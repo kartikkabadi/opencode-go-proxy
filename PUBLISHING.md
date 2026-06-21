@@ -21,7 +21,7 @@ gh repo create kartikkabadi/opencode-go-proxy --public --source . --remote origi
 ```
 
 Use `--private` instead of `--public` if this should remain private
-while the Codex/DeepSeek behavior is still moving.
+while the proxy behavior is still moving.
 
 ## AUR setup
 
@@ -30,15 +30,15 @@ staging files live under `aur/opencode-go-proxy-git/`:
 
 - `PKGBUILD`
 - `.SRCINFO`
+- `opencode-go-proxy.install`
 
 Quick publish flow:
 
 ```bash
 git clone ssh://aur@aur.archlinux.org/opencode-go-proxy-git.git aur-publish
-cp aur/opencode-go-proxy-git/PKGBUILD aur-publish/
-cp aur/opencode-go-proxy-git/.SRCINFO aur-publish/
+cp aur/opencode-go-proxy-git/{PKGBUILD,.SRCINFO,opencode-go-proxy.install} aur-publish/
 cd aur-publish
-git add PKGBUILD .SRCINFO
+git add PKGBUILD .SRCINFO opencode-go-proxy.install
 git commit -m "Initial import"
 git push
 ```

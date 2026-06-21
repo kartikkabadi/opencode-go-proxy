@@ -1,6 +1,6 @@
 # Changelog
 
-## [0.1.0] - 2025-01-15
+## [0.1.0] - 2026-06-21
 
 Initial public release.
 
@@ -10,7 +10,7 @@ Initial public release.
 - `instructions` and `developer` roles mapped to system messages
 - Function tool schema passthrough
 - Custom/freeform tool adaptation (Codex `apply_patch` works)
-- DeepSeek `reasoning_content` replay across tool-call turns
+- `reasoning_content` replay across tool-call turns
 - Real-time SSE streaming
 - Image captioning via MiMo V2.5 when tools are present
 - SSRF protection on image URLs (`data:image/` and `https://` only)
@@ -20,7 +20,7 @@ Initial public release.
 - Reference model catalog with all 13 OpenCode Go models
 - AUR package (`opencode-go-proxy-git`)
 - systemd user service
-- 12 unit tests covering protocol and credential resolution
+- 28 tests (unit + integration) covering protocol, credentials, and HTTP round-trip
 
 ### Security
 
