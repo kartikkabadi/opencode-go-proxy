@@ -349,3 +349,82 @@ class TestEdgeCases:
 
         assert resp.status == 200
         assert body["status"] == "completed"
+
+
+class TestVersionFlag:
+    def test_version_flag_prints_version(self):
+        import subprocess
+        result = subprocess.run(
+            ["uv", "run", "opencode-go-proxy", "--version"],
+            capture_output=True, text=True, cwd=os.path.dirname(os.path.dirname(__file__)),
+        )
+        assert result.returncode == 0
+        assert "0.1.0" in result.stdout
+
+
+class TestAliasMap:
+    def test_gpt_alias_maps_to_deepseek(self, server):
+        port, _ = server
+        mock_resp = mock_chat_response("ok", model="deepseek-v4-pro")
+
+        with mock.patch.dict(os.environ, {"OPENCODE_GO_API_KEY": "test-key"}):
+            with mock.patch("urllib.request.urlopen", return_value=MockUpstreamResponse(json.dumps(mock_resp).encode())) as mock_urlopen:
+                conn = HTTPConnection("127.0.0.1", port, timeout=5)
+                conn.request("POST", "/v1/responses",
+                             json.dumps({"model": "gpt-5.5", "input": "hi"}),
+                             {"content-type": "application/json"})
+                resp = conn.getresponse()
+                resp.read()
+                conn.close()
+
+        assert resp.status == 200
+        sent_payload = json.loads(mock_urlopen.call_args[0][0].data)
+        assert sent_payload["model"] == "deepseek-v4-pro"
+
+
+class TestToolCallRoundTrip:
+    def test_tool_call_passes_through_http(self, server):
+        port, _ = server
+        mock_resp = {
+            "id": "chatcmpl-test",
+            "object": "chat.completion",
+            "model": "deepseek-v4-flash",
+            "choices": [{
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [{
+                        "id": "call_abc123",
+                        "type": "function",
+                        "function": {"name": "get_weather", "arguments": '{"city":"SF"}'},
+                    }],
+                },
+                "finish_reason": "tool_calls",
+            }],
+            "usage": {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15},
+        }
+
+        with mock.patch.dict(os.environ, {"OPENCODE_GO_API_KEY": "test-key"}):
+            with mock.patch("urllib.request.urlopen", return_value=MockUpstreamResponse(json.dumps(mock_resp).encode())):
+                conn = HTTPConnection("127.0.0.1", port, timeout=5)
+                conn.request("POST", "/v1/responses",
+                             json.dumps({
+                                 "model": "deepseek-v4-flash",
+                                 "input": "What's the weather in SF?",
+                                 "tools": [{"type": "function", "function": {
+                                     "name": "get_weather",
+                                     "parameters": {"type": "object", "properties": {"city": {"type": "string"}}},
+                                 }}],
+                             }),
+                             {"content-type": "application/json"})
+                resp = conn.getresponse()
+                body = json.loads(resp.read())
+                conn.close()
+
+        assert resp.status == 200
+        assert body["status"] == "completed"
+        tool_calls = [o for o in body["output"] if o["type"] == "function_call"]
+        assert len(tool_calls) == 1
+        assert tool_calls[0]["name"] == "get_weather"
+        assert tool_calls[0]["call_id"] == "call_abc123"

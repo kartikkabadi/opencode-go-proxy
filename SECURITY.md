@@ -24,6 +24,11 @@ Image URLs in conversation content are validated — only `data:image/` and
 `https://` schemes are allowed. `file://`, `http://`, `ftp://`, and other
 schemes are rejected to prevent server-side request forgery.
 
+The proxy does not fetch image URLs itself — it forwards them to the upstream
+Chat Completions API, which is responsible for fetching and processing them.
+The scheme check prevents the proxy from passing `file://` or `http://` URLs
+that could be used to probe internal services via the upstream.
+
 ## Reports
 
 Open a private security advisory or contact the maintainers before publishing a
