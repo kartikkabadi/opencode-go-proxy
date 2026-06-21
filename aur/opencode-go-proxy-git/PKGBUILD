@@ -1,17 +1,17 @@
 # Maintainer: Kartik Kabadi <1kartikkabadi1@gmail.com>
 
-pkgname=deepseek-responses-proxy-git
-_pkgname=deepseek-responses-proxy
+pkgname=opencode-go-proxy-git
+_pkgname=opencode-go-proxy
 pkgver=0.1.0.r16.gb328277
 pkgrel=1
-pkgdesc="Local Responses API shim for Codex custom providers backed by Chat Completions upstreams"
+pkgdesc="Use your OpenCode Go subscription in Codex — local Responses-to-Chat-Completions bridge"
 arch=("any")
 url="https://github.com/kartikkabadi/opencode-go-proxy"
 license=("MIT")
 depends=("python")
 makedepends=("git" "python-installer" "uv")
-provides=("deepseek-responses-proxy")
-conflicts=("deepseek-responses-proxy")
+provides=("opencode-go-proxy")
+conflicts=("opencode-go-proxy")
 install="${_pkgname}.install"
 source=("git+${url}.git")
 sha256sums=("SKIP")
@@ -34,7 +34,7 @@ build() {
 
 check() {
   cd "${srcdir}/${_pkgname}"
-  PYTHONPATH=src python -m unittest discover -s tests -p "test*.py"
+  PYTHONPATH=src python -m pytest tests
 }
 
 package() {
@@ -42,9 +42,9 @@ package() {
 
   python -m installer --destdir="${pkgdir}" dist/*.whl
 
-  install -Dm644 contrib/systemd/deepseek-responses-proxy.service \
-    "${pkgdir}/usr/lib/systemd/user/deepseek-responses-proxy.service"
+  install -Dm644 contrib/systemd/opencode-go-proxy.service \
+    "${pkgdir}/usr/lib/systemd/user/opencode-go-proxy.service"
   sed -i \
-    "s|ExecStart=.*|ExecStart=/usr/bin/deepseek-responses-proxy --bind 127.0.0.1 --port 8787 --chat-base-url https://api.deepseek.com|" \
-    "${pkgdir}/usr/lib/systemd/user/deepseek-responses-proxy.service"
+    "s|ExecStart=.*|ExecStart=/usr/bin/opencode-go-proxy --bind 127.0.0.1 --port 8787 --chat-base-url https://opencode.ai/zen/go/v1|" \
+    "${pkgdir}/usr/lib/systemd/user/opencode-go-proxy.service"
 }

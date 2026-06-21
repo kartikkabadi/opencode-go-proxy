@@ -1,13 +1,13 @@
 [project]
-name = "deepseek-responses-proxy"
+name = "opencode-go-proxy"
 version = "0.1.0"
-description = "Local Responses API shim for Codex custom providers backed by Chat Completions upstreams"
+description = "Use your OpenCode Go subscription in Codex — local Responses-to-Chat-Completions bridge"
 readme = "README.md"
 authors = [{ name = "Kartik Kabadi", email = "1kartikkabadi1@gmail.com" }]
 license = "MIT"
 requires-python = ">=3.11"
 dependencies = []
-keywords = ["codex", "responses-api", "chat-completions", "deepseek", "agent"]
+keywords = ["codex", "opencode", "responses-api", "chat-completions", "agent", "proxy"]
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Environment :: Console",
@@ -24,7 +24,7 @@ Repository = "https://github.com/kartikkabadi/opencode-go-proxy"
 Issues = "https://github.com/kartikkabadi/opencode-go-proxy/issues"
 
 [project.scripts]
-deepseek-responses-proxy = "deepseek_responses_proxy.app:main"
+opencode-go-proxy = "opencode_go_proxy.app:main"
 
 [build-system]
 requires = ["uv_build>=0.10.9,<0.12.0"]

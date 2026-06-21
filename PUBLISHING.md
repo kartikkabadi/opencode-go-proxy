@@ -5,14 +5,14 @@ This repository is publish-ready for GitHub as
 
 ## Release surface
 
-- Package: `deepseek-responses-proxy`
+- Package: `opencode-go-proxy`
 - Current version: `0.1.0`
-- CLI entry point: `deepseek-responses-proxy`
+- CLI entry point: `opencode-go-proxy`
 - Python: `>=3.11`
 - Build backend: `uv_build`
 - Verification: `uv run python -m pytest tests -v`,
   `uvx ruff check`, `uv build`
-- AUR staging package: `aur/deepseek-responses-proxy-git`
+- AUR staging package: `aur/opencode-go-proxy-git`
 
 ## GitHub setup
 
@@ -25,8 +25,8 @@ while the Codex/DeepSeek behavior is still moving.
 
 ## AUR setup
 
-The fast Arch path is the VCS package `deepseek-responses-proxy-git`. The
-staging files live under `aur/deepseek-responses-proxy-git/`:
+The fast Arch path is the VCS package `opencode-go-proxy-git`. The
+staging files live under `aur/opencode-go-proxy-git/`:
 
 - `PKGBUILD`
 - `.SRCINFO`
@@ -34,9 +34,9 @@ staging files live under `aur/deepseek-responses-proxy-git/`:
 Quick publish flow:
 
 ```bash
-git clone ssh://aur@aur.archlinux.org/deepseek-responses-proxy-git.git aur-publish
-cp aur/deepseek-responses-proxy-git/PKGBUILD aur-publish/
-cp aur/deepseek-responses-proxy-git/.SRCINFO aur-publish/
+git clone ssh://aur@aur.archlinux.org/opencode-go-proxy-git.git aur-publish
+cp aur/opencode-go-proxy-git/PKGBUILD aur-publish/
+cp aur/opencode-go-proxy-git/.SRCINFO aur-publish/
 cd aur-publish
 git add PKGBUILD .SRCINFO
 git commit -m "Initial import"
@@ -51,8 +51,8 @@ makepkg --verifysource
 ```
 
 The AUR package installs the console script and a user service at
-`/usr/lib/systemd/user/deepseek-responses-proxy.service`. Users still need to
-provide the upstream key via `DEEPSEEK_API_KEY` or the macOS keychain.
+`/usr/lib/systemd/user/opencode-go-proxy.service`. Users still need to
+provide the upstream key via `OPENCODE_GO_API_KEY` or the macOS keychain.
 
 ## License
 

@@ -206,7 +206,7 @@ def handle_streaming_request(payload: Json, config: ProxyConfig, request_id: str
     req = urllib.request.Request(url, data=raw_payload, headers={
         "authorization": f"Bearer {api_key}", "content-type": "application/json",
         "accept": "text/event-stream",
-        "user-agent": os.environ.get("DEEPSEEK_PROXY_USER_AGENT", "codex/1.0"),
+        "user-agent": os.environ.get("OPENCODE_GO_PROXY_USER_AGENT", "codex/1.0"),
     }, method="POST")
     trace("upstream.start", request_id=request_id, url=url, bytes=len(raw_payload), stream=True)
     started = time.time()
@@ -429,7 +429,7 @@ def call_upstream_chat(chat_payload: Json, config: ProxyConfig, request_id: str,
             "authorization": f"Bearer {api_key}",
             "content-type": "application/json",
             "accept": "application/json",
-            "user-agent": os.environ.get("DEEPSEEK_PROXY_USER_AGENT", "codex/1.0"),
+            "user-agent": os.environ.get("OPENCODE_GO_PROXY_USER_AGENT", "codex/1.0"),
         },
         method="POST",
     )
@@ -500,16 +500,16 @@ def resolve_api_key(config: ProxyConfig, request_id: str) -> str:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Codex Responses API shim for OpenAI Chat Completions upstreams")
-    parser.add_argument("--bind", default=os.environ.get("DEEPSEEK_PROXY_BIND", "127.0.0.1"))
-    parser.add_argument("--port", type=int, default=int(os.environ.get("DEEPSEEK_PROXY_PORT", "8787")))
+    parser.add_argument("--bind", default=os.environ.get("OPENCODE_GO_PROXY_BIND", "127.0.0.1"))
+    parser.add_argument("--port", type=int, default=int(os.environ.get("OPENCODE_GO_PROXY_PORT", "8787")))
     parser.add_argument(
         "--chat-base-url",
         dest="chat_base_url",
-        default=os.environ.get("CHAT_COMPLETIONS_BASE_URL", "https://api.deepseek.com"),
+        default=os.environ.get("CHAT_COMPLETIONS_BASE_URL", "https://opencode.ai/zen/go/v1"),
     )
-    parser.add_argument("--api-key-env", default=os.environ.get("DEEPSEEK_PROXY_API_KEY_ENV", "DEEPSEEK_API_KEY"))
-    parser.add_argument("--timeout-sec", type=float, default=float(os.environ.get("DEEPSEEK_PROXY_TIMEOUT_SEC", "180")))
-    parser.add_argument("--max-body-mb", type=int, default=int(os.environ.get("DEEPSEEK_PROXY_MAX_BODY_MB", "20")))
+    parser.add_argument("--api-key-env", default=os.environ.get("OPENCODE_GO_PROXY_API_KEY_ENV", "OPENCODE_GO_API_KEY"))
+    parser.add_argument("--timeout-sec", type=float, default=float(os.environ.get("OPENCODE_GO_PROXY_TIMEOUT_SEC", "180")))
+    parser.add_argument("--max-body-mb", type=int, default=int(os.environ.get("OPENCODE_GO_PROXY_MAX_BODY_MB", "20")))
     return parser
 
 

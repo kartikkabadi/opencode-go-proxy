@@ -1,29 +1,29 @@
 post_install() {
   cat <<'EOF'
 
-deepseek-responses-proxy is installed.
+opencode-go-proxy is installed.
 
-1. Add the upstream DeepSeek key:
+1. Add your OpenCode Go API key:
 
-   export DEEPSEEK_API_KEY="your-key-here"
+   export OPENCODE_GO_API_KEY="your-key-here"
 
-   Or set DEEPSEEK_API_KEY in the service environment.
+   Or set OPENCODE_GO_API_KEY in the service environment.
 
 2. Start the local Responses-compatible proxy:
 
-   systemctl --user enable --now deepseek-responses-proxy.service
-   systemctl --user status deepseek-responses-proxy.service
+   systemctl --user enable --now opencode-go-proxy.service
+   systemctl --user status opencode-go-proxy.service
 
 3. Add this provider to ~/.codex/config.toml:
 
-   [model_providers.deepseek]
-   name = "DeepSeek"
+   [model_providers.opencode-go]
+   name = "OpenCode Go"
    base_url = "http://127.0.0.1:8787/v1"
-   experimental_bearer_token = "codex-deepseek-local"
+   experimental_bearer_token = "any-string-here"
    wire_api = "responses"
 
    [profiles.deepseek-v4-pro]
-   model_provider = "deepseek"
+   model_provider = "opencode-go"
    model = "deepseek-v4-pro"
    model_context_window = 1000000
    approval_policy = "untrusted"
@@ -31,7 +31,7 @@ deepseek-responses-proxy is installed.
    features = { memories = false }
 
    [profiles.deepseek-v4-flash]
-   model_provider = "deepseek"
+   model_provider = "opencode-go"
    model = "deepseek-v4-flash"
    model_context_window = 1000000
    approval_policy = "untrusted"
@@ -43,12 +43,9 @@ deepseek-responses-proxy is installed.
    codex -p deepseek-v4-pro
    codex -p deepseek-v4-flash
 
-5. Optional: suppress Codex model metadata warnings by setting:
+5. Recommended: install lazycodex for multi-model orchestration and parallel agents:
 
-   model_catalog_json = "/home/you/.codex/deepseek-model-catalog.json"
-
-   Then add catalog entries for deepseek-v4-pro and deepseek-v4-flash.
-   See the project README for a full model-catalog example and agent configs.
+   npm install -g lazycodex-ai
 
 Docs: https://github.com/kartikkabadi/opencode-go-proxy
 

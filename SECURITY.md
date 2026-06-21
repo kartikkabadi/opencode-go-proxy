@@ -8,7 +8,7 @@ and an upstream Chat Completions API.
 The proxy never needs credentials committed to the repository. It resolves the
 upstream API key in this order:
 
-1. The configured environment variable, defaulting to `DEEPSEEK_API_KEY`.
+1. The configured environment variable, defaulting to `OPENCODE_GO_API_KEY`.
 2. The macOS keychain entry `opencode-go-api-key` (override with `CODEX_KEYCHAIN_SERVICE`).
 
 ## Network exposure
