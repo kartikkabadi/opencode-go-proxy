@@ -211,7 +211,7 @@ class TestResponsesRoundTrip:
         conn.request("POST", "/v1/responses", "{}",
                      {"content-type": "application/json", "content-length": "-5"})
         resp = conn.getresponse()
-        body = json.loads(resp.read())
+        resp.read()
         conn.close()
         assert resp.status == 400
 
