@@ -256,3 +256,96 @@ class TestStreamingResponse:
         # Should contain the text deltas
         assert "hel" in raw_text
         assert "lo" in raw_text
+
+
+class TestEdgeCases:
+    def test_missing_model_defaults_to_flash(self, server):
+        port, _ = server
+        mock_resp = mock_chat_response("ok")
+
+        with mock.patch.dict(os.environ, {"OPENCODE_GO_API_KEY": "test-key"}):
+            with mock.patch("urllib.request.urlopen", return_value=MockUpstreamResponse(json.dumps(mock_resp).encode())):
+                conn = HTTPConnection("127.0.0.1", port, timeout=5)
+                conn.request("POST", "/v1/responses",
+                             json.dumps({"input": "hi"}),
+                             {"content-type": "application/json"})
+                resp = conn.getresponse()
+                body = json.loads(resp.read())
+                conn.close()
+
+        assert resp.status == 200
+        assert body["status"] == "completed"
+
+    def test_upstream_500_returns_502(self, server):
+        port, _ = server
+        err = urllib.error.HTTPError(
+            "https://mock.test/v1/chat/completions", 500, "Internal Server Error",
+            {}, io.BytesIO(b'{"error":"server error"}'),
+        )
+
+        with mock.patch.dict(os.environ, {"OPENCODE_GO_API_KEY": "test-key"}):
+            with mock.patch("urllib.request.urlopen", side_effect=err):
+                conn = HTTPConnection("127.0.0.1", port, timeout=5)
+                conn.request("POST", "/v1/responses",
+                             json.dumps({"model": "deepseek-v4-flash", "input": "hi"}),
+                             {"content-type": "application/json"})
+                resp = conn.getresponse()
+                body = json.loads(resp.read())
+                conn.close()
+
+        assert resp.status == 502
+        assert "proxy_error" in body["error"]["type"]
+
+    def test_upstream_network_error_returns_502(self, server):
+        port, _ = server
+        err = urllib.error.URLError("timed out")
+
+        with mock.patch.dict(os.environ, {"OPENCODE_GO_API_KEY": "test-key"}):
+            with mock.patch("urllib.request.urlopen", side_effect=err):
+                conn = HTTPConnection("127.0.0.1", port, timeout=5)
+                conn.request("POST", "/v1/responses",
+                             json.dumps({"model": "deepseek-v4-flash", "input": "hi"}),
+                             {"content-type": "application/json"})
+                resp = conn.getresponse()
+                body = json.loads(resp.read())
+                conn.close()
+
+        assert resp.status == 502
+        assert "network error" in body["error"]["message"].lower()
+
+    def test_upstream_429_returns_429(self, server):
+        port, _ = server
+        err = urllib.error.HTTPError(
+            "https://mock.test/v1/chat/completions", 429, "Too Many Requests",
+            {"retry-after": "10"}, io.BytesIO(b'{"error":"rate limited"}'),
+        )
+
+        with mock.patch.dict(os.environ, {"OPENCODE_GO_API_KEY": "test-key"}):
+            with mock.patch("urllib.request.urlopen", side_effect=err):
+                conn = HTTPConnection("127.0.0.1", port, timeout=5)
+                conn.request("POST", "/v1/responses",
+                             json.dumps({"model": "deepseek-v4-flash", "input": "hi"}),
+                             {"content-type": "application/json"})
+                resp = conn.getresponse()
+                body = json.loads(resp.read())
+                conn.close()
+
+        assert resp.status == 429
+        assert "retry after" in body["error"]["message"].lower()
+
+    def test_empty_input_string(self, server):
+        port, _ = server
+        mock_resp = mock_chat_response("")
+
+        with mock.patch.dict(os.environ, {"OPENCODE_GO_API_KEY": "test-key"}):
+            with mock.patch("urllib.request.urlopen", return_value=MockUpstreamResponse(json.dumps(mock_resp).encode())):
+                conn = HTTPConnection("127.0.0.1", port, timeout=5)
+                conn.request("POST", "/v1/responses",
+                             json.dumps({"model": "deepseek-v4-flash", "input": ""}),
+                             {"content-type": "application/json"})
+                resp = conn.getresponse()
+                body = json.loads(resp.read())
+                conn.close()
+
+        assert resp.status == 200
+        assert body["status"] == "completed"

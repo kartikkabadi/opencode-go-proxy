@@ -253,6 +253,28 @@ Every request emits compact JSON lines on stderr. Important events:
 - `response.converted`
 - `request.failed`
 
+## Troubleshooting
+
+**Model metadata warning every turn**
+Set `model_catalog_json` in Codex config and copy the reference catalog:
+`cp contrib/opencode-go-catalog.json ~/.codex/model-catalogs/opencode-go.json`
+
+**Connection refused on localhost:8787**
+Proxy isn't running. Start it: `opencode-go-proxy` or check `launchctl list | grep opencode`.
+
+**API key not found**
+Set `OPENCODE_GO_API_KEY` env var or add to macOS keychain:
+`security add-generic-password -a "$USER" -s opencode-go-api-key -w`
+
+**Upstream rate limited (429)**
+OpenCode Go has 5h/weekly/monthly usage limits. Switch to a cheaper model (DeepSeek V4 Flash or MiMo V2.5) to stretch your quota. See [usage limits](https://opencode.ai/docs/go#usage-limits).
+
+**Streaming not working**
+Codex sends `stream: true` — the proxy handles this. If you see no SSE events, check stderr trace for `upstream.error` or `upstream.network_error`.
+
+**Codex says "model is not supported when using ChatGPT account"**
+You used `codex -m deepseek-v4-flash` instead of `codex -p deepseek-v4-flash`. The `-m` flag only changes the model name, not the provider. Use `-p` to select a profile.
+
 ## Development
 
 ```bash
