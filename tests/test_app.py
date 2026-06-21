@@ -11,7 +11,7 @@ def make_config() -> ProxyConfig:
     return ProxyConfig(
         bind="127.0.0.1",
         port=8787,
-        chat_base_url="https://api.deepseek.com",
+        chat_base_url="https://opencode.ai/zen/go/v1",
         api_key_env="OPENCODE_GO_API_KEY",
         timeout_sec=1,
         max_body_bytes=20 * 1024 * 1024,

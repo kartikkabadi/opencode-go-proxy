@@ -40,8 +40,8 @@ uv build
 
 Include:
 - Codex version (`codex --version`)
-- Proxy version (`opencode-go-proxy --help` shows it in the build)
-- Upstream provider (OpenCode Go, DeepSeek, etc.)
+- Proxy version (`opencode-go-proxy --version`)
+- Upstream provider (OpenCode Go, or custom `CHAT_COMPLETIONS_BASE_URL`)
 - Trace output (stderr JSON lines — redact API keys first)
 - Minimal repro steps
 

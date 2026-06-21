@@ -27,6 +27,7 @@ from .protocol import (
     now_unix,
     responses_payload_to_chat_payload,
 )
+from . import __version__
 
 
 Json = dict[str, Any]
@@ -500,6 +501,7 @@ def resolve_api_key(config: ProxyConfig, request_id: str) -> str:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Codex Responses API shim for OpenAI Chat Completions upstreams")
+    parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
     parser.add_argument("--bind", default=os.environ.get("OPENCODE_GO_PROXY_BIND", "127.0.0.1"))
     parser.add_argument("--port", type=int, default=int(os.environ.get("OPENCODE_GO_PROXY_PORT", "8787")))
     parser.add_argument(
