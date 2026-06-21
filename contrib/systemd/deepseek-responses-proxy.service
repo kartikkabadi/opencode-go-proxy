@@ -1,0 +1,17 @@
+[Unit]
+Description=Responses-to-chat proxy for Codex custom providers
+Documentation=https://github.com/kartikkabadi/opencode-go-proxy
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+Environment=HOME=%h
+Environment=PATH=%h/.local/bin:%h/.cargo/bin:%h/bin:/usr/local/bin:/usr/bin:/bin
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/usr/bin/env uvx --from git+https://github.com/kartikkabadi/opencode-go-proxy deepseek-responses-proxy --bind 127.0.0.1 --port 8787 --chat-base-url https://api.deepseek.com
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=default.target

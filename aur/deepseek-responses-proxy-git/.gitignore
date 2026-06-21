@@ -1,0 +1,5 @@
+/deepseek-responses-proxy/
+/src/
+/pkg/
+/*.pkg.tar.*
+/*.log
