@@ -354,12 +354,13 @@ class TestEdgeCases:
 class TestVersionFlag:
     def test_version_flag_prints_version(self):
         import subprocess
+        from opencode_go_proxy import __version__
         result = subprocess.run(
             ["uv", "run", "opencode-go-proxy", "--version"],
             capture_output=True, text=True, cwd=os.path.dirname(os.path.dirname(__file__)),
         )
         assert result.returncode == 0
-        assert "0.1.0" in result.stdout
+        assert __version__ in result.stdout
 
 
 class TestAliasMap:
