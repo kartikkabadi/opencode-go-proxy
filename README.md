@@ -140,13 +140,13 @@ configured model. Override the vision model with `CODEX_IMAGE_MODEL`.
 The proxy resolves your OpenCode Go API key in this order:
 
 1. `$OPENCODE_GO_API_KEY` environment variable
-2. macOS keychain entry `opencode-go-api-key` (override with `CODEC_KEYCHAIN_SERVICE`)
+2. macOS keychain entry `opencode-go-api-key` (override with `CODEX_KEYCHAIN_SERVICE`; macOS only)
 
 ```bash
-# Option 1: env var
+# Option 1: env var (works everywhere)
 export OPENCODE_GO_API_KEY="your-key-here"
 
-# Option 2: macOS keychain
+# Option 2: macOS keychain (macOS only)
 security add-generic-password -a "$USER" -s opencode-go-api-key -w
 ```
 
@@ -224,15 +224,16 @@ The proxy accepts both `/responses` and `/v1/responses`.
 ## Model catalog
 
 Without a catalog entry, Codex prints a model metadata warning every turn. A reference catalog
-with all OpenCode Go models is included at `contrib/opencode-go-catalog.json`. Copy it and
-point Codex at it:
+with all OpenCode Go models is included at `contrib/opencode-go-catalog.json`. Copy it to the
+proxy's default catalog path so `/models` works out of the box:
 
 ```bash
-cp contrib/opencode-go-catalog.json ~/.codex/model-catalog.json
+mkdir -p ~/.codex/model-catalogs
+cp contrib/opencode-go-catalog.json ~/.codex/model-catalogs/opencode-go.json
 ```
 
 ```toml
-model_catalog_json = "/home/you/.codex/model-catalog.json"
+model_catalog_json = "/home/you/.codex/model-catalogs/opencode-go.json"
 ```
 
 The catalog has minimal fields (slug, display_name, context_window, supported_in_api).
