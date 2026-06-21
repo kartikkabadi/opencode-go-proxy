@@ -206,7 +206,7 @@ A launchd plist is included at `contrib/launchd/com.opencode-go.proxy.plist`.
 Copy it to `~/Library/LaunchAgents/` and load:
 
 ```bash
-mkdir -p ~/Library/LaunchAgents ~/Library/.codex/logs
+mkdir -p ~/Library/LaunchAgents ~/.codex/logs
 cp contrib/launchd/com.opencode-go.proxy.plist ~/Library/LaunchAgents/
 launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.opencode-go.proxy.plist
 ```
