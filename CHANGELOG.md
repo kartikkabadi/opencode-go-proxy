@@ -30,7 +30,7 @@ Initial public release.
 - Reference model catalog with all 13 OpenCode Go models
 - AUR package (`opencode-go-proxy-git`)
 - systemd user service
-- 38 tests (unit + integration) covering protocol, credentials, HTTP round-trip, alias map, tool calls, streaming tool calls, SSRF, and image captioning
+- 39 tests (unit + integration) covering protocol, credentials, HTTP round-trip, alias map, tool calls, streaming tool calls, streaming error handling, SSRF, and image captioning
 
 ### Security
 

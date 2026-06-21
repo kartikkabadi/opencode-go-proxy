@@ -44,7 +44,6 @@ class MockUpstreamResponse:
     def __init__(self, body: bytes, status: int = 200):
         self._body = body
         self._lines = body.split(b"\n") if b"\n" in body else [body]
-        self._idx = 0
         self.status = status
         self.headers = {}
 
@@ -256,6 +255,28 @@ class TestStreamingResponse:
         # Should contain the text deltas
         assert "hel" in raw_text
         assert "lo" in raw_text
+
+    def test_streaming_missing_api_key_sends_error_event(self, server):
+        port, _ = server
+        import opencode_go_proxy.app as app_mod
+        app_mod._api_key_cache = None
+        failed_completed = mock.MagicMock()
+        failed_completed.returncode = 1
+        failed_completed.stdout = ""
+        with mock.patch.dict(os.environ, {}, clear=True):
+            with mock.patch("opencode_go_proxy.app.subprocess.run", return_value=failed_completed):
+                conn = HTTPConnection("127.0.0.1", port, timeout=5)
+                conn.request("POST", "/v1/responses",
+                             json.dumps({"model": "deepseek-v4-flash", "input": "hi", "stream": True}),
+                             {"content-type": "application/json"})
+                resp = conn.getresponse()
+                raw = resp.read()
+                conn.close()
+
+        assert resp.status == 200
+        raw_text = raw.decode("utf-8")
+        assert "response.error" in raw_text
+        assert "[DONE]" in raw_text
 
 
 class TestEdgeCases:

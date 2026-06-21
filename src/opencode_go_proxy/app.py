@@ -197,12 +197,17 @@ def handle_streaming_request(payload: Json, config: ProxyConfig, request_id: str
         wfile.write(b"data: [DONE]\n\n")
         wfile.flush()
 
+    try:
+        api_key = resolve_api_key(config, request_id)
+    except ProxyError as exc:
+        send_error(exc.message)
+        return
+
     send_event({"type": "response.created", "response": {
         "id": response_id, "object": "response", "created_at": now_unix(),
         "status": "in_progress", "model": model, "output": [], "output_text": "", "usage": None,
     }})
 
-    api_key = resolve_api_key(config, request_id)
     url = f"{config.chat_base_url}/chat/completions"
     raw_payload = json.dumps(chat_payload, separators=(",",":")).encode("utf-8")
     req = urllib.request.Request(url, data=raw_payload, headers={
