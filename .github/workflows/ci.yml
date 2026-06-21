@@ -22,7 +22,7 @@ jobs:
         run: python -m pip install --upgrade pip uv
 
       - name: Sync
-        run: uv sync --locked
+        run: uv sync
 
       - name: Tests
         run: uv run python -m pytest tests -v
