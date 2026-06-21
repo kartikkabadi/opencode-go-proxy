@@ -1,5 +1,15 @@
 # Changelog
 
+## [0.1.1] - 2026-06-21
+
+Graceful shutdown + launchd service file.
+
+### Added
+
+- SIGTERM handler for graceful shutdown on `launchctl bootout` / `systemctl stop`
+- launchd plist at `contrib/launchd/com.opencode-go.proxy.plist`
+- README: launchd setup instructions with copy + bootstrap commands
+
 ## [0.1.0] - 2026-06-21
 
 Initial public release.

@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import signal
 import subprocess
 import sys
 import threading
@@ -537,6 +538,7 @@ def main(argv: list[str] | None = None) -> None:
         chat_base_url=config.chat_base_url,
         api_key_env=config.api_key_env,
     )
+    signal.signal(signal.SIGTERM, lambda *_: server.shutdown())
     try:
         server.serve_forever()
     except KeyboardInterrupt:

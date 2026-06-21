@@ -1,0 +1,49 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>com.opencode-go.proxy</string>
+
+	<key>ProgramArguments</key>
+	<array>
+		<string>/usr/bin/env</string>
+		<string>uvx</string>
+		<string>--from</string>
+		<string>git+https://github.com/kartikkabadi/opencode-go-proxy</string>
+		<string>opencode-go-proxy</string>
+		<string>--bind</string>
+		<string>127.0.0.1</string>
+		<string>--port</string>
+		<string>8787</string>
+		<string>--chat-base-url</string>
+		<string>https://opencode.ai/zen/go/v1</string>
+	</array>
+
+	<key>EnvironmentVariables</key>
+	<dict>
+		<key>HOME</key>
+		<string>%h</string>
+		<key>PATH</key>
+		<string>%h/.local/bin:/usr/local/bin:/usr/bin:/bin</string>
+		<key>PYTHONUNBUFFERED</key>
+		<string>1</string>
+		<key>CODEX_KEYCHAIN_SERVICE</key>
+		<string>opencode-go-api-key</string>
+		<key>CODEX_MODEL_CATALOG</key>
+		<string>%h/.codex/model-catalogs/opencode-go.json</string>
+		<key>OPENCODE_GO_PROXY_USER_AGENT</key>
+		<string>codex/1.0</string>
+	</dict>
+
+	<key>RunAtLoad</key>
+	<true/>
+	<key>KeepAlive</key>
+	<true/>
+
+	<key>StandardOutPath</key>
+	<string>%h/.codex/logs/opencode-go-proxy.log</string>
+	<key>StandardErrorPath</key>
+	<string>%h/.codex/logs/opencode-go-proxy.err</string>
+</dict>
+</plist>

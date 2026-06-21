@@ -202,9 +202,17 @@ systemctl --user enable --now opencode-go-proxy.service
 
 ### macOS (launchd)
 
-A launchd plist can keep the proxy running in the background. See
-`contrib/` for example service files. The proxy is designed for launchd's
-`KeepAlive` — it restarts on crash and starts at login.
+A launchd plist is included at `contrib/launchd/com.opencode-go.proxy.plist`.
+Copy it to `~/Library/LaunchAgents/` and load:
+
+```bash
+mkdir -p ~/Library/LaunchAgents ~/Library/.codex/logs
+cp contrib/launchd/com.opencode-go.proxy.plist ~/Library/LaunchAgents/
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.opencode-go.proxy.plist
+```
+
+The proxy is designed for launchd's `KeepAlive` — it restarts on crash and
+starts at login. Logs go to `~/.codex/logs/opencode-go-proxy.{log,err}`.
 
 ## Configuration
 
