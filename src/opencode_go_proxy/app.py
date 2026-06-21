@@ -56,7 +56,7 @@ def trace(event: str, **fields: Any) -> None:
     print(json.dumps(record, sort_keys=True), file=sys.stderr, flush=True)
 
 
-class DeepSeekResponsesHandler(BaseHTTPRequestHandler):
+class ResponsesProxyHandler(BaseHTTPRequestHandler):
     def do_GET(self) -> None:
         if self.path in {"/health", "/v1/health"}:
             self._send_json({"status": "ok"})
@@ -147,8 +147,8 @@ class ProxyError(Exception):
 def handle_responses_request(payload: Json, config: ProxyConfig, request_id: str) -> Json:
     chat_payload, request_model, conversion_stats = responses_payload_to_chat_payload(payload)
 
-    # Split-turn: if image + tools, caption images via MiMo sub-call, then route to DeepSeek.
-    # MiMo can't drive tool loops from tool-role image messages; caption + DeepSeek keeps the agent loop alive.
+    # Split-turn: if image + tools, caption images via MiMo sub-call, then route to the requested model.
+    # MiMo can't drive tool loops from tool-role image messages; caption + requested model keeps the agent loop alive.
     if conversion_stats.get("has_image") and conversion_stats.get("tools_present"):
         chat_payload = caption_images_in_messages(chat_payload, request_model, config, request_id)
         conversion_stats["upstream_model"] = chat_payload.get("model")
@@ -526,7 +526,7 @@ def main(argv: list[str] | None = None) -> None:
     if config.bind not in {"127.0.0.1", "localhost", "::1"}:
         trace("security.warning", bind=config.bind,
               message="binding to non-localhost address — proxy exposes upstream API key to network")
-    server = ThreadingHTTPServer((config.bind, config.port), DeepSeekResponsesHandler)
+    server = ThreadingHTTPServer((config.bind, config.port), ResponsesProxyHandler)
     server.config = config  # type: ignore[attr-defined]
     trace(
         "server.start",

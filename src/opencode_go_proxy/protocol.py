@@ -396,7 +396,7 @@ def responses_payload_to_chat_payload(payload: Json) -> tuple[Json, str, Json]:
     tools, tool_stats = responses_tools_to_chat_tools(payload.get("tools"))
 
     incoming_model = payload.get("model", DEFAULT_MODEL)
-    # Normalize: if model is in the alias map, use the DeepSeek equivalent.
+    # Normalize: if model is in the alias map, use the mapped OpenCode Go model.
     # If it's not a known catalog model and not aliased, fall back to DEFAULT_MODEL.
     if incoming_model in MODEL_ALIASES:
         incoming_model = MODEL_ALIASES[incoming_model]

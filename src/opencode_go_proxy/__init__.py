@@ -1,4 +1,4 @@
-"""Responses API shim for Codex -> DeepSeek Chat Completions."""
+"""Responses API shim for Codex -> OpenCode Go Chat Completions."""
 
 __all__ = ["__version__"]
 
