@@ -1,6 +1,9 @@
 # OpenCode Go Proxy
 
 [![CI](https://github.com/kartikkabadi/opencode-go-proxy/actions/workflows/ci.yml/badge.svg)](https://github.com/kartikkabadi/opencode-go-proxy/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+[![Python 3.11+](https://img.shields.io/badge/python-3.11+-blue.svg)](https://www.python.org/downloads/)
+[![Zero deps](https://img.shields.io/badge/dependencies-zero-brightgreen.svg)](#)
 
 Use your [OpenCode Go](https://opencode.ai/docs/go) subscription in the [Codex app](https://github.com/openai/codex).
 
@@ -8,9 +11,15 @@ Codex expects a Responses API (`/v1/responses`). OpenCode Go exposes an OpenAI-c
 Chat Completions API (`/v1/chat/completions`). This proxy bridges that gap in one local process:
 
 ```text
-Codex /v1/responses
-  -> opencode-go-proxy (localhost:8787)
-      -> OpenCode Go /v1/chat/completions
+Codex app
+    │
+    │  POST /v1/responses (Responses API)
+    ▼
+opencode-go-proxy  ←── localhost:8787, zero deps, stdlib only
+    │
+    │  POST /v1/chat/completions (Chat Completions API)
+    ▼
+OpenCode Go  ────── 13 models: DeepSeek, GLM, Kimi, MiMo, MiniMax, Qwen
 ```
 
 ## Why
@@ -250,6 +259,8 @@ uv run python -m pytest tests -v
 uvx ruff check
 uv build
 ```
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines.
 
 ## License
 
