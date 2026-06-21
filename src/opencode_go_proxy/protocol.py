@@ -28,7 +28,7 @@ MODEL_ALIASES: dict[str, str] = {
 
 def _load_catalog_models() -> set[str]:
     """Load known model slugs from the catalog JSON file."""
-    catalog_path = os.environ.get("CODEX_MODEL_CATALOG", os.path.expanduser("~/.codex/model-catalogs/deepseek-full.json"))
+    catalog_path = os.environ.get("CODEX_MODEL_CATALOG", os.path.expanduser("~/.codex/model-catalogs/opencode-go.json"))
     try:
         with open(catalog_path) as f:
             catalog = json.load(f)
