@@ -12,9 +12,10 @@ Json = dict[str, Any]
 DEFAULT_MODEL = "deepseek-v4-flash"
 IMAGE_MODEL_DEFAULT = "mimo-v2.5"
 
-# Map OpenAI/Codex model slugs to DeepSeek equivalents.
+# Map OpenAI/Codex model slugs to OpenCode Go equivalents.
 # When Codex sends a model not in the catalog, the alias map provides the replacement.
 # If no alias exists, DEFAULT_MODEL is used.
+# DeepSeek V4 Flash is the default — cheapest non-vision model on Go ($10/mo gets ~158k requests/mo).
 MODEL_ALIASES: dict[str, str] = {
     "gpt-5.5": "deepseek-v4-pro",
     "gpt-5.4-mini": "deepseek-v4-flash",
