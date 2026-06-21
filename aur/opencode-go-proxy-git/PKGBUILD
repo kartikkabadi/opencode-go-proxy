@@ -34,7 +34,7 @@ build() {
 
 check() {
   cd "${srcdir}/${_pkgname}"
-  PYTHONPATH=src python -m pytest tests
+  uv run python -m pytest tests
 }
 
 package() {
@@ -44,7 +44,10 @@ package() {
 
   install -Dm644 contrib/systemd/opencode-go-proxy.service \
     "${pkgdir}/usr/lib/systemd/user/opencode-go-proxy.service"
+  install -Dm644 contrib/opencode-go-catalog.json \
+    "${pkgdir}/usr/share/opencode-go-proxy/opencode-go-catalog.json"
   sed -i \
-    "s|ExecStart=.*|ExecStart=/usr/bin/opencode-go-proxy --bind 127.0.0.1 --port 8787 --chat-base-url https://opencode.ai/zen/go/v1|" \
+    -e "s|ExecStart=.*|ExecStart=/usr/bin/opencode-go-proxy --bind 127.0.0.1 --port 8787 --chat-base-url https://opencode.ai/zen/go/v1|" \
+    -e "s|CODEX_MODEL_CATALOG=.*|CODEX_MODEL_CATALOG=/usr/share/opencode-go-proxy/opencode-go-catalog.json|" \
     "${pkgdir}/usr/lib/systemd/user/opencode-go-proxy.service"
 }

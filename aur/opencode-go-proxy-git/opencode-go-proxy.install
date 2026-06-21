@@ -14,7 +14,10 @@ opencode-go-proxy is installed.
    systemctl --user enable --now opencode-go-proxy.service
    systemctl --user status opencode-go-proxy.service
 
-3. Add this provider to ~/.codex/config.toml:
+3. The model catalog is installed at /usr/share/opencode-go-proxy/opencode-go-catalog.json
+   and the systemd service points to it automatically. No extra setup needed.
+
+4. Add this provider to ~/.codex/config.toml:
 
    [model_providers.opencode-go]
    name = "OpenCode Go"
@@ -38,12 +41,12 @@ opencode-go-proxy is installed.
    sandbox_mode = "workspace-write"
    features = { memories = false }
 
-4. Start Codex with a profile, not just a model name:
+5. Start Codex with a profile, not just a model name:
 
    codex -p deepseek-v4-pro
    codex -p deepseek-v4-flash
 
-5. Recommended: install lazycodex for multi-model orchestration and parallel agents:
+6. Recommended: install lazycodex for multi-model orchestration and parallel agents:
 
    npm install -g lazycodex-ai
 

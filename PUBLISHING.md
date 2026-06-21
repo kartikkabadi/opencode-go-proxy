@@ -6,7 +6,7 @@ This repository is publish-ready for GitHub as
 ## Release surface
 
 - Package: `opencode-go-proxy`
-- Current version: `0.1.1`
+- Current version: `0.1.2`
 - CLI entry point: `opencode-go-proxy`
 - Python: `>=3.11`
 - Build backend: `uv_build`

@@ -9,6 +9,8 @@ Type=simple
 Environment=HOME=%h
 Environment=PATH=%h/.local/bin:%h/.cargo/bin:%h/bin:/usr/local/bin:/usr/bin:/bin
 Environment=PYTHONUNBUFFERED=1
+Environment=CODEX_MODEL_CATALOG=%h/.codex/model-catalogs/opencode-go.json
+Environment=OPENCODE_GO_PROXY_USER_AGENT=codex/1.0
 ExecStart=/usr/bin/env uvx --from git+https://github.com/kartikkabadi/opencode-go-proxy opencode-go-proxy --bind 127.0.0.1 --port 8787 --chat-base-url https://opencode.ai/zen/go/v1
 Restart=on-failure
 RestartSec=3

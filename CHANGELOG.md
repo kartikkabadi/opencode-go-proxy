@@ -1,5 +1,16 @@
 # Changelog
 
+## [0.1.2] - 2026-06-21
+
+Service file consistency + PKGBUILD fix.
+
+### Fixed
+
+- systemd service now sets `CODEX_MODEL_CATALOG` and `OPENCODE_GO_PROXY_USER_AGENT` (matches launchd plist)
+- PKGBUILD `check()` uses `uv run python -m pytest tests` (was `PYTHONPATH=src python -m pytest` — fails in clean chroot without pytest)
+- PKGBUILD `package()` installs catalog to `/usr/share/opencode-go-proxy/opencode-go-catalog.json` and seds service to point there
+- AUR install script: added catalog note, fixed step numbering
+
 ## [0.1.1] - 2026-06-21
 
 Graceful shutdown + launchd service file.
