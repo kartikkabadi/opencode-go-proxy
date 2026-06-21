@@ -278,6 +278,24 @@ class TestStreamingResponse:
         assert "response.error" in raw_text
         assert "[DONE]" in raw_text
 
+    def test_streaming_crash_sends_sse_error(self, server):
+        port, _ = server
+        with mock.patch.dict(os.environ, {"OPENCODE_GO_API_KEY": "test-key"}):
+            with mock.patch("opencode_go_proxy.app.responses_payload_to_chat_payload",
+                            side_effect=ValueError("boom")):
+                conn = HTTPConnection("127.0.0.1", port, timeout=5)
+                conn.request("POST", "/v1/responses",
+                             json.dumps({"model": "deepseek-v4-flash", "input": "hi", "stream": True}),
+                             {"content-type": "application/json"})
+                resp = conn.getresponse()
+                raw = resp.read()
+                conn.close()
+
+        assert resp.status == 200
+        raw_text = raw.decode("utf-8")
+        assert "response.error" in raw_text
+        assert "[DONE]" in raw_text
+
 
 class TestEdgeCases:
     def test_missing_model_defaults_to_flash(self, server):

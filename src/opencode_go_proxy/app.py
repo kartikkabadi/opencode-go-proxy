@@ -94,7 +94,16 @@ class ResponsesProxyHandler(BaseHTTPRequestHandler):
                 self.send_header("content-type", "text/event-stream")
                 self.send_header("cache-control", "no-cache")
                 self.end_headers()
-                handle_streaming_request(payload, config, request_id, self.wfile)
+                try:
+                    handle_streaming_request(payload, config, request_id, self.wfile)
+                except Exception as exc:
+                    trace("request.crashed", request_id=request_id, message=str(exc), traceback=traceback.format_exc())
+                    try:
+                        err = json.dumps({"type": "response.error", "error": {"message": "proxy crashed; see stderr trace"}}, separators=(",",":")).encode("utf-8")
+                        self.wfile.write(b"data: " + err + b"\n\ndata: [DONE]\n\n")
+                        self.wfile.flush()
+                    except BrokenPipeError:
+                        pass
             else:
                 response = handle_responses_request(payload, config, request_id)
                 self._send_json(response)
