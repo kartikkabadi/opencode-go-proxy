@@ -1,6 +1,6 @@
 # Security
 
-`deepseek-responses-proxy` is intended to run as a local adapter between Codex
+`opencode-go-proxy` is intended to run as a local adapter between Codex
 and an upstream Chat Completions API.
 
 ## Secrets
