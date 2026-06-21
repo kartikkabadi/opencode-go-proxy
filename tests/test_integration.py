@@ -389,6 +389,21 @@ class TestEdgeCases:
         assert resp.status == 200
         assert body["status"] == "completed"
 
+    def test_upstream_invalid_json_returns_502(self, server):
+        port, _ = server
+        with mock.patch.dict(os.environ, {"OPENCODE_GO_API_KEY": "test-key"}):
+            with mock.patch("urllib.request.urlopen", return_value=MockUpstreamResponse(b"not json")):
+                conn = HTTPConnection("127.0.0.1", port, timeout=5)
+                conn.request("POST", "/v1/responses",
+                             json.dumps({"model": "deepseek-v4-flash", "input": "hi"}),
+                             {"content-type": "application/json"})
+                resp = conn.getresponse()
+                body = json.loads(resp.read())
+                conn.close()
+
+        assert resp.status == 502
+        assert "invalid JSON" in body["error"]["message"]
+
 
 class TestVersionFlag:
     def test_version_flag_prints_version(self):

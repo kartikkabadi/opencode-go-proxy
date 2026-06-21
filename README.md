@@ -275,7 +275,7 @@ Set `OPENCODE_GO_API_KEY` env var or add to macOS keychain:
 `security add-generic-password -a "$USER" -s opencode-go-api-key -w`
 
 **Upstream rate limited (429)**
-OpenCode Go has 5h/weekly/monthly usage limits. Switch to a cheaper model (DeepSeek V4 Flash or MiMo V2.5) to stretch your quota. See [usage limits](https://opencode.ai/docs/go#usage-limits).
+OpenCode Go has 5-hour/weekly/monthly usage limits. Switch to a cheaper model (DeepSeek V4 Flash or MiMo V2.5) to stretch your quota. See [usage limits](https://opencode.ai/docs/go#usage-limits).
 
 **Streaming not working**
 Codex sends `stream: true` — the proxy handles this. If you see no SSE events, check stderr trace for `upstream.error` or `upstream.network_error`.

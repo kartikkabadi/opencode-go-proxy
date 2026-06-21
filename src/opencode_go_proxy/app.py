@@ -456,7 +456,10 @@ def call_upstream_chat(chat_payload: Json, config: ProxyConfig, request_id: str,
             body = response.read()
             elapsed_ms = int((time.time() - started) * 1000)
             trace("upstream.done", request_id=request_id, status=response.status, bytes=len(body), elapsed_ms=elapsed_ms)
-            value = json.loads(body)
+            try:
+                value = json.loads(body)
+            except json.JSONDecodeError:
+                raise ProxyError(HTTPStatus.BAD_GATEWAY, "upstream returned invalid JSON")
             if not isinstance(value, dict):
                 raise ProxyError(HTTPStatus.BAD_GATEWAY, "upstream returned non-object JSON")
             return value
