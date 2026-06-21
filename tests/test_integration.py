@@ -428,3 +428,95 @@ class TestToolCallRoundTrip:
         assert len(tool_calls) == 1
         assert tool_calls[0]["name"] == "get_weather"
         assert tool_calls[0]["call_id"] == "call_abc123"
+
+
+class TestStreamingToolCalls:
+    def test_streaming_tool_call_sse(self, server):
+        port, _ = server
+        sse_lines = [
+            b'data: {"id":"1","object":"chat.completion.chunk","model":"deepseek-v4-flash","choices":[{"index":0,"delta":{"role":"assistant","tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"read_file","arguments":""}}]}}]}\n',
+            b'data: {"id":"1","object":"chat.completion.chunk","model":"deepseek-v4-flash","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\\"path\\":\\"README.md\\"}"}}]}}]}\n',
+            b'data: {"id":"1","object":"chat.completion.chunk","model":"deepseek-v4-flash","choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":5,"completion_tokens":2,"total_tokens":7}}\n',
+            b'data: [DONE]\n',
+        ]
+        mock_body = b"".join(sse_lines)
+
+        with mock.patch.dict(os.environ, {"OPENCODE_GO_API_KEY": "test-key"}):
+            with mock.patch("urllib.request.urlopen", return_value=MockUpstreamResponse(mock_body)):
+                conn = HTTPConnection("127.0.0.1", port, timeout=10)
+                conn.request("POST", "/v1/responses",
+                             json.dumps({"model": "deepseek-v4-flash", "input": "read README", "stream": True}),
+                             {"content-type": "application/json"})
+                resp = conn.getresponse()
+                raw = resp.read()
+                conn.close()
+
+        assert resp.status == 200
+        raw_text = raw.decode("utf-8")
+        assert "response.created" in raw_text
+        assert "response.completed" in raw_text
+        assert "function_call" in raw_text
+        assert "read_file" in raw_text
+
+
+class TestSSRFValidation:
+    def test_file_scheme_rejected(self):
+        from opencode_go_proxy.protocol import _is_safe_image_url
+        assert not _is_safe_image_url("file:///etc/passwd")
+
+    def test_http_scheme_rejected(self):
+        from opencode_go_proxy.protocol import _is_safe_image_url
+        assert not _is_safe_image_url("http://169.254.169.254/latest/meta-data/")
+
+    def test_https_allowed(self):
+        from opencode_go_proxy.protocol import _is_safe_image_url
+        assert _is_safe_image_url("https://example.com/image.png")
+
+    def test_data_image_allowed(self):
+        from opencode_go_proxy.protocol import _is_safe_image_url
+        assert _is_safe_image_url("data:image/png;base64,iVBORw0KGgo=")
+
+    def test_ftp_rejected(self):
+        from opencode_go_proxy.protocol import _is_safe_image_url
+        assert not _is_safe_image_url("ftp://evil.com/file")
+
+
+class TestImageCaptioning:
+    def test_caption_replaces_image_with_text(self, server):
+        port, _ = server
+        caption_resp = {
+            "id": "chatcmpl-cap",
+            "object": "chat.completion",
+            "model": "mimo-v2.5",
+            "choices": [{"index": 0, "message": {"role": "assistant", "content": "A screenshot of a code editor"}, "finish_reason": "stop"}],
+            "usage": {"prompt_tokens": 5, "completion_tokens": 8, "total_tokens": 13},
+        }
+        main_resp = mock_chat_response("ok")
+
+        # First call = caption, second = main
+        responses = [
+            MockUpstreamResponse(json.dumps(caption_resp).encode()),
+            MockUpstreamResponse(json.dumps(main_resp).encode()),
+        ]
+
+        with mock.patch.dict(os.environ, {"OPENCODE_GO_API_KEY": "test-key"}):
+            with mock.patch("urllib.request.urlopen", side_effect=responses):
+                conn = HTTPConnection("127.0.0.1", port, timeout=10)
+                conn.request("POST", "/v1/responses",
+                             json.dumps({
+                                 "model": "deepseek-v4-flash",
+                                 "input": [{"type": "message", "role": "user", "content": [
+                                     {"type": "input_text", "text": "What's in this image?"},
+                                     {"type": "input_image", "image_url": "data:image/png;base64,iVBORw0KGgo="},
+                                 ]}],
+                                 "tools": [{"type": "function", "function": {
+                                     "name": "analyze", "parameters": {"type": "object", "properties": {}},
+                                 }}],
+                             }),
+                             {"content-type": "application/json"})
+                resp = conn.getresponse()
+                body = json.loads(resp.read())
+                conn.close()
+
+        assert resp.status == 200
+        assert body["status"] == "completed"
