@@ -80,13 +80,9 @@ def _normalize_image_url(part: Json) -> Json | None:
     return None
 
 
-def _is_data_url_string(s: str) -> bool:
-    return isinstance(s, str) and s.startswith("data:image/") and "base64," in s
-
-
 def _is_safe_url_string(s: str) -> bool:
-    """Allow data:image/ and https:// URLs. Reject everything else (http://, file://, ftp://, etc)."""
-    return _is_data_url_string(s) or s.startswith("https://")
+    """Allow data:image/...base64, and https:// URLs. Reject everything else (http://, file://, ftp://, etc)."""
+    return isinstance(s, str) and (s.startswith("https://") or (s.startswith("data:image/") and "base64," in s))
 
 
 def _content_to_chat_parts(content: Any) -> list[Json] | str:
@@ -166,29 +162,11 @@ def flatten_content(content: Any) -> str:
     return str(content)
 
 
-def flatten_summary(summary: Any) -> str:
-    if not isinstance(summary, list):
-        return flatten_content(summary)
-
-    parts: list[str] = []
-    for item in summary:
-        if isinstance(item, str):
-            parts.append(item)
-            continue
-        if not isinstance(item, dict):
-            parts.append(str(item))
-            continue
-        text = item.get("text")
-        if isinstance(text, str):
-            parts.append(text)
-    return "\n".join(part for part in parts if part)
-
-
 def reasoning_content_from_item(item: Json) -> str:
     content = flatten_content(item.get("content", ""))
     if content:
         return content
-    return flatten_summary(item.get("summary", ""))
+    return flatten_content(item.get("summary", ""))
 
 
 def responses_input_to_chat_messages(payload: Json) -> tuple[list[Json], Json]:
