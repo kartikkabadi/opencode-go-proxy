@@ -196,14 +196,24 @@ def handle_streaming_request(payload: Json, config: ProxyConfig, request_id: str
     response_id = new_response_id()
     model = request_model or DEFAULT_MODEL
 
+    client_alive = True
+
     def send_event(event: Json) -> None:
-        wfile.write(b"data: " + json.dumps(event, separators=(",", ":")).encode("utf-8") + b"\n\n")
-        wfile.flush()
+        nonlocal client_alive
+        if not client_alive:
+            return
+        try:
+            wfile.write(b"data: " + json.dumps(event, separators=(",", ":")).encode("utf-8") + b"\n\n")
+            wfile.flush()
+        except BrokenPipeError:
+            client_alive = False
+            trace("client.disconnected", request_id=request_id, message="client closed connection during stream")
 
     def send_error(msg: str) -> None:
         send_event({"type": "response.error", "error": {"message": msg}})
-        wfile.write(b"data: [DONE]\n\n")
-        wfile.flush()
+        if client_alive:
+            wfile.write(b"data: [DONE]\n\n")
+            wfile.flush()
 
     try:
         api_key = resolve_api_key(config, request_id)
@@ -238,8 +248,26 @@ def handle_streaming_request(payload: Json, config: ProxyConfig, request_id: str
     reasoning_open = False
     got_data = False
 
+    # Keepalive: send SSE comments every 15s while waiting for upstream first byte.
+    # Prevents Codex from timing out when the model thinks for 30+ seconds before responding.
+    keepalive_stop = threading.Event()
+
+    def keepalive() -> None:
+        while not keepalive_stop.wait(15):
+            if not client_alive:
+                return
+            try:
+                wfile.write(b": keepalive\n\n")
+                wfile.flush()
+            except BrokenPipeError:
+                return
+
+    ka_thread = threading.Thread(target=keepalive, daemon=True)
+    ka_thread.start()
+
     try:
         with urllib.request.urlopen(req, timeout=config.timeout_sec) as resp:
+            keepalive_stop.set()  # Stop keepalive once upstream starts responding.
             for line in resp:
                 line = line.decode("utf-8", errors="replace").strip()
                 if not line.startswith("data: "):
@@ -282,6 +310,12 @@ def handle_streaming_request(payload: Json, config: ProxyConfig, request_id: str
                     text += d
                     send_event({"type": "response.output_text.delta", "item_id": message_id, "output_index": 1 if reasoning_open else 0, "delta": d})
                 tcs = delta.get("tool_calls")
+                if isinstance(tcs, list) and tcs and reasoning_open:
+                    # Close reasoning item before tool calls so UI shows tool calls, not "thinking".
+                    rs_done = {"type": "reasoning", "id": reasoning_id,
+                               "summary": [{"type": "summary_text", "text": reasoning}], "status": "completed"}
+                    send_event({"type": "response.output_item.done", "output_index": 0, "item": rs_done})
+                    reasoning_open = False
                 if isinstance(tcs, list):
                     for tc in tcs:
                         idx = tc.get("index", 0)
@@ -317,6 +351,7 @@ def handle_streaming_request(payload: Json, config: ProxyConfig, request_id: str
                         if fn.get("arguments"):
                             tool_calls[idx]["function"]["arguments"] += fn["arguments"]
     except urllib.error.HTTPError as exc:
+        keepalive_stop.set()
         body = exc.read().decode("utf-8", errors="replace")
         trace("upstream.error", request_id=request_id, status=exc.code, body=body[:2000])
         if exc.code == 429:
@@ -328,6 +363,7 @@ def handle_streaming_request(payload: Json, config: ProxyConfig, request_id: str
             send_error(f"upstream HTTP {exc.code}")
         return
     except (urllib.error.URLError, TimeoutError) as exc:
+        keepalive_stop.set()
         trace("upstream.network_error", request_id=request_id, reason=str(getattr(exc, "reason", exc)))
         send_error(f"upstream network error: {getattr(exc, 'reason', exc)}")
         return
@@ -337,6 +373,10 @@ def handle_streaming_request(payload: Json, config: ProxyConfig, request_id: str
 
     if not got_data:
         send_error("upstream returned no SSE data")
+        return
+
+    if not client_alive:
+        trace("client.gone", request_id=request_id, message="client disconnected before final events")
         return
 
     # Build final response from accumulated data.
