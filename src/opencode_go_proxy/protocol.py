@@ -237,12 +237,15 @@ def responses_input_to_chat_messages(payload: Json) -> tuple[list[Json], Json]:
             continue
 
         if item_type == "function_call":
+            ns = item.get("namespace")
+            name = item.get("name", "")
+            flat_name = f"{ns}__{name}" if ns else name
             pending_assistant_tool_calls.append(
                 {
                     "id": item.get("call_id") or item.get("id") or f"call_{uuid.uuid4().hex}",
                     "type": "function",
                     "function": {
-                        "name": item.get("name", ""),
+                        "name": flat_name,
                         "arguments": item.get("arguments", "{}"),
                     },
                 }
@@ -304,8 +307,37 @@ def responses_tools_to_chat_tools(tools: Any) -> tuple[list[Json] | None, Json]:
         if not isinstance(tool, dict):
             stats["dropped_tools"] += 1
             continue
-        if tool.get("type") != "function":
-            if tool.get("type") == "custom":
+        tt = tool.get("type")
+
+        # Namespace tools (MCP servers): flatten sub-tools with namespace prefix.
+        if tt == "namespace":
+            ns_name = tool.get("name", "")
+            sub_tools = tool.get("tools") or []
+            if not isinstance(sub_tools, list):
+                stats["dropped_tools"] += 1
+                continue
+            for sub in sub_tools:
+                if not isinstance(sub, dict) or sub.get("type") != "function":
+                    stats["dropped_tools"] += 1
+                    continue
+                sub_name = sub.get("name")
+                if not isinstance(sub_name, str) or not sub_name:
+                    stats["dropped_tools"] += 1
+                    continue
+                full_name = f"{ns_name}__{sub_name}"
+                fn = sub.get("function") or {
+                    "name": full_name,
+                    "description": sub.get("description", ""),
+                    "parameters": sub.get("parameters", {"type": "object", "properties": {}}),
+                }
+                fn = dict(fn)
+                fn["name"] = full_name
+                chat_tools.append({"type": "function", "function": fn})
+                stats["forwarded_tools"] += 1
+            continue
+
+        if tt != "function":
+            if tt == "custom":
                 name = tool.get("name")
                 if not isinstance(name, str) or not name:
                     stats["dropped_tools"] += 1
@@ -451,16 +483,26 @@ def chat_message_to_response_output(message: Json) -> list[Json]:
         if not isinstance(tool_call, dict):
             continue
         function = tool_call.get("function") or {}
-        output.append(
-            {
-                "type": "function_call",
-                "id": f"fc_{uuid.uuid4().hex}",
-                "call_id": tool_call.get("id") or f"call_{uuid.uuid4().hex}",
-                "name": function.get("name", ""),
-                "arguments": function.get("arguments", "{}"),
-                "status": "completed",
-            }
-        )
+        flat_name = function.get("name", "")
+        # Split flat name back into namespace + name for Codex.
+        # Codex's ResponseItem::FunctionCall has separate namespace and name fields.
+        # Namespaced tools are flattened as {namespace}__{name}; split on last "__".
+        namespace, name = None, flat_name
+        if "__" in flat_name:
+            ns, _, n = flat_name.rpartition("__")
+            if ns and n:
+                namespace, name = ns, n
+        item: Json = {
+            "type": "function_call",
+            "id": f"fc_{uuid.uuid4().hex}",
+            "call_id": tool_call.get("id") or f"call_{uuid.uuid4().hex}",
+            "name": name,
+            "arguments": function.get("arguments", "{}"),
+            "status": "completed",
+        }
+        if namespace:
+            item["namespace"] = namespace
+        output.append(item)
 
     content = message.get("content")
     if isinstance(content, str) and content:

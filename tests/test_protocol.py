@@ -231,6 +231,89 @@ class ProtocolTests(unittest.TestCase):
         self.assertEqual(response["output"][0]["call_id"], "call_123")
         self.assertEqual(response["output"][0]["name"], "read_file")
 
+    def test_namespaced_tool_call_round_trip(self) -> None:
+        """Namespaced tool calls must split flat name back into namespace + name."""
+        response = chat_completion_to_response(
+            {
+                "id": "chat_1",
+                "model": "deepseek-v4-flash",
+                "choices": [
+                    {
+                        "index": 0,
+                        "message": {
+                            "role": "assistant",
+                            "tool_calls": [
+                                {
+                                    "id": "call_456",
+                                    "type": "function",
+                                    "function": {
+                                        "name": "mcp__computer_use__click",
+                                        "arguments": '{"x": 100, "y": 200}',
+                                    },
+                                }
+                            ],
+                        },
+                    }
+                ],
+                "usage": {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15},
+            }
+        )
+        fc = response["output"][0]
+        self.assertEqual(fc["type"], "function_call")
+        self.assertEqual(fc["name"], "click")
+        self.assertEqual(fc["namespace"], "mcp__computer_use")
+        self.assertEqual(fc["call_id"], "call_456")
+
+    def test_namespaced_function_call_replay_flattens_name(self) -> None:
+        """When Codex replays a namespaced function_call, proxy must flatten for upstream."""
+        chat, _model, _stats = responses_payload_to_chat_payload(
+            {
+                "model": "deepseek-v4-flash",
+                "input": [
+                    {"type": "function_call", "name": "click", "namespace": "mcp__computer_use",
+                     "call_id": "call_789", "arguments": '{"x": 1}'},
+                    {"type": "function_call_output", "call_id": "call_789", "output": "done"},
+                ],
+            }
+        )
+        # The assistant message should have the flattened tool call name
+        assistant_msg = next(m for m in chat["messages"] if m["role"] == "assistant")
+        self.assertEqual(assistant_msg["tool_calls"][0]["function"]["name"], "mcp__computer_use__click")
+
+    def test_namespace_tools_flattened_with_prefix(self) -> None:
+        chat, _model, stats = responses_payload_to_chat_payload(
+            {
+                "model": "deepseek-v4-flash",
+                "input": "click",
+                "tools": [
+                    {
+                        "type": "namespace",
+                        "name": "mcp__computer_use",
+                        "description": "Tools in the mcp__computer_use namespace.",
+                        "tools": [
+                            {
+                                "type": "function",
+                                "name": "click",
+                                "description": "Click an element",
+                                "parameters": {"type": "object", "properties": {"x": {"type": "number"}}},
+                            },
+                            {
+                                "type": "function",
+                                "name": "take_screenshot",
+                                "description": "Take a screenshot",
+                                "parameters": {"type": "object", "properties": {}},
+                            },
+                        ],
+                    },
+                ],
+            }
+        )
+        tool_names = [t["function"]["name"] for t in chat["tools"]]
+        self.assertIn("mcp__computer_use__click", tool_names)
+        self.assertIn("mcp__computer_use__take_screenshot", tool_names)
+        self.assertEqual(stats["tools"]["forwarded_tools"], 2)
+        self.assertEqual(stats["tools"]["dropped_tools"], 0)
+
 
 if __name__ == "__main__":
     unittest.main()
