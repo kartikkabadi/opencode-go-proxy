@@ -12,7 +12,6 @@ import traceback
 import urllib.error
 import urllib.request
 import uuid
-from concurrent.futures import ThreadPoolExecutor
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
@@ -368,7 +367,7 @@ def caption_images_in_messages(chat_payload: Json, target_model: str, config: Pr
     image_model = os.environ.get("CODEX_IMAGE_MODEL", IMAGE_MODEL_DEFAULT) or IMAGE_MODEL_DEFAULT
     messages = chat_payload.get("messages", [])
 
-    # Collect all image URLs across messages for parallel captioning.
+    # Collect all image URLs across messages.
     image_jobs: list[tuple[int, int, str]] = []  # (msg_idx, part_idx, url)
     for mi, message in enumerate(messages):
         content = message.get("content")
@@ -384,19 +383,14 @@ def caption_images_in_messages(chat_payload: Json, target_model: str, config: Pr
         chat_payload["model"] = target_model
         return chat_payload
 
-    # 1 image: call directly. 2+: parallel.
-    if len(image_jobs) == 1:
-        captions = [caption_image_via_mimo(image_jobs[0][2], image_model, config, request_id)]
-    else:
-        with ThreadPoolExecutor(max_workers=min(4, len(image_jobs))) as pool:
-            captions = list(pool.map(
-                lambda job: caption_image_via_mimo(job[2], image_model, config, request_id),
-                image_jobs,
-            ))
-
-    # Replace image parts with captions.
-    for (mi, pi, _url), caption in zip(image_jobs, captions):
-        messages[mi]["content"][pi] = {"type": "text", "text": f"[image: {caption}]"}
+    # Only caption the latest image; stub older ones to save 25+ seconds per turn.
+    # Old screenshots are stale context — the model only needs the current screen to act.
+    latest = image_jobs[-1]
+    caption = caption_image_via_mimo(latest[2], image_model, config, request_id)
+    for mi, pi, _url in image_jobs[:-1]:
+        messages[mi]["content"][pi] = {"type": "text", "text": "[prior screenshot omitted]"}
+    mi, pi, _ = latest
+    messages[mi]["content"][pi] = {"type": "text", "text": f"[screenshot: {caption}]"}
 
     # Collapse text-only lists back to strings (fast path for upstream).
     for message in messages:
@@ -407,15 +401,19 @@ def caption_images_in_messages(chat_payload: Json, target_model: str, config: Pr
             message["content"] = "\n".join(p.get("text", "") for p in content if p.get("text"))
 
     chat_payload["model"] = target_model
-    trace("split_turn.captioned", request_id=request_id, captions=len(image_jobs), model=chat_payload["model"])
+    trace("split_turn.captioned", request_id=request_id, captions=1, omitted=len(image_jobs) - 1, model=chat_payload["model"])
     return chat_payload
 
 
 CAPTION_PROMPT = (
     "You are captioning a screenshot for a coding agent that cannot see images. "
-    "In 2-3 sentences, describe: (1) what UI element/application is visible, "
-    "(2) any text content — buttons, labels, error messages, code snippets (quote exactly), "
-    "(3) layout structure — which panel/tab/section is active, where the cursor/focus is. "
+    "The agent needs to click elements precisely, so spatial positions are critical. "
+    "Describe in 4-6 sentences: (1) app name and what window/panel is active, "
+    "(2) list every clickable element with its approximate position as (x,y) pixels "
+    "from top-left — buttons, menu items, links, input fields, toolbar icons. "
+    "Format: 'button \"Save\" at (120, 45)', 'input field at (300, 200)', etc. "
+    "(3) any visible text content — quote exactly. "
+    "(4) where the cursor/focus/selection currently is. "
     "Skip colors and styling unless they convey state (e.g. red error, green success)."
 )
 
