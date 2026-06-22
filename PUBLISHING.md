@@ -1,6 +1,6 @@
 # Publishing
 
-This repository is publish-ready for GitHub as
+This repository is published on GitHub as
 `kartikkabadi/opencode-go-proxy`.
 
 ## Release surface
@@ -12,55 +12,22 @@ This repository is publish-ready for GitHub as
 - Build backend: `uv_build`
 - Verification: `uv run python -m pytest tests -v`,
   `uvx ruff check`, `uv build`
-- AUR staging package: `aur/opencode-go-proxy-git`
 
-## GitHub setup
-
-```bash
-gh repo create kartikkabadi/opencode-go-proxy --public --source . --remote origin --push
-```
-
-Use `--private` instead of `--public` if this should remain private
-while the proxy behavior is still moving.
-
-## AUR setup
-
-The fast Arch path is the VCS package `opencode-go-proxy-git`. The
-staging files live under `aur/opencode-go-proxy-git/`:
-
-- `PKGBUILD`
-- `.SRCINFO`
-- `opencode-go-proxy.install`
-
-Quick publish flow:
+## Install
 
 ```bash
-git clone ssh://aur@aur.archlinux.org/opencode-go-proxy-git.git aur-publish
-cp aur/opencode-go-proxy-git/{PKGBUILD,.SRCINFO,opencode-go-proxy.install} aur-publish/
-cd aur-publish
-git add PKGBUILD .SRCINFO opencode-go-proxy.install
-git commit -m "Initial import"
-git push
+uvx --from git+https://github.com/kartikkabadi/opencode-go-proxy opencode-go-proxy
 ```
 
-Before pushing, regenerate `.SRCINFO` after every PKGBUILD edit:
+No PyPI, no AUR. `uvx` from git is the only install path.
 
-```bash
-makepkg --printsrcinfo > .SRCINFO
-makepkg --verifysource
-```
+## Release flow
 
-The AUR package installs the console script and a user service at
-`/usr/lib/systemd/user/opencode-go-proxy.service`. Users still need to
-provide the upstream key via `OPENCODE_GO_API_KEY` or the macOS keychain.
+1. Bump version in `pyproject.toml`, `src/opencode_go_proxy/__init__.py`, this file.
+2. Add `CHANGELOG.md` entry.
+3. Commit, tag `vX.Y.Z`, push.
+4. CI builds the wheel and creates the GitHub release automatically.
 
 ## License
 
 MIT. See [LICENSE](LICENSE).
-
-## Pre-release checklist
-
-1. Confirm the repository visibility.
-2. Run the verification commands.
-3. Create the GitHub repository and push `main`.
-4. Enable branch protection after CI is green.

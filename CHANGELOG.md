@@ -2,14 +2,20 @@
 
 ## [0.1.2] - 2026-06-21
 
-Service file consistency + PKGBUILD fix.
+Bug fixes + removed AUR packaging.
 
 ### Fixed
 
-- systemd service now sets `CODEX_MODEL_CATALOG` and `OPENCODE_GO_PROXY_USER_AGENT` (matches launchd plist)
-- PKGBUILD `check()` uses `uv run python -m pytest tests` (was `PYTHONPATH=src python -m pytest` — fails in clean chroot without pytest)
-- PKGBUILD `package()` installs catalog to `/usr/share/opencode-go-proxy/opencode-go-catalog.json` and seds service to point there
-- AUR install script: added catalog note, fixed step numbering
+- `call_upstream_chat` now catches `json.JSONDecodeError` — invalid JSON from upstream returns 502 instead of crashing
+- Streaming crash: if `handle_streaming_request` raised after SSE headers sent, sends `response.error` SSE event instead of corrupted HTTP response
+- Streaming + missing API key: `resolve_api_key` moved before `response.created` so error event reaches client
+- README launchd path: `~/Library/.codex/logs` → `~/.codex/logs` (matches plist)
+- LICENSE copyright year 2025 → 2026
+
+### Removed
+
+- AUR package (`aur/opencode-go-proxy-git/`) — not launching on AUR
+- PyPI — not launching on PyPI; `uvx --from git+...` is the install path
 
 ## [0.1.1] - 2026-06-21
 
@@ -39,8 +45,7 @@ Initial public release.
 - macOS keychain credential resolution
 - Local health and model-list endpoints
 - Reference model catalog with all 13 OpenCode Go models
-- AUR package (`opencode-go-proxy-git`)
-- systemd user service
+- systemd user service at `contrib/systemd/`
 - 41 tests (unit + integration) covering protocol, credentials, HTTP round-trip, alias map, tool calls, streaming tool calls, streaming error handling, streaming crash recovery, invalid upstream JSON, SSRF, and image captioning
 
 ### Security

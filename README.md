@@ -193,13 +193,6 @@ uv sync
 uv run opencode-go-proxy --help
 ```
 
-### Arch Linux (AUR)
-
-```bash
-yay -S opencode-go-proxy-git
-systemctl --user enable --now opencode-go-proxy.service
-```
-
 ### macOS (launchd)
 
 A launchd plist is included at `contrib/launchd/com.opencode-go.proxy.plist`.
