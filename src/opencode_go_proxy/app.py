@@ -331,9 +331,20 @@ def handle_streaming_request(payload: Json, config: ProxyConfig, request_id: str
                     "summary": [{"type": "summary_text", "text": reasoning}], "status": "completed"}
         send_event({"type": "response.output_item.done", "output_index": 0, "item": rs_done})
 
+    # Emit tool_call items that were accumulated during streaming.
+    # Codex requires output_item.added + output_item.done for each function_call;
+    # items only in response.completed payload are silently dropped.
+    tc_base = 1 if reasoning_open else 0
+    for ti, item in enumerate(output):
+        if item.get("type") != "function_call":
+            continue
+        idx = tc_base + ti
+        send_event({"type": "response.output_item.added", "output_index": idx, "item": item})
+        send_event({"type": "response.output_item.done", "output_index": idx, "item": item})
+
     # Close message item if opened.
     if item_open:
-        msg_idx = 1 if reasoning_open else 0
+        msg_idx = tc_base + len(tool_calls)
         msg_done = {"type": "message", "id": message_id, "role": "assistant", "status": "completed",
                      "content": [{"type": "output_text", "text": text, "annotations": []}]}
         send_event({"type": "response.output_item.done", "output_index": msg_idx, "item": msg_done})

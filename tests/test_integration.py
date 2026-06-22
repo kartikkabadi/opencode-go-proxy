@@ -512,6 +512,13 @@ class TestStreamingToolCalls:
         assert "response.completed" in raw_text
         assert "function_call" in raw_text
         assert "read_file" in raw_text
+        # Codex requires output_item.added for each function_call;
+        # items only in response.completed are silently dropped.
+        assert "response.output_item.added" in raw_text
+        # Verify function_call appears inside an output_item.added event
+        import re
+        added_events = re.findall(r'response\.output_item\.added.*?function_call', raw_text)
+        assert len(added_events) >= 1, "function_call must have output_item.added event"
 
 
 class TestSSRFValidation:
