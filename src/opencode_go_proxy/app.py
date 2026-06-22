@@ -258,8 +258,7 @@ def handle_streaming_request(payload: Json, config: ProxyConfig, request_id: str
                 if not choices:
                     continue
                 delta = choices[0].get("delta", {})
-                # Reasoning — open item so Codex shows thinking indicator, but don't stream deltas
-                # (response.reasoning.delta is non-standard; Codex ignores it). Accumulate for final response.
+                # Reasoning — stream summary deltas so Codex shows thinking text in real-time.
                 r = delta.get("reasoning_content")
                 if isinstance(r, str) and r:
                     if not reasoning_open:
@@ -268,6 +267,8 @@ def handle_streaming_request(payload: Json, config: ProxyConfig, request_id: str
                         }})
                         reasoning_open = True
                     reasoning += r
+                    send_event({"type": "response.reasoning_summary_text.delta",
+                                "item_id": reasoning_id, "output_index": 0, "summary_index": 0, "delta": r})
                 # Text delta — open item lazily, then stream.
                 d = delta.get("content")
                 if isinstance(d, str) and d:
