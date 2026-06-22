@@ -335,12 +335,14 @@ def handle_streaming_request(payload: Json, config: ProxyConfig, request_id: str
     # Codex requires output_item.added + output_item.done for each function_call;
     # items only in response.completed payload are silently dropped.
     tc_base = 1 if reasoning_open else 0
-    for ti, item in enumerate(output):
+    tc_count = 0
+    for item in output:
         if item.get("type") != "function_call":
             continue
-        idx = tc_base + ti
+        idx = tc_base + tc_count
         send_event({"type": "response.output_item.added", "output_index": idx, "item": item})
         send_event({"type": "response.output_item.done", "output_index": idx, "item": item})
+        tc_count += 1
 
     # Close message item if opened.
     if item_open:
