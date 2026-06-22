@@ -229,6 +229,8 @@ def handle_streaming_request(payload: Json, config: ProxyConfig, request_id: str
     text = ""
     reasoning = ""
     tool_calls: list[Json] = []
+    tool_call_items: dict[int, Json] = {}  # index → {id, call_id, name, namespace}
+    tool_call_open: set[int] = set()  # indices already emitted as output_item.added
     usage: Json | None = None
     message_id = f"msg_{uuid.uuid4().hex}"
     reasoning_id = f"rs_{uuid.uuid4().hex}"
@@ -287,8 +289,30 @@ def handle_streaming_request(payload: Json, config: ProxyConfig, request_id: str
                         if tc.get("id"):
                             tool_calls[idx]["id"] = tc["id"]
                         fn = tc.get("function") or {}
-                        if fn.get("name"):
-                            tool_calls[idx]["function"]["name"] += fn["name"]
+                        name_delta = fn.get("name")
+                        if name_delta:
+                            tool_calls[idx]["function"]["name"] += name_delta
+                            # Emit output_item.added as soon as we have the full tool name.
+                            # DeepSeek sends the name in one chunk, so first non-empty name = complete.
+                            if idx not in tool_call_open and tool_calls[idx]["function"]["name"]:
+                                flat_name = tool_calls[idx]["function"]["name"]
+                                ns, _, n = flat_name.rpartition("__")
+                                if not ns or not n:
+                                    ns, n = None, flat_name
+                                fc_id = f"fc_{uuid.uuid4().hex}"
+                                call_id = tool_calls[idx]["id"] or f"call_{uuid.uuid4().hex}"
+                                tc_item: Json = {
+                                    "type": "function_call", "id": fc_id,
+                                    "call_id": call_id, "name": n,
+                                    "arguments": "", "status": "in_progress",
+                                }
+                                if ns:
+                                    tc_item["namespace"] = ns
+                                tool_call_items[idx] = tc_item
+                                tc_base = 1 if reasoning_open else 0
+                                send_event({"type": "response.output_item.added",
+                                            "output_index": tc_base + idx, "item": tc_item})
+                                tool_call_open.add(idx)
                         if fn.get("arguments"):
                             tool_calls[idx]["function"]["arguments"] += fn["arguments"]
     except urllib.error.HTTPError as exc:
@@ -330,17 +354,23 @@ def handle_streaming_request(payload: Json, config: ProxyConfig, request_id: str
                     "summary": [{"type": "summary_text", "text": reasoning}], "status": "completed"}
         send_event({"type": "response.output_item.done", "output_index": 0, "item": rs_done})
 
-    # Emit tool_call items that were accumulated during streaming.
-    # Codex requires output_item.added + output_item.done for each function_call;
-    # items only in response.completed payload are silently dropped.
+    # Emit output_item.done for tool calls that were opened during streaming,
+    # and added+done for any that weren't (e.g. name arrived in non-stream chunk).
     tc_base = 1 if reasoning_open else 0
     tc_count = 0
     for item in output:
         if item.get("type") != "function_call":
             continue
         idx = tc_base + tc_count
-        send_event({"type": "response.output_item.added", "output_index": idx, "item": item})
-        send_event({"type": "response.output_item.done", "output_index": idx, "item": item})
+        if tc_count in tool_call_open:
+            # Already emitted added; update with final arguments and close.
+            done_item = dict(tool_call_items[tc_count])
+            done_item["arguments"] = item.get("arguments", "{}")
+            done_item["status"] = "completed"
+            send_event({"type": "response.output_item.done", "output_index": idx, "item": done_item})
+        else:
+            send_event({"type": "response.output_item.added", "output_index": idx, "item": item})
+            send_event({"type": "response.output_item.done", "output_index": idx, "item": item})
         tc_count += 1
 
     # Close message item if opened.
