@@ -1,4 +1,7 @@
 {
+  "fetched_at": "2026-06-22T10:18:00.000000Z",
+  "etag": "W/\"opencode-go-catalog-v0.1.2\"",
+  "client_version": "0.142.0",
   "models": [
     {
       "slug": "deepseek-v4-flash",

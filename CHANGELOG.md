@@ -1,5 +1,15 @@
 # Changelog
 
+## [Unreleased]
+
+### Fixed
+
+- Reference catalog `contrib/opencode-go-catalog.json` now ships with the `ModelsCache` wrapper
+  (`fetched_at`/`etag`/`client_version`/`models`). Codex 0.142+ desktop app requires all four
+  top-level fields — the previous bare `{"models": [...]}` caused the model picker to fall back
+  to "Custom" instead of showing the full list. The CLI tolerated the bare format, so this only
+  surfaced in the desktop app.
+
 ## [0.1.2] - 2026-06-21
 
 Bug fixes + removed AUR packaging.

@@ -237,9 +237,14 @@ cp contrib/opencode-go-catalog.json ~/.codex/model-catalogs/opencode-go.json
 model_catalog_json = "/home/you/.codex/model-catalogs/opencode-go.json"
 ```
 
-The catalog has minimal fields (slug, display_name, context_window, supported_in_api).
+The catalog ships with the `ModelsCache` wrapper (`fetched_at`/`etag`/`client_version`/`models`).
+Codex 0.142+ desktop app requires all four top-level fields — a bare `{"models": [...]}` catalog
+causes the model picker to fall back to "Custom" instead of showing the full list. The CLI
+(`codex debug models`) tolerates the bare format, so this only surfaces in the desktop app.
+
 If you want Codex's full `base_instructions` for each model, copy your Codex installation's
-bundled `models.json` and append the OpenCode Go entries from the reference catalog.
+bundled `models.json` and append the OpenCode Go entries from the reference catalog (keep the
+`ModelsCache` wrapper).
 
 ## Trace
 
