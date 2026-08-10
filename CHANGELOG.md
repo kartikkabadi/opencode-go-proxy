@@ -8,6 +8,19 @@
   icon, live health check, start/stop of the proxy as a child process, open logs,
   reveal log file, copy port. Build with `swift build` in `macos/MenuBarApp` (macOS 13+).
 
+### Changed
+
+- README: document that the proxy exposes a single HTTP port (`OPENCODE_GO_PROXY_PORT`,
+  default 8787) with no admin/control channel, how to verify what is listening
+  (`lsof -nP -iTCP:8787 -sTCP:LISTEN`), and how to shorten the Codex provider label
+  (edit `[model_providers.opencode-go] name` in `~/.codex/config.toml`).
+### Changed
+
+- README: document that the proxy exposes a single HTTP port (`OPENCODE_GO_PROXY_PORT`,
+  default 8787) with no admin/control channel, how to verify what is listening
+  (`lsof -nP -iTCP:8787 -sTCP:LISTEN`), and how to shorten the Codex provider label
+  (edit `[model_providers.opencode-go] name` in `~/.codex/config.toml`).
+
 ### Fixed
 
 - Reference catalog `contrib/opencode-go-catalog.json` now ships with the `ModelsCache` wrapper

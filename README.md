@@ -222,6 +222,24 @@ All flags have environment variable defaults:
 
 The proxy accepts both `/responses` and `/v1/responses`.
 
+**One HTTP port only.** The proxy binds a single listener: `OPENCODE_GO_PROXY_PORT`
+(default `8787`). There is no admin port, control channel, or secondary service. If
+something else already listens on the port, the proxy fails to bind — check with
+`lsof -nP -iTCP:8787 -sTCP:LISTEN` before starting a second instance (for example, do
+not run the menu bar app's proxy and the launchd agent at the same time).
+
+**Short provider name.** The long "opencode go/" label in the Codex model picker comes
+from the provider config in `~/.codex/config.toml`, not from this proxy. Shorten it by
+editing the provider `name`:
+
+```toml
+[model_providers.opencode-go]
+name = "Go"  # shows as "Go" instead of "opencode go/"
+```
+
+The reference catalog's per-model `display_name` values are already short
+("DeepSeek V4 Flash", "Kimi K2.7 Code", etc).
+
 ## Model catalog
 
 Without a catalog entry, Codex prints a model metadata warning every turn. A reference catalog
@@ -267,6 +285,11 @@ Set `model_catalog_json` in Codex config and copy the reference catalog:
 
 **Connection refused on localhost:8787**
 Proxy isn't running. Start it: `opencode-go-proxy` or check `launchctl list | grep opencode`.
+
+**Port already in use**
+Only one proxy instance can bind 8787. Confirm what is listening:
+`lsof -nP -iTCP:8787 -sTCP:LISTEN`. If a stale instance holds the port, stop it before
+starting another.
 
 **API key not found**
 Set `OPENCODE_GO_API_KEY` env var or add to macOS keychain:
