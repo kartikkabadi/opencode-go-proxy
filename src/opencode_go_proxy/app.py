@@ -90,6 +90,18 @@ def trace(event: str, **fields: Any) -> None:
 DEFAULT_MAX_RETRIES = 2
 DEFAULT_RETRY_BASE_SLEEP_MS = 150
 
+# Budget for the MiMo image-caption sub-call. Generous on purpose: a healthy
+# caption call routinely takes ~16s, and the sub-call degrades to a placeholder
+# on timeout rather than crashing the turn.
+DEFAULT_CAPTION_TIMEOUT_SEC = 60.0
+
+
+def _caption_timeout_sec() -> float:
+    try:
+        return max(1.0, float(os.environ.get("OPENCODE_GO_PROXY_CAPTION_TIMEOUT_SEC", str(DEFAULT_CAPTION_TIMEOUT_SEC))))
+    except ValueError:
+        return DEFAULT_CAPTION_TIMEOUT_SEC
+
 
 def _max_retries() -> int:
     try:
@@ -785,7 +797,7 @@ def caption_image_via_mimo(image_url: str, image_model: str, config: ProxyConfig
         "max_tokens": 200,
     }
     try:
-        chat, _retries = call_upstream_chat(caption_payload, config, request_id, timeout_sec=15.0)
+        chat, _retries = call_upstream_chat(caption_payload, config, request_id, timeout_sec=_caption_timeout_sec())
         record_cache(config.cache_tracker, image_model, chat.get("usage"))
         choice = (chat.get("choices") or [{}])[0]
         text = (choice.get("message", {}) or {}).get("content", "")
