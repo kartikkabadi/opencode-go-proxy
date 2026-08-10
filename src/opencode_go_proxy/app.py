@@ -27,6 +27,7 @@ from .protocol import (
     cache_stats_from_usage,
     chat_completion_to_response,
     chat_message_to_response_output,
+    inject_session_model,
     new_response_id,
     normalize_usage,
     now_unix,
@@ -250,6 +251,8 @@ class ProxyError(Exception):
 
 
 def handle_responses_request(payload: Json, config: ProxyConfig, request_id: str) -> Json:
+    session_model = payload.get("model") or DEFAULT_MODEL
+    payload = inject_session_model(payload, session_model)
     chat_payload, request_model, conversion_stats = responses_payload_to_chat_payload(payload)
 
     # Split-turn: if image + tools, caption images via MiMo sub-call, then route to the requested model.
@@ -280,6 +283,8 @@ def handle_responses_request(payload: Json, config: ProxyConfig, request_id: str
 
 def handle_streaming_request(payload: Json, config: ProxyConfig, request_id: str, wfile: Any) -> None:
     """Stream upstream response as SSE in real-time: created → text deltas → completed."""
+    session_model = payload.get("model") or DEFAULT_MODEL
+    payload = inject_session_model(payload, session_model)
     chat_payload, request_model, conversion_stats = responses_payload_to_chat_payload(payload)
 
     if conversion_stats.get("has_image") and conversion_stats.get("tools_present"):
