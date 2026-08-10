@@ -19,11 +19,10 @@ import urllib.error
 import urllib.request
 from typing import Any
 
-from . import __version__
+from . import __version__, secrets
 from .config import ProxyConfig
 from .errors import ProxyError
 from .meter import usage_events_path
-from . import secrets
 
 Json = dict[str, Any]
 

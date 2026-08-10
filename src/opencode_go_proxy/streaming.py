@@ -31,7 +31,13 @@ from .protocol import (
 )
 from .secrets import resolve_api_key
 from .trace import _mask_trace_body, trace
-from .upstream import default_max_retries, record_cache, retriable_http_status, retry_sleep, usage_tokens
+from .upstream import (
+    default_max_retries,
+    record_cache,
+    retriable_http_status,
+    retry_sleep,
+    usage_tokens,
+)
 from .vision import caption_images_in_messages
 
 Json = dict[str, Any]

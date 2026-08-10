@@ -16,8 +16,9 @@ import pytest
 from opencode_go_proxy import vision
 from opencode_go_proxy.app import ProxyConfig
 from opencode_go_proxy.errors import ProxyError
-from opencode_go_proxy.upstream import call_upstream_chat, caption_timeout_sec as _caption_timeout_sec
 from opencode_go_proxy.protocol import IMAGE_MODEL_DEFAULT
+from opencode_go_proxy.upstream import call_upstream_chat
+from opencode_go_proxy.upstream import caption_timeout_sec as _caption_timeout_sec
 
 
 def make_config() -> ProxyConfig:

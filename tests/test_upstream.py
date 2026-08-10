@@ -12,7 +12,12 @@ import pytest
 from opencode_go_proxy.app import ProxyConfig
 from opencode_go_proxy.errors import ProxyError
 from opencode_go_proxy.secrets import clear_api_key_cache
-from opencode_go_proxy.upstream import DEFAULT_CAPTION_TIMEOUT_SEC, DEFAULT_MAX_RETRIES, call_upstream_chat, caption_timeout_sec
+from opencode_go_proxy.upstream import (
+    DEFAULT_CAPTION_TIMEOUT_SEC,
+    DEFAULT_MAX_RETRIES,
+    call_upstream_chat,
+    caption_timeout_sec,
+)
 
 
 def make_config() -> ProxyConfig:
@@ -58,15 +63,14 @@ class TestRetryPolicy:
         with mock.patch.dict(os.environ, {"OPENCODE_GO_API_KEY": "test-key"}), \
              mock.patch("urllib.request.urlopen", side_effect=fake_urlopen), \
              mock.patch("opencode_go_proxy.upstream.time.sleep"):
-            value, retries = call_upstream_chat(chat_payload(), make_config(), "req")
+            _value, retries = call_upstream_chat(chat_payload(), make_config(), "req")
         assert retries == 1
         assert len(calls) == 2
 
     def test_no_retry_on_permanent_error(self) -> None:
         with mock.patch.dict(os.environ, {"OPENCODE_GO_API_KEY": "test-key"}), \
-             mock.patch("urllib.request.urlopen", side_effect=http_error(400)) as urlopen:
-            with pytest.raises(ProxyError):
-                call_upstream_chat(chat_payload(), make_config(), "req")
+             mock.patch("urllib.request.urlopen", side_effect=http_error(400)) as urlopen, pytest.raises(ProxyError):
+            call_upstream_chat(chat_payload(), make_config(), "req")
         assert urlopen.call_count == 1
 
     def test_max_retries_zero_disables_retry(self) -> None:

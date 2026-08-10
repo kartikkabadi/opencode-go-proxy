@@ -13,9 +13,9 @@ import pytest
 
 from opencode_go_proxy.app import ProxyConfig, handle_responses_request
 from opencode_go_proxy.errors import ProxyError
+from opencode_go_proxy.meter import usage_events_path
 from opencode_go_proxy.streaming import handle_streaming_request
 from opencode_go_proxy.upstream import call_upstream_chat
-from opencode_go_proxy.meter import usage_events_path
 
 
 def make_config() -> ProxyConfig:

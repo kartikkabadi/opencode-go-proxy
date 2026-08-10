@@ -7,7 +7,11 @@ from unittest import mock
 
 from opencode_go_proxy.app import ProxyConfig
 from opencode_go_proxy.errors import ProxyError
-from opencode_go_proxy.secrets import clear_api_key_cache, keychain_services, resolve_api_key
+from opencode_go_proxy.secrets import (
+    clear_api_key_cache,
+    keychain_services,
+    resolve_api_key,
+)
 
 
 def make_config() -> ProxyConfig:
