@@ -632,6 +632,34 @@ class TestCacheAccounting:
         assert metrics["totals"]["cache_miss_tokens"] == 2
 
 
+class TestZstdRequests:
+    def test_zstd_compressed_request_body_is_accepted(self, server):
+        """The Codex desktop app sends /v1/responses bodies zstd-compressed;
+        the proxy must decompress before parsing (regression: json.loads on the
+        raw frame crashed with a UnicodeDecodeError)."""
+        import zstandard
+
+        port, _ = server
+        mock_resp = mock_chat_response("hello from compressed")
+
+        payload = json.dumps({"model": "deepseek-v4-flash", "input": "Say hi."}).encode()
+        compressed = zstandard.ZstdCompressor().compress(payload)
+
+        with mock.patch.dict(os.environ, {"OPENCODE_GO_API_KEY": "test-key"}), mock.patch(
+            "urllib.request.urlopen", return_value=MockUpstreamResponse(json.dumps(mock_resp).encode())
+        ):
+            conn = HTTPConnection("127.0.0.1", port, timeout=5)
+            conn.request("POST", "/v1/responses", compressed,
+                         {"content-type": "application/json", "content-encoding": "zstd"})
+            resp = conn.getresponse()
+            body = json.loads(resp.read())
+            conn.close()
+
+        assert resp.status == 200
+        assert body["status"] == "completed"
+        assert "hello from compressed" in body.get("output_text", "")
+
+
 class TestSSRFValidation:
     def test_file_scheme_rejected(self):
         from opencode_go_proxy.protocol import _is_safe_image_url

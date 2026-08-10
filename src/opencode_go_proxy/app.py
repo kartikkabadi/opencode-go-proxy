@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import argparse
+import gzip
+import io
 import json
 import os
 import signal
@@ -65,6 +67,57 @@ def record_cache(tracker: CacheTracker, model: str | None, usage: Any) -> None:
     if stats["ratio"] is None:
         return
     tracker.record(model or "unknown", stats["hit"], stats["miss"])
+
+
+def decode_request_body(raw: bytes, content_encoding: str, max_body_bytes: int) -> bytes:
+    """Decode an HTTP request body according to its Content-Encoding header.
+
+    The Codex desktop app sends /v1/responses bodies zstd-compressed whenever it
+    is authenticated (codex-rs: `Compression::Zstd`), so a proxy that serves the
+    app must decompress. gzip is supported as well; anything else is rejected
+    explicitly rather than crashing on a magic byte.
+    """
+    encoding = (content_encoding or "").strip().lower()
+    if not encoding or encoding in {"identity", "utf-8"}:
+        return raw
+    if encoding == "zstd":
+        try:
+            import zstandard as zstd
+        except ImportError as exc:  # pragma: no cover - env without the dep
+            raise ProxyError(
+                HTTPStatus.INTERNAL_SERVER_ERROR,
+                "zstd request bodies require the 'zstandard' package (pip install zstandard)",
+            ) from exc
+        cap = max(max_body_bytes * 4, 1 << 20)
+        try:
+            # Stream-decompress with a hard output cap: zstandard's
+            # max_output_size is only a hint once the frame declares its size,
+            # so a zip bomb must be bounded by reading in chunks and counting.
+            chunks: list[bytes] = []
+            total = 0
+            with zstd.ZstdDecompressor().stream_reader(io.BytesIO(raw)) as reader:
+                while True:
+                    chunk = reader.read(1 << 16)
+                    if not chunk:
+                        break
+                    total += len(chunk)
+                    if total > cap:
+                        raise ProxyError(
+                            HTTPStatus.REQUEST_ENTITY_TOO_LARGE,
+                            "decompressed request body exceeds the size cap",
+                        )
+                    chunks.append(chunk)
+            return b"".join(chunks)
+        except ProxyError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - surface a clean 400, not a crash
+            raise ProxyError(HTTPStatus.BAD_REQUEST, f"failed to decompress zstd request body: {exc}") from exc
+    if encoding in {"gzip", "x-gzip"}:
+        try:
+            return gzip.decompress(raw)
+        except OSError as exc:
+            raise ProxyError(HTTPStatus.BAD_REQUEST, "failed to decompress gzip request body") from exc
+    raise ProxyError(HTTPStatus.BAD_REQUEST, f"unsupported content-encoding: {content_encoding}")
 
 
 class ResponsesProxyHandler(BaseHTTPRequestHandler):
@@ -147,7 +200,11 @@ class ResponsesProxyHandler(BaseHTTPRequestHandler):
         raw = self.rfile.read(length)
         if not raw:
             return {}
-        value = json.loads(raw)
+        body = decode_request_body(raw, self.headers.get("content-encoding", ""), config.max_body_bytes)
+        try:
+            value = json.loads(body)
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise ProxyError(HTTPStatus.BAD_REQUEST, "request body is not valid JSON") from exc
         if not isinstance(value, dict):
             raise ProxyError(HTTPStatus.BAD_REQUEST, "request body must be a JSON object")
         return value
