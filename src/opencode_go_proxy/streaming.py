@@ -14,6 +14,7 @@ import time
 import urllib.error
 import urllib.request
 import uuid
+from http import HTTPStatus
 from typing import Any
 
 from .config import ProxyConfig
@@ -42,6 +43,16 @@ from .vision import caption_images_in_messages
 
 Json = dict[str, Any]
 
+DEFAULT_KEEPALIVE_SEC = 15.0
+
+
+def keepalive_sec() -> float:
+    """Keepalive comment interval; override so tests can tick without a 15s wait."""
+    try:
+        return max(0.05, float(os.environ.get("OPENCODE_GO_PROXY_KEEPALIVE_SEC", str(DEFAULT_KEEPALIVE_SEC))))
+    except ValueError:
+        return DEFAULT_KEEPALIVE_SEC
+
 
 def handle_streaming_request(payload: Json, config: ProxyConfig, request_id: str, wfile: Any) -> None:
     """Stream upstream response as SSE in real-time: created → text deltas → completed."""
@@ -64,7 +75,7 @@ def handle_streaming_request(payload: Json, config: ProxyConfig, request_id: str
             try:
                 wfile.write(b": keepalive\n\n")
                 wfile.flush()
-            except BrokenPipeError:
+            except (BrokenPipeError, OSError):
                 return
 
     ka_thread = threading.Thread(target=keepalive, daemon=True)
@@ -106,6 +117,7 @@ def handle_streaming_request(payload: Json, config: ProxyConfig, request_id: str
     try:
         api_key = resolve_api_key(config, request_id)
     except ProxyError as exc:
+        keepalive_stop.set()
         send_error(exc.message)
         return
 
@@ -389,3 +401,117 @@ def handle_streaming_request(payload: Json, config: ProxyConfig, request_id: str
     record_usage_event(model=model, status=200, duration_ms=duration_ms,
                        input_tokens=inp, output_tokens=outp, total_tokens=total,
                        retries=retries, empty_completion=empty)
+
+
+def handle_chat_stream_passthrough(payload: Json, config: ProxyConfig, request_id: str, handler: Any) -> None:
+    """Relay /chat/completions stream=true upstream SSE byte-for-byte.
+
+    Connect-first: an upstream non-200 is answered with the upstream's own
+    status and body before any SSE is committed. On 200 the proxy commits the
+    SSE head, runs the 15s keepalive comment thread until the upstream's first
+    byte, then writes every upstream line unchanged. Writes are serialized so a
+    keepalive comment never interleaves inside a relayed frame, and the relay
+    stops as soon as the client disconnects.
+    """
+    api_key = resolve_api_key(config, request_id)
+    url = f"{config.chat_base_url}/chat/completions"
+    raw_payload = json.dumps(payload, separators=(",",":")).encode("utf-8")
+    req = urllib.request.Request(url, data=raw_payload, headers={
+        "authorization": f"Bearer {api_key}", "content-type": "application/json",
+        "accept": "text/event-stream",
+        "user-agent": os.environ.get("OPENCODE_GO_PROXY_USER_AGENT", "codex/1.0"),
+    }, method="POST")
+    trace("upstream.start", request_id=request_id, url=url, bytes=len(raw_payload), stream=True)
+
+    retries = 0
+    max_retries = default_max_retries()
+    response = None
+    while response is None:
+        try:
+            response = urllib.request.urlopen(req, timeout=config.timeout_sec)
+        except urllib.error.HTTPError as exc:
+            body = exc.read()
+            trace("upstream.error", request_id=request_id, status=exc.code,
+                  body=_mask_trace_body(body.decode("utf-8", errors="replace")))
+            if retriable_http_status(exc.code) and retries < max_retries:
+                retries += 1
+                trace("upstream.retry", request_id=request_id, attempt=retries, status=exc.code)
+                retry_sleep(retries)
+                continue
+            # Nothing was committed yet, so the client sees the upstream's own
+            # status and error body, not a proxy envelope.
+            content_type = (exc.headers.get("content-type") if exc.headers else None) or "application/json"
+            handler.send_response(exc.code)
+            handler.send_header("content-type", content_type)
+            handler.send_header("content-length", str(len(body)))
+            handler.end_headers()
+            handler.wfile.write(body)
+            handler.wfile.flush()
+            return
+        except urllib.error.URLError as exc:
+            trace("upstream.network_error", request_id=request_id, reason=str(getattr(exc, "reason", exc)))
+            if retries < max_retries:
+                retries += 1
+                trace("upstream.retry", request_id=request_id, attempt=retries, reason=str(getattr(exc, "reason", exc)))
+                retry_sleep(retries)
+                continue
+            raise ProxyError(HTTPStatus.BAD_GATEWAY, f"upstream network error: {getattr(exc, 'reason', exc)}", retries=retries) from exc
+        except TimeoutError:
+            trace("upstream.timeout", request_id=request_id, timeout=config.timeout_sec)
+            if retries < max_retries:
+                retries += 1
+                trace("upstream.retry", request_id=request_id, attempt=retries, reason="timeout")
+                retry_sleep(retries)
+                continue
+            raise ProxyError(HTTPStatus.GATEWAY_TIMEOUT, "upstream timeout", retries=retries) from None
+
+    handler.send_response(HTTPStatus.OK)
+    handler.send_header("content-type", "text/event-stream")
+    handler.send_header("cache-control", "no-cache")
+    handler.end_headers()
+
+    keepalive_stop = threading.Event()
+    write_lock = threading.Lock()
+    interval = keepalive_sec()
+    client_alive = True
+
+    def keepalive() -> None:
+        nonlocal client_alive
+        while not keepalive_stop.wait(interval):
+            if not client_alive:
+                return
+            try:
+                with write_lock:
+                    handler.wfile.write(b": keepalive\n\n")
+                    handler.wfile.flush()
+            except (BrokenPipeError, OSError):
+                client_alive = False
+                return
+
+    ka_thread = threading.Thread(target=keepalive, daemon=True)
+    ka_thread.start()
+
+    started = time.time()
+    first_byte = True
+    try:
+        with response as resp:
+            for line in resp:
+                if first_byte:
+                    keepalive_stop.set()
+                    first_byte = False
+                if not client_alive:
+                    break
+                try:
+                    with write_lock:
+                        handler.wfile.write(line)
+                        handler.wfile.flush()
+                except (BrokenPipeError, OSError):
+                    client_alive = False
+                    trace("client.disconnected", request_id=request_id,
+                          message="client closed connection during stream")
+                    break
+    finally:
+        keepalive_stop.set()
+
+    elapsed_ms = int((time.time() - started) * 1000)
+    trace("upstream.done", request_id=request_id, status=response.status, elapsed_ms=elapsed_ms, stream=True)

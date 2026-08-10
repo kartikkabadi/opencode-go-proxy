@@ -4,6 +4,13 @@
 
 ### Added
 
+- Protocol surface (plan 005): `/v1/chat/completions` (and `/chat/completions`)
+  is a verbatim passthrough - non-stream relays the upstream status and JSON
+  body byte-for-byte (including the upstream's own error body), stream relays
+  the upstream SSE unchanged with the same 15s keepalive comment mechanism the
+  responses stream uses and stops on client disconnect; `/v1/messages` (and
+  `/messages`) answer an explicit `400 invalid_request_error`; the WebSocket
+  426 rejection now has a test asserting the exact response body.
 - Vision bridge module (plan 004): `vision.describe()` returns structured
   `Evidence` (summary / text / layout / unreadable); the caption engine auto-picks the
   cheapest image-capable catalog model or a probed local runtime (Ollama, llama.cpp

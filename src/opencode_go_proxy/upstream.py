@@ -80,6 +80,21 @@ def record_cache(tracker: Any, model: str | None, usage: Any) -> None:
     tracker.record(model or "unknown", stats["hit"], stats["miss"])
 
 
+def _chat_request(url: str, api_key: str, raw_payload: bytes, accept: str) -> urllib.request.Request:
+    """Build the one upstream chat-completions request shape both clients share."""
+    return urllib.request.Request(
+        url,
+        data=raw_payload,
+        headers={
+            "authorization": f"Bearer {api_key}",
+            "content-type": "application/json",
+            "accept": accept,
+            "user-agent": os.environ.get("OPENCODE_GO_PROXY_USER_AGENT", "codex/1.0"),
+        },
+        method="POST",
+    )
+
+
 def call_upstream_chat(chat_payload: Json, config: ProxyConfig, request_id: str, *, timeout_sec: float | None = None, max_retries: int | None = None) -> tuple[Json, int]:
     api_key = resolve_api_key(config, request_id)
 
@@ -88,17 +103,7 @@ def call_upstream_chat(chat_payload: Json, config: ProxyConfig, request_id: str,
     max_retries = default_max_retries() if max_retries is None else max_retries
     retries = 0
     while True:
-        request = urllib.request.Request(
-            url,
-            data=raw_payload,
-            headers={
-                "authorization": f"Bearer {api_key}",
-                "content-type": "application/json",
-                "accept": "application/json",
-                "user-agent": os.environ.get("OPENCODE_GO_PROXY_USER_AGENT", "codex/1.0"),
-            },
-            method="POST",
-        )
+        request = _chat_request(url, api_key, raw_payload, "application/json")
         trace("upstream.start", request_id=request_id, url=url, bytes=len(raw_payload), attempt=retries + 1)
         started = time.time()
         try:
@@ -129,6 +134,62 @@ def call_upstream_chat(chat_payload: Json, config: ProxyConfig, request_id: str,
             if exc.code == 504:
                 raise ProxyError(HTTPStatus.GATEWAY_TIMEOUT, "upstream timeout", retries=retries) from exc
             raise ProxyError(HTTPStatus.BAD_GATEWAY, f"upstream HTTP {exc.code}", retries=retries, upstream_status=exc.code) from exc
+        except urllib.error.URLError as exc:
+            trace("upstream.network_error", request_id=request_id, reason=str(getattr(exc, "reason", exc)))
+            if retries < max_retries:
+                retries += 1
+                trace("upstream.retry", request_id=request_id, attempt=retries, reason=str(getattr(exc, "reason", exc)))
+                retry_sleep(retries)
+                continue
+            raise ProxyError(HTTPStatus.BAD_GATEWAY, f"upstream network error: {getattr(exc, 'reason', exc)}", retries=retries) from exc
+        except TimeoutError:
+            trace("upstream.timeout", request_id=request_id, timeout=timeout_sec or config.timeout_sec)
+            if retries < max_retries:
+                retries += 1
+                trace("upstream.retry", request_id=request_id, attempt=retries, reason="timeout")
+                retry_sleep(retries)
+                continue
+            raise ProxyError(HTTPStatus.GATEWAY_TIMEOUT, "upstream timeout", retries=retries) from None
+
+
+def call_upstream_chat_verbatim(
+    chat_payload: Json, config: ProxyConfig, request_id: str,
+    *, timeout_sec: float | None = None, max_retries: int | None = None,
+) -> tuple[int, bytes, int]:
+    """POST chat/completions and return ``(upstream_status, raw_body, retries)``.
+
+    The /chat/completions passthrough relay: an upstream HTTP error is returned
+    with the upstream's own status and body so the proxy relays it verbatim
+    instead of substituting a ``proxy_error`` envelope. Transient failures
+    (429 / 5xx) retry under the same policy as :func:`call_upstream_chat`;
+    network and timeout failures have no upstream body to relay, so they still
+    raise :class:`ProxyError` like the JSON-mapping variant.
+    """
+    api_key = resolve_api_key(config, request_id)
+
+    url = f"{config.chat_base_url}/chat/completions"
+    raw_payload = json.dumps(chat_payload, separators=(",",":")).encode("utf-8")
+    max_retries = default_max_retries() if max_retries is None else max_retries
+    retries = 0
+    while True:
+        request = _chat_request(url, api_key, raw_payload, "application/json")
+        trace("upstream.start", request_id=request_id, url=url, bytes=len(raw_payload), attempt=retries + 1)
+        started = time.time()
+        try:
+            with urllib.request.urlopen(request, timeout=timeout_sec or config.timeout_sec) as response:
+                body = response.read()
+                elapsed_ms = int((time.time() - started) * 1000)
+                trace("upstream.done", request_id=request_id, status=response.status, bytes=len(body), elapsed_ms=elapsed_ms)
+                return response.status, body, retries
+        except urllib.error.HTTPError as exc:
+            body = exc.read()
+            trace("upstream.error", request_id=request_id, status=exc.code, body=_mask_trace_body(body.decode("utf-8", errors="replace")))
+            if retriable_http_status(exc.code) and retries < max_retries:
+                retries += 1
+                trace("upstream.retry", request_id=request_id, attempt=retries, status=exc.code)
+                retry_sleep(retries)
+                continue
+            return exc.code, body, retries
         except urllib.error.URLError as exc:
             trace("upstream.network_error", request_id=request_id, reason=str(getattr(exc, "reason", exc)))
             if retries < max_retries:

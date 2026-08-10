@@ -33,12 +33,30 @@ from .protocol import (
     known_models,
     responses_payload_to_chat_payload,
 )
-from .streaming import handle_streaming_request
+from .streaming import handle_chat_stream_passthrough, handle_streaming_request
 from .trace import trace
-from .upstream import call_upstream_chat, record_cache, usage_tokens
+from .upstream import (
+    call_upstream_chat,
+    call_upstream_chat_verbatim,
+    record_cache,
+    usage_tokens,
+)
 from .vision import caption_images_in_messages
 
 Json = dict[str, Any]
+
+RESPONSES_PATHS = {"/responses", "/v1/responses", "/responses/compact", "/v1/responses/compact"}
+CHAT_COMPLETIONS_PATHS = {"/chat/completions", "/v1/chat/completions"}
+MESSAGES_PATHS = {"/messages", "/v1/messages"}
+MESSAGES_UNSUPPORTED: Json = {
+    "error": {
+        "type": "invalid_request_error",
+        "message": (
+            "This proxy serves a single OpenAI-compatible provider via "
+            "/v1/chat/completions and /v1/responses; /messages is not supported."
+        ),
+    }
+}
 
 
 def _decompress_bounded(reader: Any, cap: int) -> bytes:
@@ -144,13 +162,18 @@ class ResponsesProxyHandler(BaseHTTPRequestHandler):
                 "data": [{"id": slug, "object": "model"} for slug in sorted(known_models())],
             })
             return
+        if self.path in MESSAGES_PATHS:
+            self._send_json(MESSAGES_UNSUPPORTED, status=HTTPStatus.BAD_REQUEST)
+            return
         self._send_json({"error": {"message": "not found"}}, status=HTTPStatus.NOT_FOUND)
 
     def do_POST(self) -> None:
         request_id = uuid.uuid4().hex[:12]
-        # /responses/compact is a standard Responses request; reuse the same handler.
-        if self.path not in {"/responses", "/v1/responses", "/responses/compact", "/v1/responses/compact"}:
-            self._send_json({"error": {"message": "not found"}}, status=HTTPStatus.NOT_FOUND)
+        if self.path not in RESPONSES_PATHS | CHAT_COMPLETIONS_PATHS:
+            if self.path in MESSAGES_PATHS:
+                self._send_json(MESSAGES_UNSUPPORTED, status=HTTPStatus.BAD_REQUEST)
+            else:
+                self._send_json({"error": {"message": "not found"}}, status=HTTPStatus.NOT_FOUND)
             return
 
         try:
@@ -163,7 +186,9 @@ class ResponsesProxyHandler(BaseHTTPRequestHandler):
                 model=payload.get("model"),
                 stream=payload.get("stream", False),
             )
-            if payload.get("stream") is True:
+            if self.path in CHAT_COMPLETIONS_PATHS:
+                handle_chat_completions_request(self, payload, config, request_id)
+            elif payload.get("stream") is True:
                 # Real streaming: send SSE headers, then stream from upstream in real-time.
                 self.send_response(HTTPStatus.OK)
                 self.send_header("content-type", "text/event-stream")
@@ -269,6 +294,27 @@ def handle_responses_request(payload: Json, config: ProxyConfig, request_id: str
         input_tokens=inp, output_tokens=outp, total_tokens=total, retries=retries,
     )
     return response
+
+
+def handle_chat_completions_request(handler: ResponsesProxyHandler, payload: Json, config: ProxyConfig, request_id: str) -> None:
+    """Verbatim /chat/completions passthrough for both stream modes.
+
+    Non-stream relays the upstream status and JSON body verbatim, including the
+    upstream's own error body on 4xx/5xx (never a ``proxy_error`` envelope).
+    Stream commits SSE only after the upstream answers 200 and relays its bytes
+    unchanged. A missing key surfaces the same 401 proxy error the responses
+    path uses.
+    """
+    if payload.get("stream") is True:
+        handle_chat_stream_passthrough(payload, config, request_id, handler)
+        return
+    status, body, _retries = call_upstream_chat_verbatim(payload, config, request_id)
+    handler.send_response(status)
+    handler.send_header("content-type", "application/json")
+    handler.send_header("content-length", str(len(body)))
+    handler.end_headers()
+    handler.wfile.write(body)
+    handler.wfile.flush()
 
 
 def build_parser() -> argparse.ArgumentParser:

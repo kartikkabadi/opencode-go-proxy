@@ -16,6 +16,7 @@ from opencode_go_proxy.upstream import (
     DEFAULT_CAPTION_TIMEOUT_SEC,
     DEFAULT_MAX_RETRIES,
     call_upstream_chat,
+    call_upstream_chat_verbatim,
     caption_timeout_sec,
 )
 
@@ -116,3 +117,51 @@ class TestCaptionBudget:
     def test_malformed_falls_back(self) -> None:
         with mock.patch.dict(os.environ, {"OPENCODE_GO_PROXY_CAPTION_TIMEOUT_SEC": "x"}, clear=True):
             assert caption_timeout_sec() == 30.0
+
+
+class TestVerbatimPassthroughClient:
+    def test_returns_upstream_status_and_raw_body(self) -> None:
+        raw = json.dumps({"choices": [{"message": {"content": "hi"}}]}).encode("utf-8")
+        with mock.patch.dict(os.environ, {"OPENCODE_GO_API_KEY": "test-key"}), \
+             mock.patch("urllib.request.urlopen", return_value=ok_response()) as urlopen:
+            status, body, retries = call_upstream_chat_verbatim(chat_payload(), make_config(), "req")
+
+        assert status == 200
+        assert body == raw
+        assert retries == 0
+        urlopen.assert_called_once()
+
+    def test_retries_transient_then_relays_final_error_verbatim(self) -> None:
+        calls = []
+
+        def fake_urlopen(req, **kw):
+            calls.append(req)
+            raise http_error(429)
+
+        with mock.patch.dict(os.environ, {"OPENCODE_GO_API_KEY": "test-key"}), \
+             mock.patch("urllib.request.urlopen", side_effect=fake_urlopen), \
+             mock.patch("opencode_go_proxy.upstream.time.sleep"):
+            status, body, retries = call_upstream_chat_verbatim(chat_payload(), make_config(), "req")
+
+        assert status == 429
+        assert body == b'{"error":"down"}'
+        assert retries == DEFAULT_MAX_RETRIES
+        assert len(calls) == DEFAULT_MAX_RETRIES + 1
+
+    def test_permanent_error_relayed_without_retry(self) -> None:
+        with mock.patch.dict(os.environ, {"OPENCODE_GO_API_KEY": "test-key"}), \
+             mock.patch("urllib.request.urlopen", side_effect=http_error(400)) as urlopen:
+            status, body, retries = call_upstream_chat_verbatim(chat_payload(), make_config(), "req")
+
+        assert status == 400
+        assert body == b'{"error":"down"}'
+        assert retries == 0
+        urlopen.assert_called_once()
+
+    def test_network_error_still_raises_proxy_error(self) -> None:
+        with mock.patch.dict(os.environ, {"OPENCODE_GO_API_KEY": "test-key"}), \
+             mock.patch("urllib.request.urlopen", side_effect=urllib.error.URLError("refused")), \
+             pytest.raises(ProxyError) as ctx:
+            call_upstream_chat_verbatim(chat_payload(), make_config(), "req", max_retries=0)
+
+        assert ctx.value.status == HTTPStatus.BAD_GATEWAY
