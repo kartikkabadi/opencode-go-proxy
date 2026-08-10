@@ -3,7 +3,7 @@ revision = 3
 requires-python = ">=3.11"
 
 [options]
-exclude-newer = "2026-08-09T12:55:32.595Z"
+exclude-newer = "2026-08-09T14:42:31.463817Z"
 exclude-newer-span = "P1D"
 
 [[package]]
@@ -26,7 +26,7 @@ wheels = [
 
 [[package]]
 name = "opencode-go-proxy"
-version = "0.1.2"
+version = "0.2.0"
 source = { editable = "." }
 dependencies = [
     { name = "zstandard" },
