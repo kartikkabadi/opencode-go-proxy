@@ -35,5 +35,6 @@ cp -R .build/release/OpenCodeGoMenuBar OpenCodeGoMenuBar.app/Contents/MacOS/
   127.0.0.1:8787 (for example the launchd agent), instead of spawning a second proxy that
   would fail to bind. One proxy per port. To switch from launchd to the menu bar, stop the
   launchd agent first (`launchctl bootout gui/$(id -u) ~/Library/LaunchAgents/com.opencode-go.proxy.plist`).
-- The proxy resolves the API key exactly as the CLI does: `$OPENCODE_GO_API_KEY` first, then
-  the macOS keychain service `opencode-go-api-key`.
+- The spawned proxy resolves the API key exactly as the CLI does: `$OPENCODE_GO_API_KEY`
+  first, then `$OPENCODE_API_KEY`, then the macOS keychain services `opencode-go-api-key`
+  and `codex-router-opencode-go`.

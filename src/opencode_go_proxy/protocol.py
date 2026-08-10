@@ -8,16 +8,71 @@ from typing import Any
 
 Json = dict[str, Any]
 
+
+def _as_int(value: Any) -> int:
+    """Coerce an upstream token count to int, tolerating malformed values.
+
+    Upstream usage may carry string or missing token fields; a malformed value
+    must never crash a request that was already billed upstream.
+    """
+    if isinstance(value, bool):
+        return int(value)
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        return int(value)
+    if isinstance(value, str):
+        try:
+            return int(value)
+        except ValueError:
+            return 0
+    return 0
+
+
 SESSION_SPAWN_TOOLS = {"create_thread", "send_message_to_thread"}
 
 
+def _translate_tool_choice(tool_choice: Any) -> Any:
+    """Map a Responses tool_choice to the Chat Completions shape.
+
+    Responses uses {"type": "function", "name": X} and {"type": "auto|required|none"};
+    Chat Completions needs {"type": "function", "function": {"name": X}} and the
+    bare strings "auto" / "required" / "none". Anything unrecognized is dropped
+    so the upstream applies its own default rather than failing on a bad shape.
+    """
+    if isinstance(tool_choice, str):
+        return tool_choice
+    if isinstance(tool_choice, dict):
+        t = tool_choice.get("type")
+        if t == "function":
+            name = tool_choice.get("name")
+            if isinstance(name, str) and name:
+                return {"type": "function", "function": {"name": name}}
+            return None
+        if t in ("auto", "required", "none"):
+            return t
+    return None
+
+
 def _session_spawn_name(item: Json) -> str | None:
-    """Return the bare tool name of a function_call item, if it is a session-spawn call."""
+    """Return the bare tool name of a function_call item, if it is a session-spawn call.
+
+    Only genuine codex_app thread-spawn tools match, so unrelated MCP tools
+    (e.g. mcp__slack__create_thread) are never rewritten. Accepted forms:
+    - flat: name is "codex_app__create_thread" / "codex_app__send_message_to_thread"
+    - namespaced: namespace is absent or "codex_app" with a bare spawn-tool name
+    """
     name = item.get("name")
-    if isinstance(name, str) and "__" in name:
-        # Flat namespace form: codex_app__create_thread.
-        name = name.rsplit("__", 1)[1]
-    if not isinstance(name, str) or name not in SESSION_SPAWN_TOOLS:
+    if not isinstance(name, str):
+        return None
+    if "__" in name:
+        namespace, _, bare = name.partition("__")
+        if namespace != "codex_app" or bare not in SESSION_SPAWN_TOOLS:
+            return None
+        return bare
+    if item.get("namespace") not in (None, "codex_app"):
+        return None
+    if name not in SESSION_SPAWN_TOOLS:
         return None
     return name
 
@@ -52,6 +107,9 @@ def inject_session_model(payload: Json, session_model: str) -> Json:
             continue
         model = parsed.get("model")
         if model is not None and model != "":
+            continue
+        if model is None and "model" in parsed:
+            # {"model": null} is explicitly present — leave it as-is.
             continue
         parsed["model"] = session_model
         item["arguments"] = json.dumps(parsed, sort_keys=True)
@@ -477,7 +535,9 @@ def responses_payload_to_chat_payload(payload: Json) -> tuple[Json, str, Json]:
     if tools is not None:
         chat_payload["tools"] = tools
         if payload.get("tool_choice") is not None:
-            chat_payload["tool_choice"] = payload["tool_choice"]
+            choice = _translate_tool_choice(payload["tool_choice"])
+            if choice is not None:
+                chat_payload["tool_choice"] = choice
 
     if payload.get("temperature") is not None:
         chat_payload["temperature"] = payload["temperature"]
@@ -609,7 +669,7 @@ def cache_stats_from_usage(usage: Any) -> Json:
     hit = hit_raw if isinstance(hit_raw, int) else (cached_raw if isinstance(cached_raw, int) else 0)
     if not isinstance(hit, int):
         hit = 0
-    miss = miss_raw if isinstance(miss_raw, int) else max(0, int(input_tokens or 0) - hit)
+    miss = miss_raw if isinstance(miss_raw, int) else max(0, _as_int(input_tokens) - hit)
     if hit == 0 and miss == 0:
         return {"hit": 0, "miss": 0, "ratio": None}
     total = hit + miss
@@ -619,12 +679,12 @@ def cache_stats_from_usage(usage: Any) -> Json:
 def normalize_usage(usage: Any) -> Json | None:
     if not isinstance(usage, dict):
         return None
-    input_tokens = usage.get("prompt_tokens", usage.get("input_tokens", 0))
-    output_tokens = usage.get("completion_tokens", usage.get("output_tokens", 0))
+    input_tokens = _as_int(usage.get("prompt_tokens", usage.get("input_tokens", 0)))
+    output_tokens = _as_int(usage.get("completion_tokens", usage.get("output_tokens", 0)))
     normalized: Json = {
         "input_tokens": input_tokens,
         "output_tokens": output_tokens,
-        "total_tokens": usage.get("total_tokens", input_tokens + output_tokens),
+        "total_tokens": _as_int(usage.get("total_tokens", input_tokens + output_tokens)),
     }
     # Surf the upstream's own prefix-cache accounting back to Codex in the
     # standard Responses shape so the app's token display shows cache hits,

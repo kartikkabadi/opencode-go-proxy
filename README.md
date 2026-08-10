@@ -3,7 +3,7 @@
 [![CI](https://github.com/kartikkabadi/opencode-go-proxy/actions/workflows/ci.yml/badge.svg)](https://github.com/kartikkabadi/opencode-go-proxy/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Python 3.11+](https://img.shields.io/badge/python-3.11+-blue.svg)](https://www.python.org/downloads/)
-[![Zero deps](https://img.shields.io/badge/dependencies-zero-brightgreen.svg)](#)
+[![Dependencies: zstandard](https://img.shields.io/badge/dependencies-zstandard-blue.svg)](#)
 
 Use your [OpenCode Go](https://opencode.ai/docs/go) subscription in the [Codex app](https://github.com/openai/codex).
 
@@ -15,7 +15,7 @@ Codex app
     │
     │  POST /v1/responses (Responses API)
     ▼
-opencode-go-proxy  ←── localhost:8787, zero deps, stdlib only
+opencode-go-proxy  ←── localhost:8787, one runtime dep (zstandard)
     │
     │  POST /v1/chat/completions (Chat Completions API)
     ▼
@@ -177,6 +177,14 @@ See the [lazycodex docs](https://github.com/code-yeongyu/oh-my-openagent) for se
 - SSRF protection on image URLs (`data:image/` and `https://` only)
 - Configurable body cap, bind address guard, keychain credential resolution
 - Local health and model-list endpoints
+- Prefix caching: byte-stable request prefixes plus `include_usage`, with per-model hit ratio on `/cache`
+- Honest usage meter: append-only `usage-events.jsonl` in the state dir (truncated or empty responses never count as success)
+- Upstream retry with bounded exponential backoff on transient failures (429/5xx/network/timeout)
+- Ops CLI: `doctor` (self-check), `smoke-test` (live upstream probe), `support-bundle` (redacted tarball)
+- Spawned threads inherit the parent session's model (`create_thread` / `send_message_to_thread`)
+- WebSocket upgrade requests answered with `426 Upgrade Required` (desktop app falls back to HTTP streaming)
+- zstd-compressed request bodies decompressed (`Content-Encoding: zstd`; the desktop app sends them)
+- Single-port guard in the menu bar app: refuses Start when 8787 is already owned
 
 ## Prefix caching
 

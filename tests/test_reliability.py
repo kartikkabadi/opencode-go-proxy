@@ -16,6 +16,10 @@ from opencode_go_proxy.app import (
     ProxyError,
     call_upstream_chat,
     handle_responses_request,
+<<<<<<< HEAD
+=======
+    handle_streaming_request,
+>>>>>>> 023aafd (fix: apply 0.2.0 review findings (12-agent review pass))
 )
 from opencode_go_proxy.meter import usage_events_path
 
@@ -147,3 +151,42 @@ class TestMeterThroughHandler:
         assert e["input_tokens"] == 3
         assert e["total_tokens"] == 4
         assert "streamAborted" not in e
+
+    def _events(self) -> list[dict]:
+        with open(usage_events_path(), encoding="utf-8") as f:
+            return [json.loads(line) for line in f if line.strip()]
+
+    def test_streaming_429_exhausted_records_429_not_aborted(self, env) -> None:
+        # A connect-phase 429 exhaustion must meter the real upstream status,
+        # not a synthetic 502 + streamAborted (nothing was ever streamed).
+        cfg = make_config()
+        payload = {"model": "deepseek-v4-flash", "input": "hi", "stream": True}
+        urlopen = mock.Mock(side_effect=http_error(429, retry_after="5"))
+        with mock.patch.dict(os.environ, {"OPENCODE_GO_PROXY_MAX_RETRIES": "1"}), \
+             mock.patch("urllib.request.urlopen", urlopen), \
+             mock.patch("opencode_go_proxy.app.time.sleep"):
+            handle_streaming_request(payload, cfg, "req8", io.BytesIO())
+        assert urlopen.call_count == 2  # initial + 1 retry
+        events = self._events()
+        assert len(events) == 1
+        e = events[0]
+        assert e["status"] == 429
+        assert e["retries"] == 1
+        assert "streamAborted" not in e
+
+    def test_failed_turn_after_retry_records_retries(self, env) -> None:
+        # A non-streaming turn that exhausts retries must still report how many
+        # retries it burned (regression: ProxyError branch omitted retries).
+        cfg = make_config()
+        payload = {"model": "deepseek-v4-flash", "input": "hi", "stream": False}
+        urlopen = mock.Mock(side_effect=http_error(429))
+        with mock.patch.dict(os.environ, {"OPENCODE_GO_PROXY_MAX_RETRIES": "1"}), \
+             mock.patch("urllib.request.urlopen", urlopen), \
+             mock.patch("opencode_go_proxy.app.time.sleep"):
+            with pytest.raises(ProxyError):
+                handle_responses_request(payload, cfg, "req9")
+        events = self._events()
+        assert len(events) == 1
+        e = events[0]
+        assert e["status"] == 429
+        assert e["retries"] == 1

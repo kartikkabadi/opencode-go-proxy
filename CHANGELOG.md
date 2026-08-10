@@ -25,6 +25,8 @@
 - Ops CLI commands: `opencode-go-proxy doctor` (self-check), `smoke-test` (real
   upstream probe) and `support-bundle` (namespaced tarball of logs, config and
   meter, with secret values redacted).
+- Agent skill `skills/opencode-go-proxy/SKILL.md`: orientation for operating the
+  proxy (start/stop, ops commands, prefix caching, config, reliability).
 - Tests: cache parsing (both DeepSeek and OpenAI usage shapes), tracker accounting,
   `/cache` endpoint, streaming `stream_options`, cache passthrough to Codex,
   meter recording, upstream retry behavior, and the ops commands.
@@ -33,10 +35,8 @@
 
 - Native macOS menu bar app in `macos/MenuBarApp` (Swift/AppKit, SwiftPM): short status
   icon, live health check, start/stop of the proxy as a child process, open logs,
-  reveal log file, copy port. Build with `swift build` in `macos/MenuBarApp` (macOS 13+).
-
-### Changed
-
+  reveal log file, copy port. It refuses to Start when port 8787 is already owned
+  (single-port guard). Build with `swift build` in `macos/MenuBarApp` (macOS 13+).
 - README: document that the proxy exposes a single HTTP port (`OPENCODE_GO_PROXY_PORT`,
   default 8787) with no admin/control channel, how to verify what is listening
   (`lsof -nP -iTCP:8787 -sTCP:LISTEN`), and how to shorten the Codex provider label
@@ -44,6 +44,10 @@
 
 ### Fixed
 
+- zstd request bodies: the Codex desktop app sends `/v1/responses` bodies
+  zstd-compressed whenever it is authenticated; the proxy now decompresses
+  `Content-Encoding: zstd` (and gzip) so the desktop app works. Unsupported
+  encodings return an explicit 400 instead of crashing on a magic byte.
 - Reference catalog `contrib/opencode-go-catalog.json` now ships with the `ModelsCache` wrapper
   (`fetched_at`/`etag`/`client_version`/`models`). Codex 0.142+ desktop app requires all four
   top-level fields — the previous bare `{"models": [...]}` caused the model picker to fall back

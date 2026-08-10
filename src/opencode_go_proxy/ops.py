@@ -1,8 +1,8 @@
 """Operational commands: doctor, smoke-test, support-bundle.
 
-Stdlib-only and single-provider like the rest of the proxy. Each command is
-read-mostly and never mutates user config. `doctor` returns non-zero exit when
-any check fails; `smoke-test` returns non-zero when the upstream probe fails;
+Stdlib-only and single-provider like the rest of the proxy. `doctor` is
+read-only: it inspects env/keychain, /health, the meter, logs, and config, and
+records nothing. `smoke-test` sends one real chat-completion to upstream;
 `support-bundle` writes a tarball that redacts secret values.
 """
 
@@ -12,6 +12,7 @@ import io
 import json
 import os
 import re
+import subprocess
 import sys
 import tarfile
 import time
@@ -20,7 +21,7 @@ import urllib.request
 from typing import Any
 
 from . import __version__
-from .meter import record_usage_event, usage_events_path
+from .meter import usage_events_path
 
 Json = dict[str, Any]
 
@@ -33,9 +34,12 @@ CHAT_BASE_URL = os.environ.get("CHAT_COMPLETIONS_BASE_URL", "https://opencode.ai
 _LOG_NAMES = ("opencode-go-proxy.log", "opencode-go-proxy.err")
 
 # Secret-looking keys redacted from the support bundle; everything else is
-# left verbatim so a config dump stays readable.
+# left verbatim so a config dump stays readable. The key name is any run of
+# word characters ending in a secret suffix (so OPENCODE_API_KEY and
+# env.api_key match, not just a bare api_key), bounded by a non-word char
+# before it, and the value may be single- or double-quoted TOML.
 _SECRET_KEY = re.compile(
-    r'(?i)\b(api[_-]?key|apikey|token|secret|password|authorization|bearer|access[_-]?key)\b\s*=\s*"[^"]*"'
+    r'(?i)(?<![\w])([A-Za-z0-9_]*?(?:api[_-]?key|apikey|token|secret|password|authorization|bearer|access[_-]?key))\s*=\s*(?:"[^"]*"|\'[^\']*\')'
 )
 
 
@@ -57,12 +61,53 @@ def _configured_key_env() -> str:
     return os.environ.get("OPENCODE_GO_PROXY_API_KEY_ENV", "OPENCODE_GO_API_KEY")
 
 
+# Keychain services that may hold the API key. Mirrors app.resolve_api_key's
+# order so doctor reports the same resolution the proxy actually uses: the
+# configured env var, then $OPENCODE_API_KEY, then the macOS keychain.
+_KEYCHAIN_SERVICES: tuple[str, ...] = ("opencode-go-api-key", "codex-router-opencode-go")
+
+
+def _keychain_services() -> list[str]:
+    services: list[str] = []
+    service_env = os.environ.get("CODEX_KEYCHAIN_SERVICE")
+    if service_env:
+        services.append(service_env)
+    services.extend(_KEYCHAIN_SERVICES)
+    return list(dict.fromkeys(services))
+
+
+def _resolve_api_key() -> tuple[str, str] | None:
+    """Resolve the API key the way the proxy does; return (value, source) or None.
+
+    Never prints the value; callers use it only for a presence check.
+    """
+    for env in (_configured_key_env(), "OPENCODE_API_KEY"):
+        if not env:
+            continue
+        value = os.environ.get(env)
+        if value:
+            return value, f"${env}"
+    for keychain_service in _keychain_services():
+        try:
+            completed = subprocess.run(
+                ["security", "find-generic-password", "-a", os.environ.get("USER", ""), "-s", keychain_service, "-w"],
+                check=False, capture_output=True, text=True, stdin=subprocess.DEVNULL, timeout=10,
+            )
+        except (FileNotFoundError, subprocess.TimeoutExpired):
+            continue
+        if completed.returncode == 0:
+            first_line = completed.stdout.splitlines()[0].strip() if completed.stdout.splitlines() else ""
+            if first_line:
+                return first_line, f"keychain:{keychain_service}"
+    return None
+
+
 def check_api_key() -> Check:
-    """The proxy key is present in its configured env var (never printed)."""
-    value = os.environ.get(_configured_key_env())
-    if value:
-        return Check("api key", True, f"resolved from ${_configured_key_env()}")
-    return Check("api key", False, f"set ${_configured_key_env()} or run `opencode-go-proxy` with the key present")
+    """The proxy key is present in env or the macOS keychain (never printed)."""
+    resolved = _resolve_api_key()
+    if resolved is not None:
+        return Check("api key", True, f"resolved from {resolved[1]}")
+    return Check("api key", False, f"set ${_configured_key_env()}, $OPENCODE_API_KEY, or keychain:{_KEYCHAIN_SERVICES[0]}")
 
 
 def check_service(url: str = HEALTH_URL) -> Check:
@@ -75,12 +120,17 @@ def check_service(url: str = HEALTH_URL) -> Check:
 
 
 def check_meter() -> Check:
-    """The usage meter is writable at its configured location."""
-    record_usage_event(model="doctor", status=0, duration_ms=0)
+    """The usage meter is writable at its configured location; probe never records."""
     path = usage_events_path()
-    if os.path.exists(path):
-        return Check("meter", True, path)
-    return Check("meter", False, "cannot write usage-events.jsonl")
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        # Probe writability without recording: an append-mode open creates the
+        # file if missing but adds no content, so the honest meter stays clean.
+        with open(path, "a", encoding="utf-8"):
+            pass
+    except OSError:
+        return Check("meter", False, "cannot write usage-events.jsonl")
+    return Check("meter", True, path)
 
 
 def check_logs() -> Check:

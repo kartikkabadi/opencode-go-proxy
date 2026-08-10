@@ -8,9 +8,12 @@ from unittest import mock
 
 from opencode_go_proxy.catalog import (
     CatalogDiscoveryError,
+    _model_from_discovery,
     discover_models,
     load_known_slugs,
     merge_models,
+    model_messages,
+    render_full_catalog,
 )
 
 
@@ -106,6 +109,70 @@ class LoadKnownSlugsTests(unittest.TestCase):
             slugs = load_known_slugs(catalog_path=str(missing))
 
         self.assertEqual(slugs, set())
+
+
+def minimal_compact(shared_instructions: str, model: dict) -> dict:
+    return {
+        "fetched_at": "2026-08-10T12:00:00.000000Z",
+        "etag": 'W/"opencode-go-models-test"',
+        "shared_instructions": shared_instructions,
+        "client_version": "0.147.0",
+        "models": [model],
+    }
+
+
+def minimal_model(**overrides: object) -> dict:
+    record = {
+        "slug": "cold-start-model",
+        "display_name": "Cold Start Model",
+        "description": "Rendered on first discovery.",
+        "default_reasoning_level": "medium",
+        "supported_reasoning_levels": [{"effort": "low", "description": "Lighter"}],
+        "context_window": 1000000,
+        "max_context_window": 1000000,
+    }
+    record.update(overrides)
+    return record
+
+
+class ColdStartRenderTests(unittest.TestCase):
+    def test_render_with_empty_shared_instructions_does_not_crash(self) -> None:
+        compact = minimal_compact("", minimal_model())
+
+        rendered = render_full_catalog(compact)
+
+        model = rendered["models"][0]
+        self.assertEqual(model["base_instructions"], "")
+        template = model["model_messages"]["instructions_template"]
+        self.assertIn("You are Codex, a coding agent based on Cold Start Model.", template)
+
+    def test_model_messages_with_empty_shared_instructions_uses_identity_line(self) -> None:
+        messages = model_messages("", "Cold Start Model", 1000000)
+
+        self.assertEqual(
+            messages["instructions_template"],
+            "You are Codex, a coding agent based on Cold Start Model. You and the user "
+            "share one workspace, and your job is to collaborate with them until their "
+            "goal is genuinely handled.",
+        )
+        self.assertEqual(messages["auto_compact_token_limit"], 900000)
+
+    def test_discovery_without_limit_context_keeps_default(self) -> None:
+        record = _model_from_discovery({"id": "no-context-model", "name": "No Context"})
+
+        self.assertEqual(record["context_window"], 1000000)
+        self.assertEqual(record["max_context_window"], 1000000)
+
+    def test_render_with_default_context_window_does_not_crash(self) -> None:
+        discovered = _model_from_discovery({"id": "no-context-model", "name": "No Context"})
+        compact = minimal_compact("Line one\n", discovered)
+
+        rendered = render_full_catalog(compact)
+
+        self.assertEqual(
+            rendered["models"][0]["model_messages"]["auto_compact_token_limit"],
+            round(1000000 * 0.9),
+        )
 
 
 if __name__ == "__main__":

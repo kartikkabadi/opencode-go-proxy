@@ -1,11 +1,11 @@
 ---
 name: opencode-go-proxy
-description: Orientation for using the opencode-go-proxy bridge, which lets the Codex app use the OpenCode Go subscription (13 open coding models) through a local zero-dependency Python service. Explains how traffic flows, how to start and stop the proxy (menu bar app or CLI, single port 8787), the operational commands (doctor, smoke-test, support-bundle), how prefix caching works and how to check the hit ratio, and the config and API-key resolution. Use when working on or operating opencode-go-proxy, or when the Codex app is pointed at 127.0.0.1:8787.
+description: Orientation for using the opencode-go-proxy bridge, which lets the Codex app use the OpenCode Go subscription (13 open coding models) through a local Python service with one runtime dependency (zstandard). Explains how traffic flows, how to start and stop the proxy (menu bar app or CLI, single port 8787), the operational commands (doctor, smoke-test, support-bundle), how prefix caching works and how to check the hit ratio, and the config and API-key resolution. Use when working on or operating opencode-go-proxy, or when the Codex app is pointed at 127.0.0.1:8787.
 ---
 
 # OpenCode Go Proxy
 
-The proxy bridges Codex's Responses API to OpenCode Go's Chat Completions API in one local process on port 8787. It is stdlib-only, single-provider, and single-port.
+The proxy bridges Codex's Responses API to OpenCode Go's Chat Completions API in one local process on port 8787. It has one runtime dependency (zstandard); the rest is stdlib. It is single-provider and single-port.
 
 ```text
 Codex app -> POST /v1/responses -> opencode-go-proxy (127.0.0.1:8787) -> POST /v1/chat/completions -> OpenCode Go
@@ -42,5 +42,5 @@ Resolved in order: `OPENCODE_GO_API_KEY`, `OPENCODE_API_KEY`, then macOS keychai
 
 ## Config
 
-- `~/.codex/config.toml`: the provider block points `openai_base_url` at `http://127.0.0.1:8787/v1`; the `[model_providers.opencode-go] name` knob controls the label in the Codex model picker.
-- Bind is guarded to localhost; the proxy refuses to expose the upstream API key to the network.
+- `~/.codex/config.toml`: the provider block points `base_url` at `http://127.0.0.1:8787/v1`; the `[model_providers.opencode-go] name` knob controls the label in the Codex model picker.
+- Bind is guarded: the proxy emits a trace-log warning when bound outside localhost (e.g. `--bind 0.0.0.0`). It does not refuse to start.

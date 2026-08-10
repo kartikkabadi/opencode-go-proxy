@@ -31,13 +31,33 @@ def _http_error(code: int, body: str = ""):
 
 class TestApiKey:
     def test_missing(self) -> None:
-        with mock.patch.dict(os.environ, {}, clear=False):
+        with mock.patch.dict(os.environ, {}, clear=False), \
+             mock.patch("opencode_go_proxy.ops.subprocess.run", side_effect=FileNotFoundError("no security")):
             os.environ.pop("OPENCODE_GO_API_KEY", None)
+            os.environ.pop("OPENCODE_API_KEY", None)
             c = ops.check_api_key()
         assert not c.ok
 
     def test_present(self) -> None:
         with mock.patch.dict(os.environ, {"OPENCODE_GO_API_KEY": "sk-abc123"}):
+            assert ops.check_api_key().ok
+
+    def test_env_takes_precedence_over_keychain(self) -> None:
+        with mock.patch.dict(os.environ, {"OPENCODE_GO_API_KEY": "sk-env"}), \
+             mock.patch("opencode_go_proxy.ops.subprocess.run") as run:
+            assert ops.check_api_key().ok
+        run.assert_not_called()
+
+    def test_generic_env_fallback(self) -> None:
+        with mock.patch.dict(os.environ, {"OPENCODE_API_KEY": "sk-generic"}, clear=True), \
+             mock.patch("opencode_go_proxy.ops.subprocess.run") as run:
+            assert ops.check_api_key().ok
+        run.assert_not_called()
+
+    def test_keychain_fallback(self) -> None:
+        with mock.patch.dict(os.environ, {}, clear=True), \
+             mock.patch("opencode_go_proxy.ops.subprocess.run",
+                        return_value=mock.Mock(returncode=0, stdout="sk-keychain\n")):
             assert ops.check_api_key().ok
 
 
@@ -60,6 +80,17 @@ class TestMeter:
             c = ops.check_meter()
         assert c.ok
         assert os.path.exists(os.path.join(str(tmp_path), "usage-events.jsonl"))
+
+    def test_read_only_does_not_record(self, tmp_path) -> None:
+        state = tmp_path / "state"
+        state.mkdir()
+        p = state / "usage-events.jsonl"
+        p.write_text('{"model":"deepseek-v4-flash","status":0}\n')
+        before = p.read_text()
+        with mock.patch.dict(os.environ, {"OPENCODE_GO_PROXY_STATE_DIR": str(state)}):
+            c = ops.check_meter()
+        assert c.ok
+        assert p.read_text() == before
 
 
 class TestLogs:
@@ -121,21 +152,32 @@ class TestSmoke:
             assert ops.smoke_test() == 1
 
     def test_missing_key(self) -> None:
-        with mock.patch.dict(os.environ, {}, clear=False):
+        with mock.patch.dict(os.environ, {}, clear=False), \
+             mock.patch("opencode_go_proxy.ops.subprocess.run", side_effect=FileNotFoundError("no security")):
             os.environ.pop("OPENCODE_GO_API_KEY", None)
+            os.environ.pop("OPENCODE_API_KEY", None)
             assert ops.smoke_test() == 1
 
 
 class TestMask:
     def test_redacts_secrets(self) -> None:
         assert ops._mask_secret_values('api_key = "sk-live"') == "api_key= ***redacted***"
+        assert ops._mask_secret_values("api_key = 'sk-single'") == "api_key= ***redacted***"
+        assert ops._mask_secret_values('OPENCODE_API_KEY = "sk-upper"') == "OPENCODE_API_KEY= ***redacted***"
+        assert ops._mask_secret_values('env = { OPENCODE_API_KEY = "sk-inline" }') == "env = { OPENCODE_API_KEY= ***redacted*** }"
         assert ops._mask_secret_values('model = "deepseek-v4-flash"') == 'model = "deepseek-v4-flash"'
 
 
 class TestSupportBundle:
     def test_bundle_contains_files_and_redacts(self, tmp_path) -> None:
         cfg = tmp_path / "config.toml"
-        cfg.write_text('openai_base_url = "http://127.0.0.1:8787/v1"\napi_key = "sk-secret-value"\n')
+        cfg.write_text(
+            'openai_base_url = "http://127.0.0.1:8787/v1"\n'
+            'api_key = "sk-secret-value"\n'
+            "api_key = 'sk-single-quoted'\n"
+            'OPENCODE_API_KEY = "sk-upper-style"\n'
+            'env = { OPENCODE_API_KEY = "sk-inline-env" }\n'
+        )
         log_dir = tmp_path / "logs"
         log_dir.mkdir()
         (log_dir / "opencode-go-proxy.err").write_text("2026-08-10 server.start\n")
@@ -150,7 +192,8 @@ class TestSupportBundle:
                 names.append(member.name)
                 if member.name == "opencode-go/config.toml":
                     text = tf.extractfile(member).read().decode()
-                    assert "sk-secret-value" not in text
+                    for secret in ("sk-secret-value", "sk-single-quoted", "sk-upper-style", "sk-inline-env"):
+                        assert secret not in text
                     assert "***redacted***" in text
         assert "opencode-go/version.json" in names
         assert "opencode-go/opencode-go-proxy.err" in names
