@@ -89,6 +89,10 @@ class MeterRecordTests(unittest.TestCase):
             record_usage_event(model="m", status=200, duration_ms=1)  # must not raise
 
     def test_default_state_dir_is_codex_dir(self) -> None:
+<<<<<<< HEAD
+=======
+        # True default (env cleared, not the autouse tmp override).
+>>>>>>> 913b72c (test: isolate all tests from the real state dir (conftest autouse fixture))
         with mock.patch.dict(os.environ, {}, clear=True):
             self.assertIn(".codex", state_dir())
 
