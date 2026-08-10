@@ -131,9 +131,16 @@ The proxy picks the upstream model based on what Codex sends:
 2. If the model slug is a known OpenCode Go model (from the catalog), it's used as-is.
 3. Otherwise, it falls back to `deepseek-v4-flash`.
 
-When images are present in a turn with tools, the proxy routes to MiMo V2.5 for image
-captioning (it's the cheapest vision model on Go), then routes the main turn to your
-configured model. Override the vision model with `CODEX_IMAGE_MODEL`.
+When images are present in a turn with tools, the proxy captions the latest image with
+the turn model by default (every OpenCode Go model accepts images), then routes the main
+turn to your configured model. Captions are cached by image bytes for an hour and sent
+with `detail: low` to cut upstream vision cost; the caption budget is 30s with no
+retries, so a failed caption degrades to a placeholder instead of stalling the turn.
+Override the caption engine with `CODEX_IMAGE_MODEL` or
+`OPENCODE_GO_PROXY_CAPTION_MODEL` (default `auto` = turn model); `mimo-v2.5` stays as
+the fallback when the turn model rejects image input. Disable `detail: low` with
+`OPENCODE_GO_PROXY_CAPTION_DETAIL=none` (a rejected detail value also falls back to a
+`sips`-downscaled image with no detail).
 
 ## API key
 
@@ -173,7 +180,7 @@ See the [lazycodex docs](https://github.com/code-yeongyu/oh-my-openagent) for se
 - Custom/freeform tool adaptation (Codex `apply_patch` works)
 - Reasoning content replay across tool-call turns
 - Real-time SSE streaming (not synthesized)
-- Image captioning via MiMo V2.5 when tools are present (override with `CODEX_IMAGE_MODEL`)
+- Cached image captioning when tools are present: turn-model engine by default, `detail: low` input, 30s no-retry budget, MiMo V2.5 fallback
 - SSRF protection on image URLs (`data:image/` and `https://` only)
 - Configurable body cap, bind address guard, keychain credential resolution
 - Local health and model-list endpoints

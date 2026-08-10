@@ -27,6 +27,15 @@
   meter, with secret values redacted).
 - Agent skill `skills/opencode-go-proxy/SKILL.md`: orientation for operating the
   proxy (start/stop, ops commands, prefix caching, config, reliability).
+- Caption latency: identical screenshot bytes are captioned once per hour (in-process
+  byte-keyed cache, 256-entry bound), so repeat tool calls on the same screen skip the
+  upstream round trip.
+- Caption engine defaults to the turn model (`OPENCODE_GO_PROXY_CAPTION_MODEL=auto`);
+  `CODEX_IMAGE_MODEL` still overrides, and `mimo-v2.5` remains the fallback when the
+  turn model rejects image input (4xx).
+- Caption images are sent with `detail: low` (`OPENCODE_GO_PROXY_CAPTION_DETAIL=none`
+  disables); if the upstream rejects the detail value, the proxy retries once with a
+  `sips`-downscaled JPEG (or the original URL) and no detail.
 - Tests: cache parsing (both DeepSeek and OpenAI usage shapes), tracker accounting,
   `/cache` endpoint, streaming `stream_options`, cache passthrough to Codex,
   meter recording, upstream retry behavior, and the ops commands.
@@ -60,6 +69,9 @@
   `HTTP/1.1 426 Upgrade Required` instead of the previous HTTP/1.0 404, which surfaced as
   "WebSocket protocol error: HTTP version must be 1.1 or higher" before the app fell back
   to HTTP streaming.
+- Image caption budget: default timeout 60s -> 30s, and caption sub-calls no longer
+  retry transient failures, so a bad caption leg costs at most ~30s instead of stacking
+  retries.
 
 ## [0.1.2] - 2026-06-21
 

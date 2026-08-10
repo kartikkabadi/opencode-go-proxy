@@ -19,7 +19,7 @@ from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 
-from . import __version__
+from . import __version__, vision
 from .cache import CacheTracker
 from .meter import record_usage_event
 from .protocol import (
@@ -90,10 +90,10 @@ def trace(event: str, **fields: Any) -> None:
 DEFAULT_MAX_RETRIES = 2
 DEFAULT_RETRY_BASE_SLEEP_MS = 150
 
-# Budget for the MiMo image-caption sub-call. Generous on purpose: a healthy
-# caption call routinely takes ~16s, and the sub-call degrades to a placeholder
-# on timeout rather than crashing the turn.
-DEFAULT_CAPTION_TIMEOUT_SEC = 60.0
+# Budget for one image-caption sub-call. Cached captions return instantly;
+# a miss gets 30s and no retries, and a slow/failed caption degrades to a
+# placeholder rather than crashing the turn.
+DEFAULT_CAPTION_TIMEOUT_SEC = 30.0
 
 
 def _caption_timeout_sec() -> float:
@@ -327,11 +327,15 @@ class ResponsesProxyHandler(BaseHTTPRequestHandler):
 
 
 class ProxyError(Exception):
-    def __init__(self, status: HTTPStatus, message: str, *, retries: int = 0) -> None:
+    def __init__(self, status: HTTPStatus, message: str, *, retries: int = 0, upstream_status: int | None = None) -> None:
         super().__init__(message)
         self.status = status
         self.message = message
         self.retries = retries
+        # The upstream's own status when the proxy surfaces a different one
+        # (e.g. upstream 400 relayed as 502) so callers can still tell
+        # "model/detail rejected" from "upstream is broken".
+        self.upstream_status = upstream_status
 
 
 def handle_responses_request(payload: Json, config: ProxyConfig, request_id: str) -> Json:
@@ -340,7 +344,7 @@ def handle_responses_request(payload: Json, config: ProxyConfig, request_id: str
     payload = inject_session_model(payload, session_model)
     chat_payload, request_model, conversion_stats = responses_payload_to_chat_payload(payload)
 
-    # Split-turn: if image + tools, caption images via MiMo sub-call, then route to the requested model.
+    # Split-turn: if image + tools, caption images via a vision sub-call, then route to the requested model.
     # MiMo can't drive tool loops from tool-role image messages; caption + requested model keeps the agent loop alive.
     if conversion_stats.get("has_image") and conversion_stats.get("tools_present"):
         chat_payload = caption_images_in_messages(chat_payload, request_model, config, request_id)
@@ -731,8 +735,8 @@ def handle_streaming_request(payload: Json, config: ProxyConfig, request_id: str
 
 
 def caption_images_in_messages(chat_payload: Json, target_model: str, config: ProxyConfig, request_id: str) -> Json:
-    """Replace image_url parts with MiMo-generated text captions. Routes turn to target_model after."""
-    image_model = os.environ.get("CODEX_IMAGE_MODEL", IMAGE_MODEL_DEFAULT) or IMAGE_MODEL_DEFAULT
+    """Replace image_url parts with vision-generated text captions. Routes turn to target_model after."""
+    image_model = vision.resolve_caption_model(target_model)
     messages = chat_payload.get("messages", [])
 
     # Collect all image URLs across messages.
@@ -754,7 +758,7 @@ def caption_images_in_messages(chat_payload: Json, target_model: str, config: Pr
     # Only caption the latest image; stub older ones to save 25+ seconds per turn.
     # Old screenshots are stale context — the model only needs the current screen to act.
     latest = image_jobs[-1]
-    caption = caption_image_via_mimo(latest[2], image_model, config, request_id)
+    caption = caption_image(latest[2], image_model, config, request_id)
     for mi, pi, _url in image_jobs[:-1]:
         messages[mi]["content"][pi] = {"type": "text", "text": "[prior screenshot omitted]"}
     mi, pi, _ = latest
@@ -773,52 +777,75 @@ def caption_images_in_messages(chat_payload: Json, target_model: str, config: Pr
     return chat_payload
 
 
-CAPTION_PROMPT = (
-    "You are captioning a screenshot for a coding agent that cannot see images. "
-    "The agent needs to click elements precisely, so spatial positions are critical. "
-    "Describe in 4-6 sentences: (1) app name and what window/panel is active, "
-    "(2) list every clickable element with its approximate position as (x,y) pixels "
-    "from top-left — buttons, menu items, links, input fields, toolbar icons. "
-    "Format: 'button \"Save\" at (120, 45)', 'input field at (300, 200)', etc. "
-    "(3) any visible text content — quote exactly. "
-    "(4) where the cursor/focus/selection currently is. "
-    "Skip colors and styling unless they convey state (e.g. red error, green success)."
-)
+# Only these 4xx statuses mean "this model cannot read the image" or "this
+# detail value is unsupported". Auth failures (401/403) and rate limits (429)
+# degrade immediately so a bad key never fans out into three caption calls.
+_CAPTION_FALLBACK_STATUSES = {400, 404, 415, 422}
 
 
-def caption_image_via_mimo(image_url: str, image_model: str, config: ProxyConfig, request_id: str) -> str:
-    """Sub-call MiMo to caption a single image. Returns text description."""
-    caption_payload: Json = {
-        "model": image_model,
-        "messages": [
-            {
-                "role": "user",
-                "content": [
-                    {"type": "text", "text": CAPTION_PROMPT},
-                    {"type": "image_url", "image_url": {"url": image_url}},
-                ],
-            }
-        ],
-        "stream": False,
-        "max_tokens": 200,
-    }
+def _caption_rejection_status(exc: ProxyError) -> int:
+    return exc.upstream_status if exc.upstream_status is not None else int(exc.status)
+
+
+def _caption_attempt(image_url: str, image_model: str, detail: str | None, config: ProxyConfig, request_id: str) -> tuple[Json | None, ProxyError | None]:
+    """One caption sub-call with no transient retries; returns (chat, error)."""
+    payload = vision.build_caption_payload(image_url, image_model, detail=detail)
     try:
-        chat, _retries = call_upstream_chat(caption_payload, config, request_id, timeout_sec=_caption_timeout_sec())
-        record_cache(config.cache_tracker, image_model, chat.get("usage"))
-        choice = (chat.get("choices") or [{}])[0]
-        text = (choice.get("message", {}) or {}).get("content", "")
-        return text.strip() if isinstance(text, str) and text.strip() else "[caption unavailable]"
+        chat, _retries = call_upstream_chat(payload, config, request_id, timeout_sec=_caption_timeout_sec(), max_retries=0)
+        return chat, None
     except ProxyError as exc:
+        return None, exc
+
+
+def caption_image(image_url: str, image_model: str, config: ProxyConfig, request_id: str) -> str:
+    """Caption one image via a vision-capable model, served from a byte-keyed cache.
+
+    Returns a text description. A failed caption degrades to a placeholder;
+    it never blocks the turn.
+    """
+    image_bytes = vision.image_bytes_for_cache(image_url)
+    cached = vision.CAPTION_CACHE.get(image_bytes)
+    if cached is not None:
+        trace("split_turn.caption_cache_hit", request_id=request_id)
+        return cached
+
+    detail = vision.caption_detail()
+    url, model = image_url, image_model
+    chat, exc = _caption_attempt(url, model, detail, config, request_id)
+    if exc is not None and _caption_rejection_status(exc) in _CAPTION_FALLBACK_STATUSES and model != IMAGE_MODEL_DEFAULT:
+        # The turn model may reject image input; fall back to the known
+        # vision model for this one sub-call.
+        model = IMAGE_MODEL_DEFAULT
+        trace("split_turn.caption_fallback", request_id=request_id, kind="engine", model=model, status=_caption_rejection_status(exc))
+        chat, exc = _caption_attempt(url, model, detail, config, request_id)
+    if exc is not None and _caption_rejection_status(exc) in _CAPTION_FALLBACK_STATUSES and detail is not None:
+        # Unknown detail values can 4xx on some upstreams; retry with a
+        # downscaled image (or the original URL) and no detail.
+        downscaled = vision.downscale_data_url(url)
+        if downscaled is not None:
+            url = downscaled
+        detail = None
+        trace("split_turn.caption_fallback", request_id=request_id, kind="detail", status=_caption_rejection_status(exc))
+        chat, exc = _caption_attempt(url, model, detail, config, request_id)
+    if exc is not None:
         trace("split_turn.caption_failed", request_id=request_id, status=exc.status, message=exc.message[:200])
         return f"[caption failed: {exc.message[:100]}]"
 
+    record_cache(config.cache_tracker, model, chat.get("usage"))
+    choice = (chat.get("choices") or [{}])[0]
+    text = (choice.get("message", {}) or {}).get("content", "")
+    caption = text.strip() if isinstance(text, str) and text.strip() else "[caption unavailable]"
+    vision.CAPTION_CACHE.put(image_bytes, caption)
+    return caption
 
-def call_upstream_chat(chat_payload: Json, config: ProxyConfig, request_id: str, *, timeout_sec: float | None = None) -> tuple[Json, int]:
+
+
+def call_upstream_chat(chat_payload: Json, config: ProxyConfig, request_id: str, *, timeout_sec: float | None = None, max_retries: int | None = None) -> tuple[Json, int]:
     api_key = resolve_api_key(config, request_id)
 
     url = f"{config.chat_base_url}/chat/completions"
     raw_payload = json.dumps(chat_payload, separators=(",",":")).encode("utf-8")
-    max_retries = _max_retries()
+    max_retries = _max_retries() if max_retries is None else max_retries
     retries = 0
     while True:
         request = urllib.request.Request(
@@ -861,7 +888,7 @@ def call_upstream_chat(chat_payload: Json, config: ProxyConfig, request_id: str,
                 raise ProxyError(HTTPStatus.SERVICE_UNAVAILABLE, "upstream unavailable", retries=retries) from exc
             if exc.code == 504:
                 raise ProxyError(HTTPStatus.GATEWAY_TIMEOUT, "upstream timeout", retries=retries) from exc
-            raise ProxyError(HTTPStatus.BAD_GATEWAY, f"upstream HTTP {exc.code}", retries=retries) from exc
+            raise ProxyError(HTTPStatus.BAD_GATEWAY, f"upstream HTTP {exc.code}", retries=retries, upstream_status=exc.code) from exc
         except urllib.error.URLError as exc:
             trace("upstream.network_error", request_id=request_id, reason=str(getattr(exc, "reason", exc)))
             if retries < max_retries:
