@@ -4,6 +4,13 @@
 
 ### Added
 
+- Auth transport guard (plan 006): zero-config protection for the loopback
+  listener - a missing Host header answers `400 invalid_host`, a non-loopback
+  Host answers `403 invalid_host` unless `OPENCODE_GO_PROXY_ALLOW_REMOTE=1`,
+  requests carrying Origin / Referer / Sec-Fetch-Site answer
+  `403 browser_request_rejected`, non-JSON POSTs to the API paths answer
+  `415 unsupported_media_type`, and OPTIONS stays unhandled so browser
+  preflight is blocked.
 - Protocol surface (plan 005): `/v1/chat/completions` (and `/chat/completions`)
   is a verbatim passthrough - non-stream relays the upstream status and JSON
   body byte-for-byte (including the upstream's own error body), stream relays

@@ -24,6 +24,7 @@ from typing import Any
 from . import __version__
 from .config import ProxyConfig
 from .errors import ProxyError
+from .guards import check_browser_origin, check_content_type, check_host
 from .meter import record_usage_event
 from .protocol import (
     DEFAULT_MODEL,
@@ -124,6 +125,15 @@ def decode_request_body(raw: bytes, content_encoding: str, max_body_bytes: int) 
 
 
 class ResponsesProxyHandler(BaseHTTPRequestHandler):
+    def _guard_request(self) -> None:
+        """Plan 006 transport guard: loopback Host, then no browser markers."""
+        check_host(self.headers.get("Host"))
+        check_browser_origin(self.headers)
+
+    @staticmethod
+    def _error_payload(exc: ProxyError) -> Json:
+        return {"error": {"type": exc.error_type or "proxy_error", "message": exc.message}}
+
     def _reject_websocket_upgrade(self) -> bool:
         """Reject a realtime WebSocket upgrade with HTTP/1.1 426.
 
@@ -147,6 +157,12 @@ class ResponsesProxyHandler(BaseHTTPRequestHandler):
         return True
 
     def do_GET(self) -> None:
+        try:
+            self._guard_request()
+        except ProxyError as exc:
+            trace("request.failed", status=exc.status, message=exc.message)
+            self._send_json(self._error_payload(exc), status=exc.status)
+            return
         if self._reject_websocket_upgrade():
             return
         if self.path in {"/health", "/v1/health"}:
@@ -169,14 +185,16 @@ class ResponsesProxyHandler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:
         request_id = uuid.uuid4().hex[:12]
-        if self.path not in RESPONSES_PATHS | CHAT_COMPLETIONS_PATHS:
-            if self.path in MESSAGES_PATHS:
-                self._send_json(MESSAGES_UNSUPPORTED, status=HTTPStatus.BAD_REQUEST)
-            else:
-                self._send_json({"error": {"message": "not found"}}, status=HTTPStatus.NOT_FOUND)
-            return
 
         try:
+            self._guard_request()
+            if self.path not in RESPONSES_PATHS | CHAT_COMPLETIONS_PATHS:
+                if self.path in MESSAGES_PATHS:
+                    self._send_json(MESSAGES_UNSUPPORTED, status=HTTPStatus.BAD_REQUEST)
+                else:
+                    self._send_json({"error": {"message": "not found"}}, status=HTTPStatus.NOT_FOUND)
+                return
+            check_content_type(self.headers.get("content-type"))
             config: ProxyConfig = self.server.config  # type: ignore[attr-defined]
             payload = self._read_json(config)
             trace(
@@ -209,7 +227,7 @@ class ResponsesProxyHandler(BaseHTTPRequestHandler):
                 self._send_json(response)
         except ProxyError as exc:
             trace("request.failed", request_id=request_id, status=exc.status, message=exc.message)
-            self._send_json({"error": {"message": exc.message, "type": "proxy_error"}}, status=exc.status)
+            self._send_json(self._error_payload(exc), status=exc.status)
         except BrokenPipeError:
             trace("client.disconnected", request_id=request_id, message="client closed connection during stream")
         except Exception as exc:  # pragma: no cover - defensive crash trace  # noqa: BLE001
