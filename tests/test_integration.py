@@ -209,13 +209,13 @@ class TestResponsesRoundTrip:
 
     def test_missing_api_key_returns_401(self, server):
         port, _ = server
-        import opencode_go_proxy.app as app_mod
-        app_mod._api_key_cache = None
+        from opencode_go_proxy.secrets import clear_api_key_cache
+        clear_api_key_cache()
         # Mock subprocess.run to return a failed completed process (no keychain entry)
         failed_completed = mock.MagicMock()
         failed_completed.returncode = 1
         failed_completed.stdout = ""
-        with mock.patch.dict(os.environ, {}, clear=True), mock.patch("opencode_go_proxy.app.subprocess.run", return_value=failed_completed):
+        with mock.patch.dict(os.environ, {}, clear=True), mock.patch("opencode_go_proxy.secrets.subprocess.run", return_value=failed_completed):
             conn = HTTPConnection("127.0.0.1", port, timeout=5)
             conn.request("POST", "/v1/responses",
                          json.dumps({"model": "deepseek-v4-flash", "input": "hi"}),
@@ -280,12 +280,12 @@ class TestStreamingResponse:
 
     def test_streaming_missing_api_key_sends_error_event(self, server):
         port, _ = server
-        import opencode_go_proxy.app as app_mod
-        app_mod._api_key_cache = None
+        from opencode_go_proxy.secrets import clear_api_key_cache
+        clear_api_key_cache()
         failed_completed = mock.MagicMock()
         failed_completed.returncode = 1
         failed_completed.stdout = ""
-        with mock.patch.dict(os.environ, {}, clear=True), mock.patch("opencode_go_proxy.app.subprocess.run", return_value=failed_completed):
+        with mock.patch.dict(os.environ, {}, clear=True), mock.patch("opencode_go_proxy.secrets.subprocess.run", return_value=failed_completed):
             conn = HTTPConnection("127.0.0.1", port, timeout=5)
             conn.request("POST", "/v1/responses",
                          json.dumps({"model": "deepseek-v4-flash", "input": "hi", "stream": True}),
@@ -302,7 +302,7 @@ class TestStreamingResponse:
     def test_streaming_crash_sends_sse_error(self, server):
         port, _ = server
         with mock.patch.dict(os.environ, {"OPENCODE_GO_API_KEY": "test-key"}), mock.patch(
-            "opencode_go_proxy.app.responses_payload_to_chat_payload",
+            "opencode_go_proxy.streaming.responses_payload_to_chat_payload",
             side_effect=ValueError("boom"),
         ):
             conn = HTTPConnection("127.0.0.1", port, timeout=5)

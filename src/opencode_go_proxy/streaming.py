@@ -1,0 +1,385 @@
+"""The deep SSE streaming engine shared by /responses and /chat/completions.
+
+Owns SSE framing, the 15s keepalive thread (started before any caption
+sub-call so the client never sits on a silent open stream), monotonic
+output_index assignment, empty-completion detection, and usage recording.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import threading
+import time
+import urllib.error
+import urllib.request
+import uuid
+from typing import Any
+
+from .config import ProxyConfig
+from .errors import ProxyError
+from .meter import record_usage_event
+from .protocol import (
+    DEFAULT_MODEL,
+    cache_stats_from_usage,
+    chat_message_to_response_output,
+    inject_session_model,
+    new_response_id,
+    normalize_usage,
+    now_unix,
+    responses_payload_to_chat_payload,
+)
+from .secrets import resolve_api_key
+from .trace import _mask_trace_body, trace
+from .upstream import default_max_retries, record_cache, retriable_http_status, retry_sleep, usage_tokens
+from .vision import caption_images_in_messages
+
+Json = dict[str, Any]
+
+
+def handle_streaming_request(payload: Json, config: ProxyConfig, request_id: str, wfile: Any) -> None:
+    """Stream upstream response as SSE in real-time: created → text deltas → completed."""
+    session_model = payload.get("model") or DEFAULT_MODEL
+    payload = inject_session_model(payload, session_model)
+    chat_payload, request_model, conversion_stats = responses_payload_to_chat_payload(payload)
+
+    client_alive = True
+
+    # Keepalive: send SSE comments every 15s while waiting for upstream first
+    # byte. Prevents Codex from timing out when the model thinks for 30+
+    # seconds before responding. Started before the image-caption sub-call so
+    # the client never sees a silent open stream while a caption is fetched.
+    keepalive_stop = threading.Event()
+
+    def keepalive() -> None:
+        while not keepalive_stop.wait(15):
+            if not client_alive:
+                return
+            try:
+                wfile.write(b": keepalive\n\n")
+                wfile.flush()
+            except BrokenPipeError:
+                return
+
+    ka_thread = threading.Thread(target=keepalive, daemon=True)
+    ka_thread.start()
+
+    if conversion_stats.get("has_image") and conversion_stats.get("tools_present"):
+        chat_payload = caption_images_in_messages(chat_payload, request_model, config, request_id)
+        conversion_stats["upstream_model"] = chat_payload.get("model")
+
+    chat_payload["stream"] = True
+    # Ask the upstream to include the usage object in the stream; without
+    # stream_options.include_usage most OpenAI-compatible endpoints omit it,
+    # and the cache accounting (prompt_cache_hit_tokens / cached_tokens)
+    # never reaches the proxy.
+    chat_payload["stream_options"] = {"include_usage": True}
+    trace("request.converted", request_id=request_id, stats=conversion_stats,
+          upstream_model=chat_payload.get("model"), stream=True)
+
+    response_id = new_response_id()
+    model = request_model or DEFAULT_MODEL
+
+    def send_event(event: Json) -> None:
+        nonlocal client_alive
+        if not client_alive:
+            return
+        try:
+            wfile.write(b"data: " + json.dumps(event, separators=(",", ":")).encode("utf-8") + b"\n\n")
+            wfile.flush()
+        except BrokenPipeError:
+            client_alive = False
+            trace("client.disconnected", request_id=request_id, message="client closed connection during stream")
+
+    def send_error(msg: str) -> None:
+        send_event({"type": "response.error", "error": {"message": msg}})
+        if client_alive:
+            wfile.write(b"data: [DONE]\n\n")
+            wfile.flush()
+
+    try:
+        api_key = resolve_api_key(config, request_id)
+    except ProxyError as exc:
+        send_error(exc.message)
+        return
+
+    send_event({"type": "response.created", "response": {
+        "id": response_id, "object": "response", "created_at": now_unix(),
+        "status": "in_progress", "model": model, "output": [], "output_text": "", "usage": None,
+    }})
+
+    url = f"{config.chat_base_url}/chat/completions"
+    raw_payload = json.dumps(chat_payload, separators=(",",":")).encode("utf-8")
+    req = urllib.request.Request(url, data=raw_payload, headers={
+        "authorization": f"Bearer {api_key}", "content-type": "application/json",
+        "accept": "text/event-stream",
+        "user-agent": os.environ.get("OPENCODE_GO_PROXY_USER_AGENT", "codex/1.0"),
+    }, method="POST")
+    trace("upstream.start", request_id=request_id, url=url, bytes=len(raw_payload), stream=True)
+    started = time.time()
+
+    text = ""
+    reasoning = ""
+    tool_calls: list[Json] = []
+    tool_call_items: dict[int, Json] = {}  # index → {id, call_id, name, namespace}
+    tool_call_open: set[int] = set()  # indices already emitted as output_item.added
+    usage: Json | None = None
+    message_id = f"msg_{uuid.uuid4().hex}"
+    reasoning_id = f"rs_{uuid.uuid4().hex}"
+    item_open = False
+    reasoning_open = False
+    # reasoning_emitted is set the moment the reasoning item is opened and never
+    # cleared: every later item's output_index is computed from it, so a
+    # reasoning item that is already closed still occupies output_index 0 and
+    # text/tool calls cannot collide with it.
+    reasoning_emitted = False
+    got_data = False
+
+    def emit_tool_added(idx: int) -> None:
+        """Emit output_item.added for tool call `idx` with its complete name.
+
+        The upstream streams tool names in chunks (e.g. 'read_' then 'file'),
+        so added must be deferred until the name is complete. The stream moves
+        on to the arguments phase only after the final name chunk, so the first
+        arguments delta is the signal that the name is complete; tool calls
+        whose name is still growing when the stream ends are emitted in the
+        finalize phase below. A truncated name must never appear in added/done.
+        """
+        if idx in tool_call_open:
+            return
+        flat_name = tool_calls[idx]["function"]["name"]
+        ns, _, n = flat_name.rpartition("__")
+        if not ns or not n:
+            ns, n = None, flat_name
+        fc_id = f"fc_{uuid.uuid4().hex}"
+        call_id = tool_calls[idx]["id"] or f"call_{uuid.uuid4().hex}"
+        tc_item: Json = {
+            "type": "function_call", "id": fc_id, "call_id": call_id,
+            "name": n, "arguments": "", "status": "in_progress",
+        }
+        if ns:
+            tc_item["namespace"] = ns
+        tool_call_items[idx] = tc_item
+        send_event({"type": "response.output_item.added",
+                    "output_index": (1 if reasoning_emitted else 0) + idx, "item": tc_item})
+        tool_call_open.add(idx)
+
+    retries = 0
+    max_retries = default_max_retries()
+
+    # Connect with bounded retry on transient failures before any SSE byte
+    # arrives. Once the response object is open we stream it below; a failure
+    # inside that loop means the upstream died after its 200 head was already
+    # committed to the client, which we mark as an aborted stream rather than
+    # a success.
+    response = None
+    while response is None:
+        try:
+            response = urllib.request.urlopen(req, timeout=config.timeout_sec)
+        except urllib.error.HTTPError as exc:
+            body = exc.read().decode("utf-8", errors="replace")
+            trace("upstream.error", request_id=request_id, status=exc.code, body=_mask_trace_body(body))
+            if retriable_http_status(exc.code) and retries < max_retries:
+                retries += 1
+                trace("upstream.retry", request_id=request_id, attempt=retries, status=exc.code)
+                retry_sleep(retries)
+                continue
+            keepalive_stop.set()
+            if exc.code == 429:
+                retry_after = exc.headers.get("retry-after", "5")
+                send_error(f"rate limited (retry after {retry_after}s)")
+            elif exc.code in (500, 502, 503, 504):
+                send_error(f"upstream unavailable (HTTP {exc.code})")
+            else:
+                send_error(f"upstream HTTP {exc.code}")
+            # No upstream bytes were ever streamed, so this is not a mid-stream
+            # abort: meter the real final upstream status, not a synthetic 502.
+            record_usage_event(model=model, status=exc.code, duration_ms=int((time.time() - started) * 1000),
+                               retries=retries)
+            return
+        except (urllib.error.URLError, TimeoutError) as exc:
+            trace("upstream.network_error", request_id=request_id, reason=str(getattr(exc, "reason", exc)))
+            if retries < max_retries:
+                retries += 1
+                trace("upstream.retry", request_id=request_id, attempt=retries, reason=str(getattr(exc, "reason", exc)))
+                retry_sleep(retries)
+                continue
+            keepalive_stop.set()
+            send_error(f"upstream network error: {getattr(exc, 'reason', exc)}")
+            # Network failure: no upstream status exists (502) and nothing was
+            # streamed, so no streamAborted marker.
+            record_usage_event(model=model, status=502, duration_ms=int((time.time() - started) * 1000),
+                               retries=retries)
+            return
+
+    try:
+        with response as resp:
+            keepalive_stop.set()  # Stop keepalive once upstream starts responding.
+            for line in resp:
+                line = line.decode("utf-8", errors="replace").strip()
+                if not line.startswith("data: "):
+                    continue
+                got_data = True
+                data = line[6:]
+                if data == "[DONE]":
+                    break
+                try:
+                    chunk = json.loads(data)
+                except json.JSONDecodeError:
+                    continue
+                if chunk.get("usage"):
+                    usage = chunk["usage"]
+                choices = chunk.get("choices") or []
+                if not choices:
+                    continue
+                delta = choices[0].get("delta", {})
+                # Reasoning — stream summary deltas so Codex shows thinking text in real-time.
+                r = delta.get("reasoning_content")
+                if isinstance(r, str) and r:
+                    if not reasoning_open:
+                        send_event({"type": "response.output_item.added", "output_index": 0, "item": {
+                            "type": "reasoning", "id": reasoning_id, "summary": [], "status": "in_progress",
+                        }})
+                        reasoning_open = True
+                        reasoning_emitted = True
+                    reasoning += r
+                    send_event({"type": "response.reasoning_summary_text.delta",
+                                "item_id": reasoning_id, "output_index": 0, "summary_index": 0, "delta": r})
+                # Text delta — open item lazily, then stream.
+                d = delta.get("content")
+                if isinstance(d, str) and d:
+                    if not item_open:
+                        idx = 1 if reasoning_emitted else 0
+                        send_event({"type": "response.output_item.added", "output_index": idx, "item": {
+                            "type": "message", "id": message_id, "role": "assistant",
+                            "status": "in_progress", "content": [],
+                        }})
+                        item_open = True
+                    text += d
+                    send_event({"type": "response.output_text.delta", "item_id": message_id, "output_index": 1 if reasoning_emitted else 0, "delta": d})
+                tcs = delta.get("tool_calls")
+                if isinstance(tcs, list) and tcs and reasoning_open:
+                    # Close reasoning item before tool calls so UI shows tool calls, not "thinking".
+                    rs_done = {"type": "reasoning", "id": reasoning_id,
+                               "summary": [{"type": "summary_text", "text": reasoning}], "status": "completed"}
+                    send_event({"type": "response.output_item.done", "output_index": 0, "item": rs_done})
+                    reasoning_open = False
+                if isinstance(tcs, list):
+                    for tc in tcs:
+                        idx = tc.get("index", 0)
+                        while len(tool_calls) <= idx:
+                            tool_calls.append({"id": "", "type": "function", "function": {"name": "", "arguments": ""}})
+                        if tc.get("id"):
+                            tool_calls[idx]["id"] = tc["id"]
+                        fn = tc.get("function") or {}
+                        name_delta = fn.get("name")
+                        if name_delta:
+                            tool_calls[idx]["function"]["name"] += name_delta
+                        args_delta = fn.get("arguments")
+                        if args_delta:
+                            tool_calls[idx]["function"]["arguments"] += args_delta
+                            # Arguments only start after the final name chunk, so
+                            # the accumulated name is complete: emit added now.
+                            emit_tool_added(idx)
+    except (urllib.error.HTTPError, urllib.error.URLError, TimeoutError, OSError) as exc:
+        # The upstream stream died after its 200 head was already committed to
+        # the client. Surface an error and mark the turn as aborted so the
+        # meter never records a success the client never received.
+        keepalive_stop.set()
+        code = exc.code if isinstance(exc, urllib.error.HTTPError) else None
+        trace("upstream.stream_aborted", request_id=request_id,
+              status=code or getattr(exc, "reason", str(exc)))
+        send_error("upstream stream aborted")
+        record_usage_event(model=model, status=502, duration_ms=int((time.time() - started) * 1000),
+                           stream_aborted=True, retries=retries)
+        return
+
+    duration_ms = int((time.time() - started) * 1000)
+    trace("upstream.done", request_id=request_id, status=200, elapsed_ms=duration_ms, stream=True)
+    record_cache(config.cache_tracker, chat_payload.get("model"), usage)
+
+    if not client_alive:
+        trace("client.gone", request_id=request_id, message="client disconnected before final events")
+        record_usage_event(model=model, status=0, duration_ms=duration_ms, stream_aborted=True, retries=retries)
+        return
+
+    if not got_data:
+        send_error("upstream returned no SSE data")
+        record_usage_event(model=model, status=502, duration_ms=duration_ms, empty_completion=True, retries=retries)
+        return
+
+    # Build final response from accumulated data.
+    fake_msg: Json = {}
+    if reasoning:
+        fake_msg["reasoning_content"] = reasoning
+    if tool_calls:
+        fake_msg["tool_calls"] = tool_calls
+    if text:
+        fake_msg["content"] = text
+    output = chat_message_to_response_output(fake_msg)
+
+    # Close reasoning item if opened.
+    if reasoning_open:
+        rs_done = {"type": "reasoning", "id": reasoning_id,
+                    "summary": [{"type": "summary_text", "text": reasoning}], "status": "completed"}
+        send_event({"type": "response.output_item.done", "output_index": 0, "item": rs_done})
+
+    # Emit output_item.done for tool calls that were opened during streaming,
+    # and added+done for any that weren't (e.g. name only completed at stream
+    # end) — always with the complete name.
+    tc_base = 1 if reasoning_emitted else 0
+    tc_count = 0
+    for item in output:
+        if item.get("type") != "function_call":
+            continue
+        idx = tc_base + tc_count
+        if tc_count in tool_call_open:
+            # Already emitted added during streaming; close with the final
+            # name/arguments and keep the streamed item id.
+            done_item = dict(tool_call_items[tc_count])
+            done_item["name"] = item["name"]
+            done_item["arguments"] = item.get("arguments", "{}")
+            done_item["status"] = "completed"
+            send_event({"type": "response.output_item.done", "output_index": idx, "item": done_item})
+            # Completed must reuse the streamed ids so Codex reconciles items
+            # by id instead of creating ghost duplicates.
+            item["id"] = tool_call_items[tc_count]["id"]
+            item["call_id"] = tool_call_items[tc_count]["call_id"]
+        else:
+            # Added was never emitted during streaming: emit added+done now
+            # with the complete name.
+            tool_call_items[tc_count] = item
+            send_event({"type": "response.output_item.added", "output_index": idx, "item": item})
+            send_event({"type": "response.output_item.done", "output_index": idx, "item": item})
+        tc_count += 1
+
+    # Close message item if opened.
+    if item_open:
+        msg_idx = tc_base + len(tool_calls)
+        msg_done = {"type": "message", "id": message_id, "role": "assistant", "status": "completed",
+                     "content": [{"type": "output_text", "text": text, "annotations": []}]}
+        send_event({"type": "response.output_item.done", "output_index": msg_idx, "item": msg_done})
+
+    # Reuse the ids already streamed in response.completed.
+    for out_item in output:
+        if out_item.get("type") == "reasoning":
+            out_item["id"] = reasoning_id
+        elif out_item.get("type") == "message":
+            out_item["id"] = message_id
+
+    final: Json = {
+        "id": response_id, "object": "response", "created_at": now_unix(),
+        "status": "completed", "model": model, "output": output,
+        "output_text": text, "usage": normalize_usage(usage),
+    }
+    send_event({"type": "response.completed", "response": final})
+    wfile.write(b"data: [DONE]\n\n")
+    wfile.flush()
+    trace("response.converted", request_id=request_id, output_items=len(output),
+          output_text_len=len(text), usage=final.get("usage"), stream=True,
+          cache=cache_stats_from_usage(usage))
+    inp, outp, total = usage_tokens(usage)
+    empty = not text and not tool_calls and not reasoning
+    record_usage_event(model=model, status=200, duration_ms=duration_ms,
+                       input_tokens=inp, output_tokens=outp, total_tokens=total,
+                       retries=retries, empty_completion=empty)

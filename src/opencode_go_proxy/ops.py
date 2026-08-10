@@ -12,7 +12,6 @@ import io
 import json
 import os
 import re
-import subprocess
 import sys
 import tarfile
 import time
@@ -21,7 +20,10 @@ import urllib.request
 from typing import Any
 
 from . import __version__
+from .config import ProxyConfig
+from .errors import ProxyError
 from .meter import usage_events_path
+from . import secrets
 
 Json = dict[str, Any]
 
@@ -57,23 +59,16 @@ class Check:
         return {"name": self.name, "ok": self.ok, "hint": self.hint}
 
 
-def _configured_key_env() -> str:
-    return os.environ.get("OPENCODE_GO_PROXY_API_KEY_ENV", "OPENCODE_GO_API_KEY")
-
-
-# Keychain services that may hold the API key. Mirrors app.resolve_api_key's
-# order so doctor reports the same resolution the proxy actually uses: the
-# configured env var, then $OPENCODE_API_KEY, then the macOS keychain.
-_KEYCHAIN_SERVICES: tuple[str, ...] = ("opencode-go-api-key", "codex-router-opencode-go")
-
-
-def _keychain_services() -> list[str]:
-    services: list[str] = []
-    service_env = os.environ.get("CODEX_KEYCHAIN_SERVICE")
-    if service_env:
-        services.append(service_env)
-    services.extend(_KEYCHAIN_SERVICES)
-    return list(dict.fromkeys(services))
+def _proxy_config() -> ProxyConfig:
+    """A ProxyConfig with the defaults doctor/smoke-test use."""
+    return ProxyConfig(
+        bind="127.0.0.1",
+        port=DEFAULT_PORT,
+        chat_base_url=CHAT_BASE_URL,
+        api_key_env=secrets.configured_key_env(),
+        timeout_sec=180,
+        max_body_bytes=20 * 1024 * 1024,
+    )
 
 
 def _resolve_api_key() -> tuple[str, str] | None:
@@ -81,25 +76,11 @@ def _resolve_api_key() -> tuple[str, str] | None:
 
     Never prints the value; callers use it only for a presence check.
     """
-    for env in (_configured_key_env(), "OPENCODE_API_KEY"):
-        if not env:
-            continue
-        value = os.environ.get(env)
-        if value:
-            return value, f"${env}"
-    for keychain_service in _keychain_services():
-        try:
-            completed = subprocess.run(
-                ["security", "find-generic-password", "-a", os.environ.get("USER", ""), "-s", keychain_service, "-w"],
-                check=False, capture_output=True, text=True, stdin=subprocess.DEVNULL, timeout=10,
-            )
-        except (FileNotFoundError, subprocess.TimeoutExpired):
-            continue
-        if completed.returncode == 0:
-            first_line = completed.stdout.splitlines()[0].strip() if completed.stdout.splitlines() else ""
-            if first_line:
-                return first_line, f"keychain:{keychain_service}"
-    return None
+    try:
+        value = secrets.resolve_api_key(_proxy_config(), "ops")
+        return value, "env or keychain"
+    except ProxyError:
+        return None
 
 
 def check_api_key() -> Check:
@@ -107,7 +88,7 @@ def check_api_key() -> Check:
     resolved = _resolve_api_key()
     if resolved is not None:
         return Check("api key", True, f"resolved from {resolved[1]}")
-    return Check("api key", False, f"set ${_configured_key_env()}, $OPENCODE_API_KEY, or keychain:{_KEYCHAIN_SERVICES[0]}")
+    return Check("api key", False, f"set ${secrets.configured_key_env()}, $OPENCODE_API_KEY, or keychain:{secrets.keychain_services()[0]}")
 
 
 def check_service(url: str = HEALTH_URL) -> Check:
@@ -190,7 +171,7 @@ def smoke_test() -> int:
         f"{CHAT_BASE_URL}/chat/completions",
         data=payload,
         headers={
-            "authorization": f"Bearer {os.environ.get(_configured_key_env(), '')}",
+            "authorization": f"Bearer {os.environ.get(secrets.configured_key_env(), '')}",
             "content-type": "application/json",
         },
         method="POST",

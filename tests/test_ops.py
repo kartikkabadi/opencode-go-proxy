@@ -30,33 +30,43 @@ def _http_error(code: int, body: str = ""):
 
 
 class TestApiKey:
+    def _clear(self) -> None:
+        from opencode_go_proxy.secrets import clear_api_key_cache
+
+        clear_api_key_cache()
+
     def test_missing(self) -> None:
+        self._clear()
         with mock.patch.dict(os.environ, {}, clear=False), \
-             mock.patch("opencode_go_proxy.ops.subprocess.run", side_effect=FileNotFoundError("no security")):
+             mock.patch("opencode_go_proxy.secrets.subprocess.run", side_effect=FileNotFoundError("no security")):
             os.environ.pop("OPENCODE_GO_API_KEY", None)
             os.environ.pop("OPENCODE_API_KEY", None)
             c = ops.check_api_key()
         assert not c.ok
 
     def test_present(self) -> None:
+        self._clear()
         with mock.patch.dict(os.environ, {"OPENCODE_GO_API_KEY": "sk-abc123"}):
             assert ops.check_api_key().ok
 
     def test_env_takes_precedence_over_keychain(self) -> None:
+        self._clear()
         with mock.patch.dict(os.environ, {"OPENCODE_GO_API_KEY": "sk-env"}), \
-             mock.patch("opencode_go_proxy.ops.subprocess.run") as run:
+             mock.patch("opencode_go_proxy.secrets.subprocess.run") as run:
             assert ops.check_api_key().ok
         run.assert_not_called()
 
     def test_generic_env_fallback(self) -> None:
+        self._clear()
         with mock.patch.dict(os.environ, {"OPENCODE_API_KEY": "sk-generic"}, clear=True), \
-             mock.patch("opencode_go_proxy.ops.subprocess.run") as run:
+             mock.patch("opencode_go_proxy.secrets.subprocess.run") as run:
             assert ops.check_api_key().ok
         run.assert_not_called()
 
     def test_keychain_fallback(self) -> None:
+        self._clear()
         with mock.patch.dict(os.environ, {}, clear=True), \
-             mock.patch("opencode_go_proxy.ops.subprocess.run",
+             mock.patch("opencode_go_proxy.secrets.subprocess.run",
                         return_value=mock.Mock(returncode=0, stdout="sk-keychain\n")):
             assert ops.check_api_key().ok
 
@@ -152,8 +162,11 @@ class TestSmoke:
             assert ops.smoke_test() == 1
 
     def test_missing_key(self) -> None:
+        from opencode_go_proxy.secrets import clear_api_key_cache
+
+        clear_api_key_cache()
         with mock.patch.dict(os.environ, {}, clear=False), \
-             mock.patch("opencode_go_proxy.ops.subprocess.run", side_effect=FileNotFoundError("no security")):
+             mock.patch("opencode_go_proxy.secrets.subprocess.run", side_effect=FileNotFoundError("no security")):
             os.environ.pop("OPENCODE_GO_API_KEY", None)
             os.environ.pop("OPENCODE_API_KEY", None)
             assert ops.smoke_test() == 1

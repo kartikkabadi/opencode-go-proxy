@@ -189,3 +189,115 @@ def downscale_data_url(image_url: str, max_edge: int = SIPS_MAX_EDGE) -> str | N
     if not out:
         return None
     return "data:image/jpeg;base64," + base64.b64encode(out).decode("ascii")
+
+
+# Only these 4xx statuses mean "this model cannot read the image" or "this
+# detail value is unsupported". Auth failures (401/403) and rate limits (429)
+# degrade immediately so a bad key never fans out into three caption calls.
+CAPTION_FALLBACK_STATUSES = {400, 404, 415, 422}
+
+
+def _caption_rejection_status(exc: Any) -> int:
+    return exc.upstream_status if exc.upstream_status is not None else int(exc.status)
+
+
+def _caption_attempt(image_url: str, image_model: str, detail: str | None, config: Any, request_id: str) -> tuple[dict[str, Any] | None, Any | None]:
+    """One caption sub-call with no transient retries; returns (chat, error)."""
+    from .upstream import call_upstream_chat, caption_timeout_sec
+
+    payload = build_caption_payload(image_url, image_model, detail=detail)
+    try:
+        chat, _retries = call_upstream_chat(payload, config, request_id, timeout_sec=caption_timeout_sec(), max_retries=0)
+        return chat, None
+    except Exception as exc:  # noqa: BLE001 - surfaced as a failed caption
+        return None, exc
+
+
+def caption_image(image_url: str, image_model: str, config: Any, request_id: str) -> str:
+    """Caption one image via a vision-capable model, served from a byte-keyed cache.
+
+    Returns a text description. A failed caption degrades to a placeholder;
+    it never blocks the turn.
+    """
+    from .trace import trace
+    from .upstream import record_cache
+
+    image_bytes = image_bytes_for_cache(image_url)
+    cached = CAPTION_CACHE.get(image_bytes)
+    if cached is not None:
+        trace("split_turn.caption_cache_hit", request_id=request_id)
+        return cached
+
+    detail = caption_detail()
+    url, model = image_url, image_model
+    chat, exc = _caption_attempt(url, model, detail, config, request_id)
+    if exc is not None and _caption_rejection_status(exc) in CAPTION_FALLBACK_STATUSES and model != IMAGE_MODEL_DEFAULT:
+        # The turn model may reject image input; fall back to the known
+        # vision model for this one sub-call.
+        model = IMAGE_MODEL_DEFAULT
+        trace("split_turn.caption_fallback", request_id=request_id, kind="engine", model=model, status=_caption_rejection_status(exc))
+        chat, exc = _caption_attempt(url, model, detail, config, request_id)
+    if exc is not None and _caption_rejection_status(exc) in CAPTION_FALLBACK_STATUSES and detail is not None:
+        # Unknown detail values can 4xx on some upstreams; retry with a
+        # downscaled image (or the original URL) and no detail.
+        downscaled = downscale_data_url(url)
+        if downscaled is not None:
+            url = downscaled
+        detail = None
+        trace("split_turn.caption_fallback", request_id=request_id, kind="detail", status=_caption_rejection_status(exc))
+        chat, exc = _caption_attempt(url, model, detail, config, request_id)
+    if exc is not None:
+        trace("split_turn.caption_failed", request_id=request_id, status=getattr(exc, "status", None), message=str(getattr(exc, "message", exc))[:200])
+        return f"[caption failed: {str(getattr(exc, 'message', exc))[:100]}]"
+
+    record_cache(config.cache_tracker, model, chat.get("usage"))
+    choice = (chat.get("choices") or [{}])[0]
+    text = (choice.get("message", {}) or {}).get("content", "")
+    caption = text.strip() if isinstance(text, str) and text.strip() else "[caption unavailable]"
+    CAPTION_CACHE.put(image_bytes, caption)
+    return caption
+
+
+def caption_images_in_messages(chat_payload: dict[str, Any], target_model: str, config: Any, request_id: str) -> dict[str, Any]:
+    """Replace image_url parts with vision-generated text captions. Routes turn to target_model after."""
+    from .trace import trace
+
+    image_model = resolve_caption_model(target_model)
+    messages = chat_payload.get("messages", [])
+
+    # Collect all image URLs across messages.
+    image_jobs: list[tuple[int, int, str]] = []  # (msg_idx, part_idx, url)
+    for mi, message in enumerate(messages):
+        content = message.get("content")
+        if not isinstance(content, list):
+            continue
+        for pi, part in enumerate(content):
+            if isinstance(part, dict) and part.get("type") == "image_url":
+                url = (part.get("image_url") or {}).get("url", "")
+                if url:
+                    image_jobs.append((mi, pi, url))
+
+    if not image_jobs:
+        chat_payload["model"] = target_model
+        return chat_payload
+
+    # Only caption the latest image; stub older ones to save 25+ seconds per turn.
+    # Old screenshots are stale context — the model only needs the current screen to act.
+    latest = image_jobs[-1]
+    caption = caption_image(latest[2], image_model, config, request_id)
+    for mi, pi, _url in image_jobs[:-1]:
+        messages[mi]["content"][pi] = {"type": "text", "text": "[prior screenshot omitted]"}
+    mi, pi, _ = latest
+    messages[mi]["content"][pi] = {"type": "text", "text": f"[screenshot: {caption}]"}
+
+    # Collapse text-only lists back to strings (fast path for upstream).
+    for message in messages:
+        content = message.get("content")
+        if isinstance(content, list) and all(
+            isinstance(p, dict) and p.get("type") == "text" for p in content
+        ):
+            message["content"] = "\n".join(p.get("text", "") for p in content if p.get("text"))
+
+    chat_payload["model"] = target_model
+    trace("split_turn.captioned", request_id=request_id, captions=1, omitted=len(image_jobs) - 1, model=chat_payload["model"])
+    return chat_payload

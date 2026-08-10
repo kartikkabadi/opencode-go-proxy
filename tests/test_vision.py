@@ -14,12 +14,9 @@ from unittest import mock
 import pytest
 
 from opencode_go_proxy import vision
-from opencode_go_proxy.app import (
-    ProxyConfig,
-    ProxyError,
-    _caption_timeout_sec,
-    call_upstream_chat,
-)
+from opencode_go_proxy.app import ProxyConfig
+from opencode_go_proxy.errors import ProxyError
+from opencode_go_proxy.upstream import call_upstream_chat, caption_timeout_sec as _caption_timeout_sec
 from opencode_go_proxy.protocol import IMAGE_MODEL_DEFAULT
 
 
@@ -189,18 +186,18 @@ class TestDownscale:
 
 class TestCaptionBudget:
     def test_default_timeout_is_30_seconds(self) -> None:
-        import opencode_go_proxy.app as app_mod
+        from opencode_go_proxy import upstream
 
-        assert app_mod.DEFAULT_CAPTION_TIMEOUT_SEC == 30.0
+        assert upstream.DEFAULT_CAPTION_TIMEOUT_SEC == 30.0
 
     def test_env_override_applies(self) -> None:
         with mock.patch.dict(os.environ, {"OPENCODE_GO_PROXY_CAPTION_TIMEOUT_SEC": "45"}, clear=True):
             assert _caption_timeout_sec() == 45.0
 
     def test_call_upstream_chat_max_retries_zero(self) -> None:
-        import opencode_go_proxy.app as app_mod
+        from opencode_go_proxy.secrets import clear_api_key_cache
 
-        app_mod._api_key_cache = None
+        clear_api_key_cache()
         err = urllib.error.HTTPError(
             "https://mock.test/v1/chat/completions", 503, "Service Unavailable",
             {}, io.BytesIO(b'{"error":"down"}'),
@@ -214,9 +211,9 @@ class TestCaptionBudget:
         assert urlopen.call_count == 1
 
     def test_call_upstream_chat_still_retries_by_default(self) -> None:
-        import opencode_go_proxy.app as app_mod
+        from opencode_go_proxy.secrets import clear_api_key_cache
 
-        app_mod._api_key_cache = None
+        clear_api_key_cache()
         err = urllib.error.HTTPError(
             "https://mock.test/v1/chat/completions", 503, "Service Unavailable",
             {}, io.BytesIO(b'{"error":"down"}'),
