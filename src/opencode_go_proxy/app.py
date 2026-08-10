@@ -637,9 +637,14 @@ def main(argv: list[str] | None = None) -> None:
         chat_base_url=config.chat_base_url,
         api_key_env=config.api_key_env,
     )
+    # serve_forever in a background thread: shutdown() from a signal handler
+    # running on the main thread would otherwise deadlock (both need the main
+    # thread), leaving the process unkillable via SIGTERM.
+    serve_thread = threading.Thread(target=server.serve_forever, daemon=True)
     signal.signal(signal.SIGTERM, lambda *_: server.shutdown())
     try:
-        server.serve_forever()
+        serve_thread.start()
+        serve_thread.join()
     except KeyboardInterrupt:
         trace("server.stop", reason="keyboard_interrupt")
     finally:

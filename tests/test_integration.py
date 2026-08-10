@@ -417,6 +417,42 @@ class TestVersionFlag:
         assert __version__ in result.stdout
 
 
+class TestGracefulShutdown:
+    def test_sigterm_stops_server(self):
+        """SIGTERM must stop the proxy (regression: shutdown() from a main-thread
+        signal handler deadlocked when serve_forever ran on the main thread)."""
+        import signal
+        import socket
+        import subprocess
+        import sys
+        import time
+
+        env = dict(os.environ, OPENCODE_GO_API_KEY="test-key")
+        proc = subprocess.Popen(
+            [sys.executable, "-m", "opencode_go_proxy", "--bind", "127.0.0.1", "--port", "8799"],
+            env=env,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        try:
+            deadline = time.monotonic() + 10
+            while time.monotonic() < deadline:
+                try:
+                    with socket.create_connection(("127.0.0.1", 8799), timeout=1):
+                        break
+                except OSError:
+                    time.sleep(0.2)
+            else:
+                raise AssertionError("proxy did not start listening on 8799")
+
+            proc.send_signal(signal.SIGTERM)
+            proc.wait(timeout=8)
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+                proc.wait(timeout=5)
+
+
 class TestAliasMap:
     def test_gpt_alias_maps_to_deepseek(self, server):
         port, _ = server
