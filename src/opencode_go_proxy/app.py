@@ -20,6 +20,7 @@ from typing import Any
 
 from . import __version__
 from .cache import CacheTracker
+from .meter import record_usage_event
 from .protocol import (
     DEFAULT_MODEL,
     IMAGE_MODEL_DEFAULT,
@@ -60,6 +61,43 @@ class ProxyConfig:
 def trace(event: str, **fields: Any) -> None:
     record = {"ts": time.time(), "event": event, **fields}
     print(json.dumps(record, sort_keys=True), file=sys.stderr, flush=True)
+
+
+# Upstream retry policy. Transient failures (429 / 5xx / network / timeout) are
+# retried a bounded number of times with a small exponential backoff before the
+# error is surfaced, so a flaky upstream does not kill a turn that a retry
+# would have completed. Tuned small: localhost proxy, latency-sensitive client.
+DEFAULT_MAX_RETRIES = 2
+DEFAULT_RETRY_BASE_SLEEP_MS = 150
+
+
+def _max_retries() -> int:
+    try:
+        return max(0, int(os.environ.get("OPENCODE_GO_PROXY_MAX_RETRIES", str(DEFAULT_MAX_RETRIES))))
+    except ValueError:
+        return DEFAULT_MAX_RETRIES
+
+
+def _retriable_http_status(code: int) -> bool:
+    return code in (429, 500, 502, 503, 504)
+
+
+def _retry_sleep(attempt: int) -> None:
+    """Sleep for a bounded exponential backoff before retry attempt N (1-based)."""
+    base = DEFAULT_RETRY_BASE_SLEEP_MS
+    try:
+        base = max(0, int(os.environ.get("OPENCODE_GO_PROXY_RETRY_BASE_MS", str(base))))
+    except ValueError:
+        pass
+    delay = min(base * (2 ** (attempt - 1)), 2000) / 1000.0
+    time.sleep(delay)
+
+
+def _usage_tokens(usage: Any) -> tuple[Any, Any, Any]:
+    """Return (input, output, total) token counts from an upstream usage dict."""
+    if not isinstance(usage, dict):
+        return None, None, None
+    return usage.get("prompt_tokens"), usage.get("completion_tokens"), usage.get("total_tokens")
 
 
 def record_cache(tracker: CacheTracker, model: str | None, usage: Any) -> None:
@@ -251,6 +289,7 @@ class ProxyError(Exception):
 
 
 def handle_responses_request(payload: Json, config: ProxyConfig, request_id: str) -> Json:
+    started = time.time()
     session_model = payload.get("model") or DEFAULT_MODEL
     payload = inject_session_model(payload, session_model)
     chat_payload, request_model, conversion_stats = responses_payload_to_chat_payload(payload)
@@ -267,7 +306,13 @@ def handle_responses_request(payload: Json, config: ProxyConfig, request_id: str
         stats=conversion_stats,
         upstream_model=chat_payload.get("model"),
     )
-    chat = call_upstream_chat(chat_payload, config, request_id)
+    try:
+        chat, retries = call_upstream_chat(chat_payload, config, request_id)
+    except ProxyError as exc:
+        record_usage_event(
+            model=request_model, status=int(exc.status), duration_ms=int((time.time() - started) * 1000),
+        )
+        raise
     record_cache(config.cache_tracker, chat_payload.get("model"), chat.get("usage"))
     response = chat_completion_to_response(chat, request_model=request_model)
     trace(
@@ -277,6 +322,11 @@ def handle_responses_request(payload: Json, config: ProxyConfig, request_id: str
         output_text_len=len(response.get("output_text", "")),
         usage=response.get("usage"),
         cache=cache_stats_from_usage(chat.get("usage")),
+    )
+    inp, outp, total = _usage_tokens(chat.get("usage"))
+    record_usage_event(
+        model=request_model, status=200, duration_ms=int((time.time() - started) * 1000),
+        input_tokens=inp, output_tokens=outp, total_tokens=total, retries=retries,
     )
     return response
 
@@ -372,8 +422,52 @@ def handle_streaming_request(payload: Json, config: ProxyConfig, request_id: str
     ka_thread = threading.Thread(target=keepalive, daemon=True)
     ka_thread.start()
 
+    retries = 0
+    max_retries = _max_retries()
+
+    # Connect with bounded retry on transient failures before any SSE byte
+    # arrives. Once the response object is open we stream it below; a failure
+    # inside that loop means the upstream died after its 200 head was already
+    # committed to the client, which we mark as an aborted stream rather than
+    # a success.
+    response = None
+    while response is None:
+        try:
+            response = urllib.request.urlopen(req, timeout=config.timeout_sec)
+        except urllib.error.HTTPError as exc:
+            body = exc.read().decode("utf-8", errors="replace")
+            trace("upstream.error", request_id=request_id, status=exc.code, body=body[:2000])
+            if _retriable_http_status(exc.code) and retries < max_retries:
+                retries += 1
+                trace("upstream.retry", request_id=request_id, attempt=retries, status=exc.code)
+                _retry_sleep(retries)
+                continue
+            keepalive_stop.set()
+            if exc.code == 429:
+                retry_after = exc.headers.get("retry-after", "5")
+                send_error(f"rate limited (retry after {retry_after}s)")
+            elif exc.code in (500, 502, 503, 504):
+                send_error(f"upstream unavailable (HTTP {exc.code})")
+            else:
+                send_error(f"upstream HTTP {exc.code}")
+            record_usage_event(model=model, status=502, duration_ms=int((time.time() - started) * 1000),
+                               stream_aborted=True, retries=retries)
+            return
+        except (urllib.error.URLError, TimeoutError) as exc:
+            trace("upstream.network_error", request_id=request_id, reason=str(getattr(exc, "reason", exc)))
+            if retries < max_retries:
+                retries += 1
+                trace("upstream.retry", request_id=request_id, attempt=retries, reason=str(getattr(exc, "reason", exc)))
+                _retry_sleep(retries)
+                continue
+            keepalive_stop.set()
+            send_error(f"upstream network error: {getattr(exc, 'reason', exc)}")
+            record_usage_event(model=model, status=502, duration_ms=int((time.time() - started) * 1000),
+                               stream_aborted=True, retries=retries)
+            return
+
     try:
-        with urllib.request.urlopen(req, timeout=config.timeout_sec) as resp:
+        with response as resp:
             keepalive_stop.set()  # Stop keepalive once upstream starts responding.
             for line in resp:
                 line = line.decode("utf-8", errors="replace").strip()
@@ -457,34 +551,31 @@ def handle_streaming_request(payload: Json, config: ProxyConfig, request_id: str
                                 tool_call_open.add(idx)
                         if fn.get("arguments"):
                             tool_calls[idx]["function"]["arguments"] += fn["arguments"]
-    except urllib.error.HTTPError as exc:
+    except (urllib.error.HTTPError, urllib.error.URLError, TimeoutError, OSError) as exc:
+        # The upstream stream died after its 200 head was already committed to
+        # the client. Surface an error and mark the turn as aborted so the
+        # meter never records a success the client never received.
         keepalive_stop.set()
-        body = exc.read().decode("utf-8", errors="replace")
-        trace("upstream.error", request_id=request_id, status=exc.code, body=body[:2000])
-        if exc.code == 429:
-            retry_after = exc.headers.get("retry-after", "5")
-            send_error(f"rate limited (retry after {retry_after}s)")
-        elif exc.code in (500, 502, 503, 504):
-            send_error(f"upstream unavailable (HTTP {exc.code})")
-        else:
-            send_error(f"upstream HTTP {exc.code}")
-        return
-    except (urllib.error.URLError, TimeoutError) as exc:
-        keepalive_stop.set()
-        trace("upstream.network_error", request_id=request_id, reason=str(getattr(exc, "reason", exc)))
-        send_error(f"upstream network error: {getattr(exc, 'reason', exc)}")
+        code = exc.code if isinstance(exc, urllib.error.HTTPError) else None
+        trace("upstream.stream_aborted", request_id=request_id,
+              status=code or getattr(exc, "reason", str(exc)))
+        send_error("upstream stream aborted")
+        record_usage_event(model=model, status=502, duration_ms=int((time.time() - started) * 1000),
+                           stream_aborted=True, retries=retries)
         return
 
-    trace("upstream.done", request_id=request_id, status=200,
-          elapsed_ms=int((time.time() - started) * 1000), stream=True)
+    duration_ms = int((time.time() - started) * 1000)
+    trace("upstream.done", request_id=request_id, status=200, elapsed_ms=duration_ms, stream=True)
     record_cache(config.cache_tracker, chat_payload.get("model"), usage)
-
-    if not got_data:
-        send_error("upstream returned no SSE data")
-        return
 
     if not client_alive:
         trace("client.gone", request_id=request_id, message="client disconnected before final events")
+        record_usage_event(model=model, status=0, duration_ms=duration_ms, stream_aborted=True, retries=retries)
+        return
+
+    if not got_data:
+        send_error("upstream returned no SSE data")
+        record_usage_event(model=model, status=502, duration_ms=duration_ms, empty_completion=True, retries=retries)
         return
 
     # Build final response from accumulated data.
@@ -540,6 +631,11 @@ def handle_streaming_request(payload: Json, config: ProxyConfig, request_id: str
     trace("response.converted", request_id=request_id, output_items=len(output),
           output_text_len=len(text), usage=final.get("usage"), stream=True,
           cache=cache_stats_from_usage(usage))
+    inp, outp, total = _usage_tokens(usage)
+    empty = not text and not tool_calls and not reasoning
+    record_usage_event(model=model, status=200, duration_ms=duration_ms,
+                       input_tokens=inp, output_tokens=outp, total_tokens=total,
+                       retries=retries, empty_completion=empty)
 
 
 def caption_images_in_messages(chat_payload: Json, target_model: str, config: ProxyConfig, request_id: str) -> Json:
@@ -615,7 +711,7 @@ def caption_image_via_mimo(image_url: str, image_model: str, config: ProxyConfig
         "max_tokens": 200,
     }
     try:
-        chat = call_upstream_chat(caption_payload, config, request_id, timeout_sec=15.0)
+        chat, _retries = call_upstream_chat(caption_payload, config, request_id, timeout_sec=15.0)
         record_cache(config.cache_tracker, image_model, chat.get("usage"))
         choice = (chat.get("choices") or [{}])[0]
         text = (choice.get("message", {}) or {}).get("content", "")
@@ -625,50 +721,71 @@ def caption_image_via_mimo(image_url: str, image_model: str, config: ProxyConfig
         return f"[caption failed: {exc.message[:100]}]"
 
 
-def call_upstream_chat(chat_payload: Json, config: ProxyConfig, request_id: str, *, timeout_sec: float | None = None) -> Json:
+def call_upstream_chat(chat_payload: Json, config: ProxyConfig, request_id: str, *, timeout_sec: float | None = None) -> tuple[Json, int]:
     api_key = resolve_api_key(config, request_id)
 
     url = f"{config.chat_base_url}/chat/completions"
     raw_payload = json.dumps(chat_payload, separators=(",",":")).encode("utf-8")
-    request = urllib.request.Request(
-        url,
-        data=raw_payload,
-        headers={
-            "authorization": f"Bearer {api_key}",
-            "content-type": "application/json",
-            "accept": "application/json",
-            "user-agent": os.environ.get("OPENCODE_GO_PROXY_USER_AGENT", "codex/1.0"),
-        },
-        method="POST",
-    )
-    trace("upstream.start", request_id=request_id, url=url, bytes=len(raw_payload))
-    started = time.time()
-    try:
-        with urllib.request.urlopen(request, timeout=timeout_sec or config.timeout_sec) as response:
-            body = response.read()
-            elapsed_ms = int((time.time() - started) * 1000)
-            trace("upstream.done", request_id=request_id, status=response.status, bytes=len(body), elapsed_ms=elapsed_ms)
-            try:
-                value = json.loads(body)
-            except json.JSONDecodeError:
-                raise ProxyError(HTTPStatus.BAD_GATEWAY, "upstream returned invalid JSON")
-            if not isinstance(value, dict):
-                raise ProxyError(HTTPStatus.BAD_GATEWAY, "upstream returned non-object JSON")
-            return value
-    except urllib.error.HTTPError as exc:
-        body = exc.read().decode("utf-8", errors="replace")
-        trace("upstream.error", request_id=request_id, status=exc.code, body=body[:2000])
-        if exc.code == 429:
-            retry_after = exc.headers.get("retry-after", "5")
-            raise ProxyError(HTTPStatus.TOO_MANY_REQUESTS, f"rate limited (retry after {retry_after}s)") from exc
-        if exc.code == 503:
-            raise ProxyError(HTTPStatus.SERVICE_UNAVAILABLE, "upstream unavailable") from exc
-        if exc.code == 504:
-            raise ProxyError(HTTPStatus.GATEWAY_TIMEOUT, "upstream timeout") from exc
-        raise ProxyError(HTTPStatus.BAD_GATEWAY, f"upstream HTTP {exc.code}") from exc
-    except urllib.error.URLError as exc:
-        trace("upstream.network_error", request_id=request_id, reason=str(exc.reason))
-        raise ProxyError(HTTPStatus.BAD_GATEWAY, f"upstream network error: {exc.reason}") from exc
+    max_retries = _max_retries()
+    retries = 0
+    while True:
+        request = urllib.request.Request(
+            url,
+            data=raw_payload,
+            headers={
+                "authorization": f"Bearer {api_key}",
+                "content-type": "application/json",
+                "accept": "application/json",
+                "user-agent": os.environ.get("OPENCODE_GO_PROXY_USER_AGENT", "codex/1.0"),
+            },
+            method="POST",
+        )
+        trace("upstream.start", request_id=request_id, url=url, bytes=len(raw_payload), attempt=retries + 1)
+        started = time.time()
+        try:
+            with urllib.request.urlopen(request, timeout=timeout_sec or config.timeout_sec) as response:
+                body = response.read()
+                elapsed_ms = int((time.time() - started) * 1000)
+                trace("upstream.done", request_id=request_id, status=response.status, bytes=len(body), elapsed_ms=elapsed_ms)
+                try:
+                    value = json.loads(body)
+                except json.JSONDecodeError:
+                    raise ProxyError(HTTPStatus.BAD_GATEWAY, "upstream returned invalid JSON")
+                if not isinstance(value, dict):
+                    raise ProxyError(HTTPStatus.BAD_GATEWAY, "upstream returned non-object JSON")
+                return value, retries
+        except urllib.error.HTTPError as exc:
+            body = exc.read().decode("utf-8", errors="replace")
+            trace("upstream.error", request_id=request_id, status=exc.code, body=body[:2000])
+            if _retriable_http_status(exc.code) and retries < max_retries:
+                retries += 1
+                trace("upstream.retry", request_id=request_id, attempt=retries, status=exc.code)
+                _retry_sleep(retries)
+                continue
+            if exc.code == 429:
+                retry_after = exc.headers.get("retry-after", "5")
+                raise ProxyError(HTTPStatus.TOO_MANY_REQUESTS, f"rate limited (retry after {retry_after}s)") from exc
+            if exc.code == 503:
+                raise ProxyError(HTTPStatus.SERVICE_UNAVAILABLE, "upstream unavailable") from exc
+            if exc.code == 504:
+                raise ProxyError(HTTPStatus.GATEWAY_TIMEOUT, "upstream timeout") from exc
+            raise ProxyError(HTTPStatus.BAD_GATEWAY, f"upstream HTTP {exc.code}") from exc
+        except urllib.error.URLError as exc:
+            trace("upstream.network_error", request_id=request_id, reason=str(getattr(exc, "reason", exc)))
+            if retries < max_retries:
+                retries += 1
+                trace("upstream.retry", request_id=request_id, attempt=retries, reason=str(getattr(exc, "reason", exc)))
+                _retry_sleep(retries)
+                continue
+            raise ProxyError(HTTPStatus.BAD_GATEWAY, f"upstream network error: {getattr(exc, 'reason', exc)}") from exc
+        except TimeoutError:
+            trace("upstream.timeout", request_id=request_id, timeout=timeout_sec or config.timeout_sec)
+            if retries < max_retries:
+                retries += 1
+                trace("upstream.retry", request_id=request_id, attempt=retries, reason="timeout")
+                _retry_sleep(retries)
+                continue
+            raise ProxyError(HTTPStatus.GATEWAY_TIMEOUT, "upstream timeout") from None
 
 
 _api_key_cache: str | None = None
