@@ -306,13 +306,26 @@ The reference catalog's per-model `display_name` values are already short
 
 ## Model catalog
 
-Without a catalog entry, Codex prints a model metadata warning every turn. A reference catalog
-with all OpenCode Go models is included at `contrib/opencode-go-catalog.json`. Copy it to the
-proxy's default catalog path so `/models` works out of the box:
+The proxy serves `/v1/models` from a runtime catalog in the state dir
+(`OPENCODE_GO_PROXY_STATE_DIR`, default `~/.codex/opencode-go-proxy/`). At startup it renders
+the state-dir compact catalog (or the checked-in seed at `contrib/opencode-go-models.json`)
+immediately, then refreshes in the background: models.dev discovery merges in additively,
+TTL-gated so a fresh catalog never hits the network, and the full catalog is written to
+`opencode-go-catalog.json` under the state dir. Runtime refresh never writes the repo's
+`contrib/` files; maintain the checked-in seed with `opencode-go-proxy --refresh-catalog`.
+
+Rendered models follow the exact key set Codex reads in codex-router's `merged-models.json`:
+`multi_agent_version` lives at the model top level, `comp_hash`/`availability_nux`/`tool_mode`
+are present, and `model_messages` carries `approvals`, `collaboration_modes`, `permissions`,
+`token_budget`, and `auto_review` instead of dropping them. A parity test pins the renderer to
+that key set.
+
+To keep Codex from printing a model metadata warning every turn, point `model_catalog_json` at
+a full-shape catalog. The rendered one in the state dir works; copy it where you like:
 
 ```bash
 mkdir -p ~/.codex/model-catalogs
-cp contrib/opencode-go-catalog.json ~/.codex/model-catalogs/opencode-go.json
+cp ~/.codex/opencode-go-proxy/opencode-go-catalog.json ~/.codex/model-catalogs/opencode-go.json
 ```
 
 ```toml
@@ -323,6 +336,29 @@ The catalog ships with the `ModelsCache` wrapper (`fetched_at`/`etag`/`client_ve
 Codex 0.142+ desktop app requires all four top-level fields — a bare `{"models": [...]}` catalog
 causes the model picker to fall back to "Custom" instead of showing the full list. The CLI
 (`codex debug models`) tolerates the bare format, so this only surfaces in the desktop app.
+
+### Local model overlay
+
+Custom models are layered on top of the merged catalog at runtime, never by editing
+`contrib/`. `user-models.json` in the state dir holds entries keyed by slug: a full record adds
+a model, a partial record edits display fields, `"hide": true` hides one:
+
+```json
+{
+  "version": 1,
+  "models": [
+    {"slug": "my-custom-model", "display_name": "My Custom", "context_window": 200000},
+    {"slug": "deepseek-v4-flash", "display_name": "Flash (edited)", "priority": 3},
+    {"slug": "deepseek-v4-pro", "hide": true}
+  ]
+}
+```
+
+Hidden-model flags from `model-picker.json` (`{"version": 1, "hidden": ["slug"]}`) hide models
+from the picker too. Newly added models get a seven-day `availability_nux` announcement,
+tracked in `announced-models.json` under the state dir. The proxy re-reads the rendered catalog
+on each `/v1/models` request (cached by file mtime), so editing the overlay and refreshing grows
+the live list without a restart.
 
 If you want Codex's full `base_instructions` for each model, copy your Codex installation's
 bundled `models.json` and append the OpenCode Go entries from the reference catalog (keep the
@@ -344,8 +380,8 @@ Every request emits compact JSON lines on stderr. Important events:
 ## Troubleshooting
 
 **Model metadata warning every turn**
-Set `model_catalog_json` in Codex config and copy the reference catalog:
-`cp contrib/opencode-go-catalog.json ~/.codex/model-catalogs/opencode-go.json`
+Set `model_catalog_json` in Codex config and copy the rendered catalog:
+`cp ~/.codex/opencode-go-proxy/opencode-go-catalog.json ~/.codex/model-catalogs/opencode-go.json`
 
 **Connection refused on localhost:8787**
 Proxy isn't running. Start it: `opencode-go-proxy` or check `launchctl list | grep opencode`.

@@ -31,7 +31,7 @@
 		<key>CODEX_KEYCHAIN_SERVICE</key>
 		<string>opencode-go-api-key</string>
 		<key>CODEX_MODEL_CATALOG</key>
-		<string>%h/.codex/model-catalogs/opencode-go.json</string>
+		<string>%h/.codex/opencode-go-proxy/opencode-go-catalog.json</string>
 		<key>OPENCODE_GO_PROXY_USER_AGENT</key>
 		<string>codex/1.0</string>
 	</dict>

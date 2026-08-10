@@ -27,10 +27,10 @@ from .errors import ProxyError
 from .meter import record_usage_event
 from .protocol import (
     DEFAULT_MODEL,
-    KNOWN_MODELS,
     cache_stats_from_usage,
     chat_completion_to_response,
     inject_session_model,
+    known_models,
     responses_payload_to_chat_payload,
 )
 from .streaming import handle_streaming_request
@@ -141,7 +141,7 @@ class ResponsesProxyHandler(BaseHTTPRequestHandler):
         if self.path in {"/models", "/v1/models"}:
             self._send_json({
                 "object": "list",
-                "data": [{"id": slug, "object": "model"} for slug in sorted(KNOWN_MODELS)],
+                "data": [{"id": slug, "object": "model"} for slug in sorted(known_models())],
             })
             return
         self._send_json({"error": {"message": "not found"}}, status=HTTPStatus.NOT_FOUND)
@@ -287,6 +287,16 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _refresh_catalog_in_background() -> None:
+    """Run the TTL-gated runtime catalog refresh; failures are logged, never fatal."""
+    try:
+        from opencode_go_proxy import catalog as _catalog
+
+        _catalog.refresh_runtime_catalog()
+    except Exception as exc:  # noqa: BLE001 - background refresh is best-effort
+        trace("catalog.refresh.skipped", error=str(exc))
+
+
 def main(argv: list[str] | None = None) -> None:
     args_list = list(sys.argv[1:] if argv is None else argv)
     # Operational subcommands must be reachable from the installed console
@@ -313,9 +323,14 @@ def main(argv: list[str] | None = None) -> None:
     try:
         from opencode_go_proxy import catalog as _catalog
 
-        _catalog.refresh_catalog()
-    except Exception as exc:  # noqa: BLE001 - startup refresh is best-effort
+        # Startup fast path: render the state-dir compact (or the seed) with
+        # no network. The full refresh below runs in the background.
+        _catalog.prepare_runtime_catalog()
+    except Exception as exc:  # noqa: BLE001 - startup catalog render is best-effort
         trace("catalog.refresh.skipped", error=str(exc))
+    # The full refresh may fetch models.dev (up to a 10s timeout); run it in
+    # the background so startup never blocks on the network.
+    threading.Thread(target=_refresh_catalog_in_background, daemon=True, name="catalog-refresh").start()
     config = ProxyConfig(
         bind=args.bind,
         port=args.port,

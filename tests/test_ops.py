@@ -93,7 +93,7 @@ class TestMeter:
 
     def test_read_only_does_not_record(self, tmp_path) -> None:
         state = tmp_path / "state"
-        state.mkdir()
+        state.mkdir(exist_ok=True)
         p = state / "usage-events.jsonl"
         p.write_text('{"model":"deepseek-v4-flash","status":0}\n')
         before = p.read_text()

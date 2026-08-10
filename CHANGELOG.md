@@ -1,5 +1,26 @@
 # Changelog
 
+## [Unreleased]
+
+### Added
+
+- Catalog contract with overlay and runtime reload (plan 003): `render_full_catalog`
+  projects each model through the canonical key set Codex reads in
+  `merged-models.json` (`multi_agent_version` at the model top level, plus
+  `comp_hash`, `availability_nux`, and `approvals`/`collaboration_modes`/
+  `permissions`/`token_budget`/`auto_review` in `model_messages`), backed by a
+  key-set parity test against a sampled fixture.
+- Runtime catalog lives under the state dir (`OPENCODE_GO_PROXY_STATE_DIR`,
+  default `~/.codex/opencode-go-proxy/`); refresh never writes the repo's
+  `contrib/` files, and startup renders the state-dir compact (or the seed)
+  instantly while discovery runs in the background.
+- `known_models()` replaces the frozen `KNOWN_MODELS`: the live slug set is
+  cached by catalog file mtime, so `/v1/models` and model routing pick up a
+  refreshed catalog without a restart (`reload_known_models()` forces it).
+- User overlay for custom models: `user-models.json` (add / hide / edit display)
+  plus hidden-model flags from `model-picker.json`, seven-day `availability_nux`
+  announcements tracked in `announced-models.json`.
+
 ## [0.2.0] - 2026-08-10
 
 ### Added

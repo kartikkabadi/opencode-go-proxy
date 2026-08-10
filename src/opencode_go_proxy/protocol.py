@@ -136,14 +136,40 @@ MODEL_ALIASES: dict[str, str] = {
 }
 
 
-def _load_catalog_models() -> set[str]:
-    """Load known model slugs from the catalog JSON file."""
+_KNOWN_MODELS_CACHE: tuple[str, int | None, set[str]] | None = None
+
+
+def known_models() -> set[str]:
+    """Return the live set of known model slugs, cached by catalog file mtime.
+
+    Runtime refresh rewrites the state-dir catalog, so a changed file mtime
+    makes the next call re-read without a restart. reload_known_models()
+    bypasses the cache explicitly.
+    """
+    global _KNOWN_MODELS_CACHE
     from opencode_go_proxy import catalog as _catalog
 
-    return _catalog.load_known_slugs()
+    path = _catalog.default_catalog_path()
+    try:
+        mtime = os.stat(path).st_mtime_ns
+    except OSError:
+        mtime = None
+    if (
+        _KNOWN_MODELS_CACHE is not None
+        and _KNOWN_MODELS_CACHE[0] == path
+        and _KNOWN_MODELS_CACHE[1] == mtime
+    ):
+        return _KNOWN_MODELS_CACHE[2]
+    slugs = _catalog.load_known_slugs(catalog_path=path)
+    _KNOWN_MODELS_CACHE = (path, mtime, slugs)
+    return slugs
 
 
-KNOWN_MODELS: set[str] = _load_catalog_models()
+def reload_known_models() -> set[str]:
+    """Drop the mtime cache and re-read known slugs from the catalog."""
+    global _KNOWN_MODELS_CACHE
+    _KNOWN_MODELS_CACHE = None
+    return known_models()
 
 
 def new_response_id() -> str:
@@ -516,7 +542,7 @@ def responses_payload_to_chat_payload(payload: Json) -> tuple[Json, str, Json]:
     # If it's not a known catalog model and not aliased, fall back to DEFAULT_MODEL.
     if incoming_model in MODEL_ALIASES:
         incoming_model = MODEL_ALIASES[incoming_model]
-    elif incoming_model not in KNOWN_MODELS:
+    elif incoming_model not in known_models():
         incoming_model = DEFAULT_MODEL
     # Detect images by scanning for actual image_url parts (not just list-shaped content).
     has_image = any(

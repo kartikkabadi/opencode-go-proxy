@@ -155,7 +155,8 @@ class ColdStartRenderTests(unittest.TestCase):
             "share one workspace, and your job is to collaborate with them until their "
             "goal is genuinely handled.",
         )
-        self.assertEqual(messages["auto_compact_token_limit"], 900000)
+        self.assertNotIn("auto_compact_token_limit", messages)
+        self.assertNotIn("multi_agent_version", messages)
 
     def test_discovery_without_limit_context_keeps_default(self) -> None:
         record = _model_from_discovery({"id": "no-context-model", "name": "No Context"})
@@ -170,9 +171,10 @@ class ColdStartRenderTests(unittest.TestCase):
         rendered = render_full_catalog(compact)
 
         self.assertEqual(
-            rendered["models"][0]["model_messages"]["auto_compact_token_limit"],
+            rendered["models"][0]["auto_compact_token_limit"],
             round(1000000 * 0.9),
         )
+        self.assertEqual(rendered["models"][0]["multi_agent_version"], "v1")
 
 
 if __name__ == "__main__":
