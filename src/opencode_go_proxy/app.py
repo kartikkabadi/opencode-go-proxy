@@ -384,6 +384,27 @@ def handle_streaming_request(payload: Json, config: ProxyConfig, request_id: str
     payload = inject_session_model(payload, session_model)
     chat_payload, request_model, conversion_stats = responses_payload_to_chat_payload(payload)
 
+    client_alive = True
+
+    # Keepalive: send SSE comments every 15s while waiting for upstream first
+    # byte. Prevents Codex from timing out when the model thinks for 30+
+    # seconds before responding. Started before the image-caption sub-call so
+    # the client never sees a silent open stream while a caption is fetched.
+    keepalive_stop = threading.Event()
+
+    def keepalive() -> None:
+        while not keepalive_stop.wait(15):
+            if not client_alive:
+                return
+            try:
+                wfile.write(b": keepalive\n\n")
+                wfile.flush()
+            except BrokenPipeError:
+                return
+
+    ka_thread = threading.Thread(target=keepalive, daemon=True)
+    ka_thread.start()
+
     if conversion_stats.get("has_image") and conversion_stats.get("tools_present"):
         chat_payload = caption_images_in_messages(chat_payload, request_model, config, request_id)
         conversion_stats["upstream_model"] = chat_payload.get("model")
@@ -399,8 +420,6 @@ def handle_streaming_request(payload: Json, config: ProxyConfig, request_id: str
 
     response_id = new_response_id()
     model = request_model or DEFAULT_MODEL
-
-    client_alive = True
 
     def send_event(event: Json) -> None:
         nonlocal client_alive
@@ -486,23 +505,10 @@ def handle_streaming_request(payload: Json, config: ProxyConfig, request_id: str
                     "output_index": (1 if reasoning_emitted else 0) + idx, "item": tc_item})
         tool_call_open.add(idx)
 
-    # Keepalive: send SSE comments every 15s while waiting for upstream first byte.
-    # Prevents Codex from timing out when the model thinks for 30+ seconds before responding.
-    keepalive_stop = threading.Event()
-
-    def keepalive() -> None:
-        while not keepalive_stop.wait(15):
-            if not client_alive:
-                return
-            try:
-                wfile.write(b": keepalive\n\n")
-                wfile.flush()
-            except BrokenPipeError:
-                return
-
-    ka_thread = threading.Thread(target=keepalive, daemon=True)
-    ka_thread.start()
-
+    # Keepalive: send SSE comments every 15s while waiting for upstream first
+    # byte. Prevents Codex from timing out when the model thinks for 30+
+    # seconds before responding. Started before the image-caption sub-call so
+    # the client never sees a silent open stream while a caption is fetched.
     retries = 0
     max_retries = _max_retries()
 
