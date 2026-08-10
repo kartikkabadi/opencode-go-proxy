@@ -126,6 +126,30 @@ class TestHealthAndModels:
         assert "/nonexistent" not in body["error"]["message"]
 
 
+class TestWebSocketUpgradeRejected:
+    def test_upgrade_returns_426_http11(self, server):
+        """A realtime WebSocket upgrade must be answered HTTP/1.1 426 so the
+        client falls back to plain HTTP streaming instead of failing on an
+        HTTP/1.0 status line."""
+        import socket
+        port, _ = server
+        sock = socket.create_connection(("127.0.0.1", port), timeout=5)
+        sock.sendall(
+            b"GET /v1/responses HTTP/1.1\r\n"
+            b"Host: 127.0.0.1\r\n"
+            b"Connection: Upgrade\r\n"
+            b"Upgrade: websocket\r\n"
+            b"Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n"
+            b"Sec-WebSocket-Version: 13\r\n"
+            b"\r\n"
+        )
+        sock.settimeout(5)
+        data = sock.recv(4096)
+        sock.close()
+        assert data.startswith(b"HTTP/1.1 426 ")
+        assert b"Upgrade Required" in data
+
+
 class TestResponsesRoundTrip:
     def test_non_streaming_response(self, server):
         port, _ = server

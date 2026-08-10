@@ -121,7 +121,31 @@ def decode_request_body(raw: bytes, content_encoding: str, max_body_bytes: int) 
 
 
 class ResponsesProxyHandler(BaseHTTPRequestHandler):
+    def _reject_websocket_upgrade(self) -> bool:
+        """Reject a realtime WebSocket upgrade with HTTP/1.1 426.
+
+        The Codex app opens a WebSocket upgrade for realtime; BaseHTTPRequestHandler
+        defaults to HTTP/1.0 and answers with an HTTP/1.0 status line, which the client
+        rejects as "WebSocket protocol error: HTTP version must be 1.1 or higher".
+        Answering the raw upgrade with HTTP/1.1 426 Upgrade Required makes the client
+        fall back to plain HTTP streaming cleanly (mirrors codex-router src/router.mjs).
+        """
+        connection = (self.headers.get("Connection") or "").lower()
+        upgrade = (self.headers.get("Upgrade") or "").lower()
+        if "upgrade" not in connection or upgrade != "websocket":
+            return False
+        self.wfile.write(
+            b"HTTP/1.1 426 Upgrade Required\r\n"
+            b"Connection: close\r\n"
+            b"Content-Length: 0\r\n\r\n"
+        )
+        self.wfile.flush()
+        self.close_connection = True
+        return True
+
     def do_GET(self) -> None:
+        if self._reject_websocket_upgrade():
+            return
         if self.path in {"/health", "/v1/health"}:
             self._send_json({"status": "ok"})
             return
