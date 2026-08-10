@@ -2,6 +2,12 @@
 
 ## [Unreleased]
 
+### Added
+
+- Native macOS menu bar app in `macos/MenuBarApp` (Swift/AppKit, SwiftPM): short status
+  icon, live health check, start/stop of the proxy as a child process, open logs,
+  reveal log file, copy port. Build with `swift build` in `macos/MenuBarApp` (macOS 13+).
+
 ### Fixed
 
 - Reference catalog `contrib/opencode-go-catalog.json` now ships with the `ModelsCache` wrapper
@@ -9,6 +15,9 @@
   top-level fields — the previous bare `{"models": [...]}` caused the model picker to fall back
   to "Custom" instead of showing the full list. The CLI tolerated the bare format, so this only
   surfaced in the desktop app.
+- SIGTERM graceful shutdown: `serve_forever` now runs on a background thread so the signal
+  handler's `server.shutdown()` no longer deadlocks on the main thread, leaving the process
+  unkillable via SIGTERM (launchd/systemd stop, menu bar Stop).
 
 ## [0.1.2] - 2026-06-21
 

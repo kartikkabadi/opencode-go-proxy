@@ -6,7 +6,6 @@ import time
 import uuid
 from typing import Any
 
-
 Json = dict[str, Any]
 
 DEFAULT_MODEL = "deepseek-v4-flash"

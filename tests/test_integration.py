@@ -4,15 +4,15 @@ import io
 import json
 import os
 import threading
-import urllib.request
 import urllib.error
+import urllib.request
 from http.client import HTTPConnection
+from http.server import ThreadingHTTPServer
 from unittest import mock
 
 import pytest
 
 from opencode_go_proxy.app import ProxyConfig, ResponsesProxyHandler
-from http.server import ThreadingHTTPServer
 
 
 def make_config(port: int) -> ProxyConfig:
@@ -51,8 +51,7 @@ class MockUpstreamResponse:
         return self._body
 
     def __iter__(self):
-        for line in self._lines:
-            yield line
+        yield from self._lines
 
     def __enter__(self):
         return self
@@ -132,15 +131,14 @@ class TestResponsesRoundTrip:
         port, _ = server
         mock_resp = mock_chat_response("hello world")
 
-        with mock.patch.dict(os.environ, {"OPENCODE_GO_API_KEY": "test-key"}):
-            with mock.patch("urllib.request.urlopen", return_value=MockUpstreamResponse(json.dumps(mock_resp).encode())):
-                conn = HTTPConnection("127.0.0.1", port, timeout=5)
-                conn.request("POST", "/v1/responses",
-                             json.dumps({"model": "deepseek-v4-flash", "input": "Say hi."}),
-                             {"content-type": "application/json"})
-                resp = conn.getresponse()
-                body = json.loads(resp.read())
-                conn.close()
+        with mock.patch.dict(os.environ, {"OPENCODE_GO_API_KEY": "test-key"}), mock.patch("urllib.request.urlopen", return_value=MockUpstreamResponse(json.dumps(mock_resp).encode())):
+            conn = HTTPConnection("127.0.0.1", port, timeout=5)
+            conn.request("POST", "/v1/responses",
+                         json.dumps({"model": "deepseek-v4-flash", "input": "Say hi."}),
+                         {"content-type": "application/json"})
+            resp = conn.getresponse()
+            body = json.loads(resp.read())
+            conn.close()
 
         assert resp.status == 200
         assert body["status"] == "completed"
@@ -153,15 +151,14 @@ class TestResponsesRoundTrip:
         port, _ = server
         mock_resp = mock_chat_response("hi")
 
-        with mock.patch.dict(os.environ, {"OPENCODE_GO_API_KEY": "test-key"}):
-            with mock.patch("urllib.request.urlopen", return_value=MockUpstreamResponse(json.dumps(mock_resp).encode())):
-                conn = HTTPConnection("127.0.0.1", port, timeout=5)
-                conn.request("POST", "/responses",
-                             json.dumps({"model": "deepseek-v4-flash", "input": "hi"}),
-                             {"content-type": "application/json"})
-                resp = conn.getresponse()
-                body = json.loads(resp.read())
-                conn.close()
+        with mock.patch.dict(os.environ, {"OPENCODE_GO_API_KEY": "test-key"}), mock.patch("urllib.request.urlopen", return_value=MockUpstreamResponse(json.dumps(mock_resp).encode())):
+            conn = HTTPConnection("127.0.0.1", port, timeout=5)
+            conn.request("POST", "/responses",
+                         json.dumps({"model": "deepseek-v4-flash", "input": "hi"}),
+                         {"content-type": "application/json"})
+            resp = conn.getresponse()
+            body = json.loads(resp.read())
+            conn.close()
 
         assert resp.status == 200
         assert body["status"] == "completed"
@@ -170,15 +167,14 @@ class TestResponsesRoundTrip:
         port, _ = server
         mock_resp = mock_chat_response("compact")
 
-        with mock.patch.dict(os.environ, {"OPENCODE_GO_API_KEY": "test-key"}):
-            with mock.patch("urllib.request.urlopen", return_value=MockUpstreamResponse(json.dumps(mock_resp).encode())):
-                conn = HTTPConnection("127.0.0.1", port, timeout=5)
-                conn.request("POST", "/responses/compact",
-                             json.dumps({"model": "deepseek-v4-flash", "input": "hi"}),
-                             {"content-type": "application/json"})
-                resp = conn.getresponse()
-                body = json.loads(resp.read())
-                conn.close()
+        with mock.patch.dict(os.environ, {"OPENCODE_GO_API_KEY": "test-key"}), mock.patch("urllib.request.urlopen", return_value=MockUpstreamResponse(json.dumps(mock_resp).encode())):
+            conn = HTTPConnection("127.0.0.1", port, timeout=5)
+            conn.request("POST", "/responses/compact",
+                         json.dumps({"model": "deepseek-v4-flash", "input": "hi"}),
+                         {"content-type": "application/json"})
+            resp = conn.getresponse()
+            body = json.loads(resp.read())
+            conn.close()
 
         assert resp.status == 200
         assert body["status"] == "completed"
@@ -191,15 +187,14 @@ class TestResponsesRoundTrip:
         failed_completed = mock.MagicMock()
         failed_completed.returncode = 1
         failed_completed.stdout = ""
-        with mock.patch.dict(os.environ, {}, clear=True):
-            with mock.patch("opencode_go_proxy.app.subprocess.run", return_value=failed_completed):
-                conn = HTTPConnection("127.0.0.1", port, timeout=5)
-                conn.request("POST", "/v1/responses",
-                             json.dumps({"model": "deepseek-v4-flash", "input": "hi"}),
-                             {"content-type": "application/json"})
-                resp = conn.getresponse()
-                body = json.loads(resp.read())
-                conn.close()
+        with mock.patch.dict(os.environ, {}, clear=True), mock.patch("opencode_go_proxy.app.subprocess.run", return_value=failed_completed):
+            conn = HTTPConnection("127.0.0.1", port, timeout=5)
+            conn.request("POST", "/v1/responses",
+                         json.dumps({"model": "deepseek-v4-flash", "input": "hi"}),
+                         {"content-type": "application/json"})
+            resp = conn.getresponse()
+            body = json.loads(resp.read())
+            conn.close()
 
         assert resp.status == 401
         assert "OPENCODE_GO_API_KEY" in body["error"]["message"]
@@ -236,15 +231,14 @@ class TestStreamingResponse:
         ]
         mock_body = b"".join(sse_lines)
 
-        with mock.patch.dict(os.environ, {"OPENCODE_GO_API_KEY": "test-key"}):
-            with mock.patch("urllib.request.urlopen", return_value=MockUpstreamResponse(mock_body)):
-                conn = HTTPConnection("127.0.0.1", port, timeout=10)
-                conn.request("POST", "/v1/responses",
-                             json.dumps({"model": "deepseek-v4-flash", "input": "Say hi.", "stream": True}),
-                             {"content-type": "application/json"})
-                resp = conn.getresponse()
-                raw = resp.read()
-                conn.close()
+        with mock.patch.dict(os.environ, {"OPENCODE_GO_API_KEY": "test-key"}), mock.patch("urllib.request.urlopen", return_value=MockUpstreamResponse(mock_body)):
+            conn = HTTPConnection("127.0.0.1", port, timeout=10)
+            conn.request("POST", "/v1/responses",
+                         json.dumps({"model": "deepseek-v4-flash", "input": "Say hi.", "stream": True}),
+                         {"content-type": "application/json"})
+            resp = conn.getresponse()
+            raw = resp.read()
+            conn.close()
 
         assert resp.status == 200
         assert "text/event-stream" in resp.getheader("content-type", "")
@@ -263,15 +257,14 @@ class TestStreamingResponse:
         failed_completed = mock.MagicMock()
         failed_completed.returncode = 1
         failed_completed.stdout = ""
-        with mock.patch.dict(os.environ, {}, clear=True):
-            with mock.patch("opencode_go_proxy.app.subprocess.run", return_value=failed_completed):
-                conn = HTTPConnection("127.0.0.1", port, timeout=5)
-                conn.request("POST", "/v1/responses",
-                             json.dumps({"model": "deepseek-v4-flash", "input": "hi", "stream": True}),
-                             {"content-type": "application/json"})
-                resp = conn.getresponse()
-                raw = resp.read()
-                conn.close()
+        with mock.patch.dict(os.environ, {}, clear=True), mock.patch("opencode_go_proxy.app.subprocess.run", return_value=failed_completed):
+            conn = HTTPConnection("127.0.0.1", port, timeout=5)
+            conn.request("POST", "/v1/responses",
+                         json.dumps({"model": "deepseek-v4-flash", "input": "hi", "stream": True}),
+                         {"content-type": "application/json"})
+            resp = conn.getresponse()
+            raw = resp.read()
+            conn.close()
 
         assert resp.status == 200
         raw_text = raw.decode("utf-8")
@@ -280,16 +273,17 @@ class TestStreamingResponse:
 
     def test_streaming_crash_sends_sse_error(self, server):
         port, _ = server
-        with mock.patch.dict(os.environ, {"OPENCODE_GO_API_KEY": "test-key"}):
-            with mock.patch("opencode_go_proxy.app.responses_payload_to_chat_payload",
-                            side_effect=ValueError("boom")):
-                conn = HTTPConnection("127.0.0.1", port, timeout=5)
-                conn.request("POST", "/v1/responses",
-                             json.dumps({"model": "deepseek-v4-flash", "input": "hi", "stream": True}),
-                             {"content-type": "application/json"})
-                resp = conn.getresponse()
-                raw = resp.read()
-                conn.close()
+        with mock.patch.dict(os.environ, {"OPENCODE_GO_API_KEY": "test-key"}), mock.patch(
+            "opencode_go_proxy.app.responses_payload_to_chat_payload",
+            side_effect=ValueError("boom"),
+        ):
+            conn = HTTPConnection("127.0.0.1", port, timeout=5)
+            conn.request("POST", "/v1/responses",
+                         json.dumps({"model": "deepseek-v4-flash", "input": "hi", "stream": True}),
+                         {"content-type": "application/json"})
+            resp = conn.getresponse()
+            raw = resp.read()
+            conn.close()
 
         assert resp.status == 200
         raw_text = raw.decode("utf-8")
@@ -302,15 +296,14 @@ class TestEdgeCases:
         port, _ = server
         mock_resp = mock_chat_response("ok")
 
-        with mock.patch.dict(os.environ, {"OPENCODE_GO_API_KEY": "test-key"}):
-            with mock.patch("urllib.request.urlopen", return_value=MockUpstreamResponse(json.dumps(mock_resp).encode())):
-                conn = HTTPConnection("127.0.0.1", port, timeout=5)
-                conn.request("POST", "/v1/responses",
-                             json.dumps({"input": "hi"}),
-                             {"content-type": "application/json"})
-                resp = conn.getresponse()
-                body = json.loads(resp.read())
-                conn.close()
+        with mock.patch.dict(os.environ, {"OPENCODE_GO_API_KEY": "test-key"}), mock.patch("urllib.request.urlopen", return_value=MockUpstreamResponse(json.dumps(mock_resp).encode())):
+            conn = HTTPConnection("127.0.0.1", port, timeout=5)
+            conn.request("POST", "/v1/responses",
+                         json.dumps({"input": "hi"}),
+                         {"content-type": "application/json"})
+            resp = conn.getresponse()
+            body = json.loads(resp.read())
+            conn.close()
 
         assert resp.status == 200
         assert body["status"] == "completed"
@@ -322,15 +315,14 @@ class TestEdgeCases:
             {}, io.BytesIO(b'{"error":"server error"}'),
         )
 
-        with mock.patch.dict(os.environ, {"OPENCODE_GO_API_KEY": "test-key"}):
-            with mock.patch("urllib.request.urlopen", side_effect=err):
-                conn = HTTPConnection("127.0.0.1", port, timeout=5)
-                conn.request("POST", "/v1/responses",
-                             json.dumps({"model": "deepseek-v4-flash", "input": "hi"}),
-                             {"content-type": "application/json"})
-                resp = conn.getresponse()
-                body = json.loads(resp.read())
-                conn.close()
+        with mock.patch.dict(os.environ, {"OPENCODE_GO_API_KEY": "test-key"}), mock.patch("urllib.request.urlopen", side_effect=err):
+            conn = HTTPConnection("127.0.0.1", port, timeout=5)
+            conn.request("POST", "/v1/responses",
+                         json.dumps({"model": "deepseek-v4-flash", "input": "hi"}),
+                         {"content-type": "application/json"})
+            resp = conn.getresponse()
+            body = json.loads(resp.read())
+            conn.close()
 
         assert resp.status == 502
         assert "proxy_error" in body["error"]["type"]
@@ -339,15 +331,14 @@ class TestEdgeCases:
         port, _ = server
         err = urllib.error.URLError("timed out")
 
-        with mock.patch.dict(os.environ, {"OPENCODE_GO_API_KEY": "test-key"}):
-            with mock.patch("urllib.request.urlopen", side_effect=err):
-                conn = HTTPConnection("127.0.0.1", port, timeout=5)
-                conn.request("POST", "/v1/responses",
-                             json.dumps({"model": "deepseek-v4-flash", "input": "hi"}),
-                             {"content-type": "application/json"})
-                resp = conn.getresponse()
-                body = json.loads(resp.read())
-                conn.close()
+        with mock.patch.dict(os.environ, {"OPENCODE_GO_API_KEY": "test-key"}), mock.patch("urllib.request.urlopen", side_effect=err):
+            conn = HTTPConnection("127.0.0.1", port, timeout=5)
+            conn.request("POST", "/v1/responses",
+                         json.dumps({"model": "deepseek-v4-flash", "input": "hi"}),
+                         {"content-type": "application/json"})
+            resp = conn.getresponse()
+            body = json.loads(resp.read())
+            conn.close()
 
         assert resp.status == 502
         assert "network error" in body["error"]["message"].lower()
@@ -359,15 +350,14 @@ class TestEdgeCases:
             {"retry-after": "10"}, io.BytesIO(b'{"error":"rate limited"}'),
         )
 
-        with mock.patch.dict(os.environ, {"OPENCODE_GO_API_KEY": "test-key"}):
-            with mock.patch("urllib.request.urlopen", side_effect=err):
-                conn = HTTPConnection("127.0.0.1", port, timeout=5)
-                conn.request("POST", "/v1/responses",
-                             json.dumps({"model": "deepseek-v4-flash", "input": "hi"}),
-                             {"content-type": "application/json"})
-                resp = conn.getresponse()
-                body = json.loads(resp.read())
-                conn.close()
+        with mock.patch.dict(os.environ, {"OPENCODE_GO_API_KEY": "test-key"}), mock.patch("urllib.request.urlopen", side_effect=err):
+            conn = HTTPConnection("127.0.0.1", port, timeout=5)
+            conn.request("POST", "/v1/responses",
+                         json.dumps({"model": "deepseek-v4-flash", "input": "hi"}),
+                         {"content-type": "application/json"})
+            resp = conn.getresponse()
+            body = json.loads(resp.read())
+            conn.close()
 
         assert resp.status == 429
         assert "retry after" in body["error"]["message"].lower()
@@ -376,30 +366,28 @@ class TestEdgeCases:
         port, _ = server
         mock_resp = mock_chat_response("")
 
-        with mock.patch.dict(os.environ, {"OPENCODE_GO_API_KEY": "test-key"}):
-            with mock.patch("urllib.request.urlopen", return_value=MockUpstreamResponse(json.dumps(mock_resp).encode())):
-                conn = HTTPConnection("127.0.0.1", port, timeout=5)
-                conn.request("POST", "/v1/responses",
-                             json.dumps({"model": "deepseek-v4-flash", "input": ""}),
-                             {"content-type": "application/json"})
-                resp = conn.getresponse()
-                body = json.loads(resp.read())
-                conn.close()
+        with mock.patch.dict(os.environ, {"OPENCODE_GO_API_KEY": "test-key"}), mock.patch("urllib.request.urlopen", return_value=MockUpstreamResponse(json.dumps(mock_resp).encode())):
+            conn = HTTPConnection("127.0.0.1", port, timeout=5)
+            conn.request("POST", "/v1/responses",
+                         json.dumps({"model": "deepseek-v4-flash", "input": ""}),
+                         {"content-type": "application/json"})
+            resp = conn.getresponse()
+            body = json.loads(resp.read())
+            conn.close()
 
         assert resp.status == 200
         assert body["status"] == "completed"
 
     def test_upstream_invalid_json_returns_502(self, server):
         port, _ = server
-        with mock.patch.dict(os.environ, {"OPENCODE_GO_API_KEY": "test-key"}):
-            with mock.patch("urllib.request.urlopen", return_value=MockUpstreamResponse(b"not json")):
-                conn = HTTPConnection("127.0.0.1", port, timeout=5)
-                conn.request("POST", "/v1/responses",
-                             json.dumps({"model": "deepseek-v4-flash", "input": "hi"}),
-                             {"content-type": "application/json"})
-                resp = conn.getresponse()
-                body = json.loads(resp.read())
-                conn.close()
+        with mock.patch.dict(os.environ, {"OPENCODE_GO_API_KEY": "test-key"}), mock.patch("urllib.request.urlopen", return_value=MockUpstreamResponse(b"not json")):
+            conn = HTTPConnection("127.0.0.1", port, timeout=5)
+            conn.request("POST", "/v1/responses",
+                         json.dumps({"model": "deepseek-v4-flash", "input": "hi"}),
+                         {"content-type": "application/json"})
+            resp = conn.getresponse()
+            body = json.loads(resp.read())
+            conn.close()
 
         assert resp.status == 502
         assert "invalid JSON" in body["error"]["message"]
@@ -408,13 +396,50 @@ class TestEdgeCases:
 class TestVersionFlag:
     def test_version_flag_prints_version(self):
         import subprocess
+
         from opencode_go_proxy import __version__
         result = subprocess.run(
             ["uv", "run", "opencode-go-proxy", "--version"],
-            capture_output=True, text=True, cwd=os.path.dirname(os.path.dirname(__file__)),
+            capture_output=True, text=True, check=False, cwd=os.path.dirname(os.path.dirname(__file__)),
         )
         assert result.returncode == 0
         assert __version__ in result.stdout
+
+
+class TestGracefulShutdown:
+    def test_sigterm_stops_server(self):
+        """SIGTERM must stop the proxy (regression: shutdown() from a main-thread
+        signal handler deadlocked when serve_forever ran on the main thread)."""
+        import signal
+        import socket
+        import subprocess
+        import sys
+        import time
+
+        env = dict(os.environ, OPENCODE_GO_API_KEY="test-key")
+        proc = subprocess.Popen(
+            [sys.executable, "-m", "opencode_go_proxy", "--bind", "127.0.0.1", "--port", "8799"],
+            env=env,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        try:
+            deadline = time.monotonic() + 10
+            while time.monotonic() < deadline:
+                try:
+                    with socket.create_connection(("127.0.0.1", 8799), timeout=1):
+                        break
+                except OSError:
+                    time.sleep(0.2)
+            else:
+                raise AssertionError("proxy did not start listening on 8799")
+
+            proc.send_signal(signal.SIGTERM)
+            proc.wait(timeout=8)
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+                proc.wait(timeout=5)
 
 
 class TestAliasMap:
@@ -422,15 +447,14 @@ class TestAliasMap:
         port, _ = server
         mock_resp = mock_chat_response("ok", model="deepseek-v4-pro")
 
-        with mock.patch.dict(os.environ, {"OPENCODE_GO_API_KEY": "test-key"}):
-            with mock.patch("urllib.request.urlopen", return_value=MockUpstreamResponse(json.dumps(mock_resp).encode())) as mock_urlopen:
-                conn = HTTPConnection("127.0.0.1", port, timeout=5)
-                conn.request("POST", "/v1/responses",
-                             json.dumps({"model": "gpt-5.5", "input": "hi"}),
-                             {"content-type": "application/json"})
-                resp = conn.getresponse()
-                resp.read()
-                conn.close()
+        with mock.patch.dict(os.environ, {"OPENCODE_GO_API_KEY": "test-key"}), mock.patch("urllib.request.urlopen", return_value=MockUpstreamResponse(json.dumps(mock_resp).encode())) as mock_urlopen:
+            conn = HTTPConnection("127.0.0.1", port, timeout=5)
+            conn.request("POST", "/v1/responses",
+                         json.dumps({"model": "gpt-5.5", "input": "hi"}),
+                         {"content-type": "application/json"})
+            resp = conn.getresponse()
+            resp.read()
+            conn.close()
 
         assert resp.status == 200
         sent_payload = json.loads(mock_urlopen.call_args[0][0].data)
@@ -460,22 +484,21 @@ class TestToolCallRoundTrip:
             "usage": {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15},
         }
 
-        with mock.patch.dict(os.environ, {"OPENCODE_GO_API_KEY": "test-key"}):
-            with mock.patch("urllib.request.urlopen", return_value=MockUpstreamResponse(json.dumps(mock_resp).encode())):
-                conn = HTTPConnection("127.0.0.1", port, timeout=5)
-                conn.request("POST", "/v1/responses",
-                             json.dumps({
-                                 "model": "deepseek-v4-flash",
-                                 "input": "What's the weather in SF?",
-                                 "tools": [{"type": "function", "function": {
-                                     "name": "get_weather",
-                                     "parameters": {"type": "object", "properties": {"city": {"type": "string"}}},
-                                 }}],
-                             }),
-                             {"content-type": "application/json"})
-                resp = conn.getresponse()
-                body = json.loads(resp.read())
-                conn.close()
+        with mock.patch.dict(os.environ, {"OPENCODE_GO_API_KEY": "test-key"}), mock.patch("urllib.request.urlopen", return_value=MockUpstreamResponse(json.dumps(mock_resp).encode())):
+            conn = HTTPConnection("127.0.0.1", port, timeout=5)
+            conn.request("POST", "/v1/responses",
+                         json.dumps({
+                             "model": "deepseek-v4-flash",
+                             "input": "What's the weather in SF?",
+                             "tools": [{"type": "function", "function": {
+                                 "name": "get_weather",
+                                 "parameters": {"type": "object", "properties": {"city": {"type": "string"}}},
+                             }}],
+                         }),
+                         {"content-type": "application/json"})
+            resp = conn.getresponse()
+            body = json.loads(resp.read())
+            conn.close()
 
         assert resp.status == 200
         assert body["status"] == "completed"
@@ -496,15 +519,14 @@ class TestStreamingToolCalls:
         ]
         mock_body = b"".join(sse_lines)
 
-        with mock.patch.dict(os.environ, {"OPENCODE_GO_API_KEY": "test-key"}):
-            with mock.patch("urllib.request.urlopen", return_value=MockUpstreamResponse(mock_body)):
-                conn = HTTPConnection("127.0.0.1", port, timeout=10)
-                conn.request("POST", "/v1/responses",
-                             json.dumps({"model": "deepseek-v4-flash", "input": "read README", "stream": True}),
-                             {"content-type": "application/json"})
-                resp = conn.getresponse()
-                raw = resp.read()
-                conn.close()
+        with mock.patch.dict(os.environ, {"OPENCODE_GO_API_KEY": "test-key"}), mock.patch("urllib.request.urlopen", return_value=MockUpstreamResponse(mock_body)):
+            conn = HTTPConnection("127.0.0.1", port, timeout=10)
+            conn.request("POST", "/v1/responses",
+                         json.dumps({"model": "deepseek-v4-flash", "input": "read README", "stream": True}),
+                         {"content-type": "application/json"})
+            resp = conn.getresponse()
+            raw = resp.read()
+            conn.close()
 
         assert resp.status == 200
         raw_text = raw.decode("utf-8")
@@ -561,24 +583,23 @@ class TestImageCaptioning:
             MockUpstreamResponse(json.dumps(main_resp).encode()),
         ]
 
-        with mock.patch.dict(os.environ, {"OPENCODE_GO_API_KEY": "test-key"}):
-            with mock.patch("urllib.request.urlopen", side_effect=responses):
-                conn = HTTPConnection("127.0.0.1", port, timeout=10)
-                conn.request("POST", "/v1/responses",
-                             json.dumps({
-                                 "model": "deepseek-v4-flash",
-                                 "input": [{"type": "message", "role": "user", "content": [
-                                     {"type": "input_text", "text": "What's in this image?"},
-                                     {"type": "input_image", "image_url": "data:image/png;base64,iVBORw0KGgo="},
-                                 ]}],
-                                 "tools": [{"type": "function", "function": {
-                                     "name": "analyze", "parameters": {"type": "object", "properties": {}},
-                                 }}],
-                             }),
-                             {"content-type": "application/json"})
-                resp = conn.getresponse()
-                body = json.loads(resp.read())
-                conn.close()
+        with mock.patch.dict(os.environ, {"OPENCODE_GO_API_KEY": "test-key"}), mock.patch("urllib.request.urlopen", side_effect=responses):
+            conn = HTTPConnection("127.0.0.1", port, timeout=10)
+            conn.request("POST", "/v1/responses",
+                         json.dumps({
+                             "model": "deepseek-v4-flash",
+                             "input": [{"type": "message", "role": "user", "content": [
+                                 {"type": "input_text", "text": "What's in this image?"},
+                                 {"type": "input_image", "image_url": "data:image/png;base64,iVBORw0KGgo="},
+                             ]}],
+                             "tools": [{"type": "function", "function": {
+                                 "name": "analyze", "parameters": {"type": "object", "properties": {}},
+                             }}],
+                         }),
+                         {"content-type": "application/json"})
+            resp = conn.getresponse()
+            body = json.loads(resp.read())
+            conn.close()
 
         assert resp.status == 200
         assert body["status"] == "completed"

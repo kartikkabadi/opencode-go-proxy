@@ -25,9 +25,8 @@ class CredentialTests(unittest.TestCase):
         app_mod._api_key_cache = None
 
     def test_env_key_wins_without_keychain_lookup(self) -> None:
-        with mock.patch.dict(os.environ, {"OPENCODE_GO_API_KEY": "env-key"}, clear=True):
-            with mock.patch("opencode_go_proxy.app.subprocess.run") as run:
-                self.assertEqual(resolve_api_key(make_config(), "req"), "env-key")
+        with mock.patch.dict(os.environ, {"OPENCODE_GO_API_KEY": "env-key"}, clear=True), mock.patch("opencode_go_proxy.app.subprocess.run") as run:
+            self.assertEqual(resolve_api_key(make_config(), "req"), "env-key")
 
         run.assert_not_called()
 
@@ -38,9 +37,8 @@ class CredentialTests(unittest.TestCase):
             stdout="keychain-key\n",
             stderr="",
         )
-        with mock.patch.dict(os.environ, {}, clear=True):
-            with mock.patch("opencode_go_proxy.app.subprocess.run", return_value=completed):
-                self.assertEqual(resolve_api_key(make_config(), "req"), "keychain-key")
+        with mock.patch.dict(os.environ, {}, clear=True), mock.patch("opencode_go_proxy.app.subprocess.run", return_value=completed):
+            self.assertEqual(resolve_api_key(make_config(), "req"), "keychain-key")
 
     def test_missing_key_names_env_and_keychain(self) -> None:
         completed = subprocess.CompletedProcess(
@@ -49,10 +47,10 @@ class CredentialTests(unittest.TestCase):
             stdout="",
             stderr="could not be found",
         )
-        with mock.patch.dict(os.environ, {}, clear=True):
-            with mock.patch("opencode_go_proxy.app.subprocess.run", return_value=completed):
-                with self.assertRaises(ProxyError) as ctx:
-                    resolve_api_key(make_config(), "req")
+        with mock.patch.dict(os.environ, {}, clear=True), mock.patch(
+            "opencode_go_proxy.app.subprocess.run", return_value=completed
+        ), self.assertRaises(ProxyError) as ctx:
+            resolve_api_key(make_config(), "req")
 
         self.assertEqual(ctx.exception.status, HTTPStatus.UNAUTHORIZED)
         self.assertIn("$OPENCODE_GO_API_KEY", ctx.exception.message)
