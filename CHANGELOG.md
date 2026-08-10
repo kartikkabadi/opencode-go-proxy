@@ -4,6 +4,16 @@
 
 ### Added
 
+- Correctness contract (plan 007): an upstream 200 that streams no
+  text, tool call, or reasoning is retried once with the identical request
+  (terminal events held, ids reused); a second empty stream answers
+  `response.error` code `empty_completion`. Upstream `input_tokens: 0` is
+  estimated as `max(1000, ceil(prompt_bytes / 3.3))` capped at the model's
+  context window and surfaced as `estimatedInputTokens` (kill switch
+  `OPENCODE_GO_PROXY_ESTIMATE_ZERO_INPUT=0`; self-disables once the upstream
+  reports real tokens again). The keepalive comment thread now runs until the
+  stream truly ends, with writes serialized so comments never interleave into
+  data frames.
 - Auth transport guard (plan 006): zero-config protection for the loopback
   listener - a missing Host header answers `400 invalid_host`, a non-loopback
   Host answers `403 invalid_host` unless `OPENCODE_GO_PROXY_ALLOW_REMOTE=1`,

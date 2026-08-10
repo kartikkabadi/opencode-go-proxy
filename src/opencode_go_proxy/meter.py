@@ -17,6 +17,7 @@ deliberately honest:
 from __future__ import annotations
 
 import json
+import math
 import os
 import threading
 import time
@@ -27,7 +28,19 @@ Json = dict[str, Any]
 DEFAULT_STATE_DIR = os.path.join(os.path.expanduser("~"), ".codex", "opencode-go-proxy")
 STATE_DIR_ENV = "OPENCODE_GO_PROXY_STATE_DIR"
 
+# Zero-input-token estimation: some upstreams report prompt_tokens: 0 even
+# when the prompt is large, which breaks Codex's compaction heuristic. The
+# proxy substitutes ceil(prompt_bytes / 3.3), floor 1000, capped at the
+# model's context window, in a separate estimatedInputTokens field, and
+# disables itself permanently for a model once the upstream reports real
+# non-zero input tokens. OPENCODE_GO_PROXY_ESTIMATE_ZERO_INPUT=0 turns the
+# substitution off entirely.
+ESTIMATE_ZERO_INPUT_ENV = "OPENCODE_GO_PROXY_ESTIMATE_ZERO_INPUT"
+DEFAULT_ESTIMATE_CONTEXT_WINDOW = 272000
+
 _lock = threading.Lock()
+
+_models_with_real_tokens: set[str] = set()
 
 
 def state_dir() -> str:
@@ -36,6 +49,50 @@ def state_dir() -> str:
 
 def usage_events_path() -> str:
     return os.path.join(state_dir(), "usage-events.jsonl")
+
+
+def estimate_zero_input_disabled() -> bool:
+    """True when the estimation kill switch is set (env value "0")."""
+    return os.environ.get(ESTIMATE_ZERO_INPUT_ENV, "1") == "0"
+
+
+def estimate_input_tokens(
+    model: str,
+    prompt_bytes: int,
+    usage: Any,
+    *,
+    context_window: int | None = None,
+) -> int | None:
+    """Estimate input tokens for a turn whose upstream reported exactly 0.
+
+    Returns None when the kill switch is set, the model has already reported
+    real non-zero input tokens, usage is missing, or the reported count is not
+    exactly 0. Otherwise returns max(1000, ceil(prompt_bytes / 3.3)) capped at
+    the model's context window (DEFAULT_ESTIMATE_CONTEXT_WINDOW when unknown).
+    """
+    if estimate_zero_input_disabled():
+        return None
+    if model in _models_with_real_tokens:
+        return None
+    if not isinstance(usage, dict):
+        return None
+    reported = usage.get("prompt_tokens", usage.get("input_tokens"))
+    if not (isinstance(reported, int) and reported == 0):
+        return None
+    cap = context_window if isinstance(context_window, int) and context_window > 0 else DEFAULT_ESTIMATE_CONTEXT_WINDOW
+    estimate = max(1000, math.ceil(max(0, prompt_bytes) / 3.3))
+    return min(cap, estimate)
+
+
+def note_real_input_tokens(model: str) -> None:
+    """Latch a model as reporting real input tokens; estimation never applies again."""
+    if model:
+        _models_with_real_tokens.add(model)
+
+
+def clear_estimate_latches() -> None:
+    """Drop the per-model real-token latches (test isolation only)."""
+    _models_with_real_tokens.clear()
 
 
 def _safe_token(value: Any) -> int | None:
@@ -61,6 +118,7 @@ def record_usage_event(
     input_tokens: Any = None,
     output_tokens: Any = None,
     total_tokens: Any = None,
+    estimated_input_tokens: Any = None,
     stream_aborted: bool = False,
     empty_completion: bool = False,
     retries: int | None = None,
@@ -87,6 +145,9 @@ def record_usage_event(
         clean = _safe_token(value)
         if clean is not None:
             record[key] = clean
+    estimated = _safe_token(estimated_input_tokens)
+    if estimated is not None:
+        record["estimatedInputTokens"] = estimated
     if stream_aborted:
         record["streamAborted"] = True
     if empty_completion:

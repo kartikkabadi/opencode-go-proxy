@@ -172,6 +172,48 @@ def reload_known_models() -> set[str]:
     return known_models()
 
 
+_CONTEXT_WINDOW_CACHE: tuple[str, int | None, dict[str, int]] | None = None
+
+
+def model_context_window(model: str) -> int | None:
+    """Best-known context window for a catalog model; None when unknown.
+
+    Reads the full-shape catalog the same way known_models() does, cached by
+    file mtime. Used to cap zero-input-token estimates at the model's real
+    window instead of a proxy-wide default.
+    """
+    global _CONTEXT_WINDOW_CACHE
+    from opencode_go_proxy import catalog as _catalog
+
+    path = _catalog.default_catalog_path()
+    try:
+        mtime = os.stat(path).st_mtime_ns
+    except OSError:
+        mtime = None
+    if (
+        _CONTEXT_WINDOW_CACHE is not None
+        and _CONTEXT_WINDOW_CACHE[0] == path
+        and _CONTEXT_WINDOW_CACHE[1] == mtime
+    ):
+        windows = _CONTEXT_WINDOW_CACHE[2]
+    else:
+        windows = {}
+        try:
+            with open(path) as f:
+                catalog = json.load(f)
+            for entry in catalog.get("models", []):
+                if not isinstance(entry, dict):
+                    continue
+                slug = entry.get("slug")
+                context = entry.get("context_window")
+                if isinstance(slug, str) and slug and isinstance(context, int) and context > 0:
+                    windows[slug] = context
+        except (OSError, json.JSONDecodeError):
+            pass
+        _CONTEXT_WINDOW_CACHE = (path, mtime, windows)
+    return windows.get(model)
+
+
 def new_response_id() -> str:
     return f"resp_{uuid.uuid4().hex}"
 
@@ -702,7 +744,13 @@ def cache_stats_from_usage(usage: Any) -> Json:
     return {"hit": hit, "miss": miss, "ratio": hit / total if total else None}
 
 
-def normalize_usage(usage: Any) -> Json | None:
+def normalize_usage(usage: Any, *, estimated_input_tokens: int | None = None) -> Json | None:
+    """Normalize upstream usage for the client.
+
+    estimated_input_tokens substitutes the proxy's estimate for an upstream
+    input_tokens: 0 (so the client compacts correctly) and surfaces it as
+    estimatedInputTokens; the provider's own numbers are otherwise untouched.
+    """
     if not isinstance(usage, dict):
         return None
     input_tokens = _as_int(usage.get("prompt_tokens", usage.get("input_tokens", 0)))
@@ -712,6 +760,10 @@ def normalize_usage(usage: Any) -> Json | None:
         "output_tokens": output_tokens,
         "total_tokens": _as_int(usage.get("total_tokens", input_tokens + output_tokens)),
     }
+    if estimated_input_tokens is not None:
+        normalized["input_tokens"] = estimated_input_tokens
+        normalized["total_tokens"] = estimated_input_tokens + output_tokens
+        normalized["estimatedInputTokens"] = estimated_input_tokens
     # Surf the upstream's own prefix-cache accounting back to Codex in the
     # standard Responses shape so the app's token display shows cache hits,
     # and keep the reasoning split when the provider reports one.

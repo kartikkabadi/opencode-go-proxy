@@ -61,6 +61,15 @@ class MeterRecordTests(unittest.TestCase):
         events = self._record(model="m", status=200, duration_ms=1, empty_completion=True)
         self.assertEqual(events[0]["emptyCompletion"], True)
 
+    def test_estimated_input_tokens_field_kept_separate(self) -> None:
+        events = self._record(
+            model="m", status=200, duration_ms=1,
+            input_tokens=0, estimated_input_tokens=5000,
+        )
+        e = events[0]
+        self.assertEqual(e["input_tokens"], 0)
+        self.assertEqual(e["estimatedInputTokens"], 5000)
+
     def test_retries_recorded_only_when_present(self) -> None:
         events = self._record(model="m", status=200, duration_ms=1, retries=2)
         self.assertEqual(events[0]["retries"], 2)
