@@ -16,6 +16,7 @@ from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 
+from . import __version__
 from .protocol import (
     DEFAULT_MODEL,
     IMAGE_MODEL_DEFAULT,
@@ -27,8 +28,6 @@ from .protocol import (
     now_unix,
     responses_payload_to_chat_payload,
 )
-from . import __version__
-
 
 Json = dict[str, Any]
 
@@ -95,7 +94,7 @@ class ResponsesProxyHandler(BaseHTTPRequestHandler):
                 self.end_headers()
                 try:
                     handle_streaming_request(payload, config, request_id, self.wfile)
-                except Exception as exc:
+                except Exception as exc:  # noqa: BLE001 - defensive crash trace
                     trace("request.crashed", request_id=request_id, message=str(exc), traceback=traceback.format_exc())
                     try:
                         err = json.dumps({"type": "response.error", "error": {"message": "proxy crashed; see stderr trace"}}, separators=(",",":")).encode("utf-8")
@@ -111,7 +110,7 @@ class ResponsesProxyHandler(BaseHTTPRequestHandler):
             self._send_json({"error": {"message": exc.message, "type": "proxy_error"}}, status=exc.status)
         except BrokenPipeError:
             trace("client.disconnected", request_id=request_id, message="client closed connection during stream")
-        except Exception as exc:  # pragma: no cover - defensive crash trace
+        except Exception as exc:  # pragma: no cover - defensive crash trace  # noqa: BLE001
             trace("request.crashed", request_id=request_id, message=str(exc), traceback=traceback.format_exc())
             try:
                 self._send_json(

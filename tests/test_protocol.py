@@ -1,8 +1,9 @@
+import unittest
+
 from opencode_go_proxy.protocol import (
     chat_completion_to_response,
     responses_payload_to_chat_payload,
 )
-import unittest
 
 
 class ProtocolTests(unittest.TestCase):
