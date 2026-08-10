@@ -1,7 +1,9 @@
 import unittest
 
 from opencode_go_proxy.protocol import (
+    cache_stats_from_usage,
     chat_completion_to_response,
+    normalize_usage,
     responses_payload_to_chat_payload,
 )
 
@@ -314,6 +316,67 @@ class ProtocolTests(unittest.TestCase):
         self.assertIn("mcp__computer_use__take_screenshot", tool_names)
         self.assertEqual(stats["tools"]["forwarded_tools"], 2)
         self.assertEqual(stats["tools"]["dropped_tools"], 0)
+
+
+class CacheAccountingTests(unittest.TestCase):
+    def test_deepseek_style_cache_fields_are_parsed(self) -> None:
+        stats = cache_stats_from_usage({
+            "prompt_tokens": 100,
+            "completion_tokens": 5,
+            "prompt_cache_hit_tokens": 90,
+            "prompt_cache_miss_tokens": 10,
+        })
+        self.assertEqual(stats["hit"], 90)
+        self.assertEqual(stats["miss"], 10)
+        self.assertAlmostEqual(stats["ratio"], 0.9)
+
+    def test_openai_style_cached_tokens_are_parsed(self) -> None:
+        stats = cache_stats_from_usage({
+            "prompt_tokens": 100,
+            "completion_tokens": 5,
+            "prompt_tokens_details": {"cached_tokens": 80},
+        })
+        self.assertEqual(stats["hit"], 80)
+        self.assertEqual(stats["miss"], 20)
+        self.assertAlmostEqual(stats["ratio"], 0.8)
+
+    def test_usage_without_cache_fields_reports_no_ratio(self) -> None:
+        stats = cache_stats_from_usage({"prompt_tokens": 10, "completion_tokens": 5})
+        self.assertEqual(stats, {"hit": 0, "miss": 0, "ratio": None})
+
+    def test_normalize_usage_surfaces_cached_tokens_to_codex(self) -> None:
+        normalized = normalize_usage({
+            "prompt_tokens": 100,
+            "completion_tokens": 5,
+            "total_tokens": 105,
+            "prompt_cache_hit_tokens": 90,
+            "prompt_cache_miss_tokens": 10,
+            "completion_tokens_details": {"reasoning_tokens": 3},
+        })
+        self.assertEqual(normalized["input_tokens"], 100)
+        self.assertEqual(normalized["output_tokens"], 5)
+        self.assertEqual(normalized["input_tokens_details"], {"cached_tokens": 90})
+        self.assertEqual(normalized["output_tokens_details"], {"reasoning_tokens": 3})
+
+    def test_normalize_usage_omits_details_when_upstream_reports_none(self) -> None:
+        normalized = normalize_usage({"prompt_tokens": 3, "completion_tokens": 2, "total_tokens": 5})
+        self.assertEqual(normalized, {"input_tokens": 3, "output_tokens": 2, "total_tokens": 5})
+
+    def test_chat_completion_response_carries_cache_usage_through(self) -> None:
+        response = chat_completion_to_response(
+            {
+                "model": "deepseek-v4-flash",
+                "choices": [{"message": {"role": "assistant", "content": "ok"}}],
+                "usage": {
+                    "prompt_tokens": 100,
+                    "completion_tokens": 5,
+                    "total_tokens": 105,
+                    "prompt_cache_hit_tokens": 99,
+                    "prompt_cache_miss_tokens": 1,
+                },
+            }
+        )
+        self.assertEqual(response["usage"]["input_tokens_details"], {"cached_tokens": 99})
 
 
 if __name__ == "__main__":

@@ -56,6 +56,26 @@ class CredentialTests(unittest.TestCase):
         self.assertIn("$OPENCODE_GO_API_KEY", ctx.exception.message)
         self.assertIn("keychain", ctx.exception.message)
 
+    def test_env_falls_back_to_standard_opencode_key(self) -> None:
+        with mock.patch.dict(os.environ, {"OPENCODE_API_KEY": "std-key"}, clear=True), mock.patch(
+            "opencode_go_proxy.app.subprocess.run"
+        ) as run:
+            self.assertEqual(resolve_api_key(make_config(), "req"), "std-key")
+
+        run.assert_not_called()
+
+    def test_keychain_falls_back_to_codex_router_service(self) -> None:
+        def fake_run(args: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+            service = args[args.index("-s") + 1]
+            if service == "codex-router-opencode-go":
+                return subprocess.CompletedProcess(args, 0, stdout="router-key\n", stderr="")
+            return subprocess.CompletedProcess(args, 1, stdout="", stderr="not found")
+
+        with mock.patch.dict(os.environ, {}, clear=True), mock.patch(
+            "opencode_go_proxy.app.subprocess.run", side_effect=fake_run
+        ):
+            self.assertEqual(resolve_api_key(make_config(), "req"), "router-key")
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -532,16 +532,56 @@ def output_text_from_items(items: list[Json]) -> str:
     return "".join(parts)
 
 
+def cache_stats_from_usage(usage: Any) -> Json:
+    """Extract prefix-cache accounting from an upstream usage object.
+
+    DeepSeek-style chat completions report prompt_cache_hit_tokens and
+    prompt_cache_miss_tokens; OpenAI-compatible endpoints report
+    prompt_tokens_details.cached_tokens. Whichever shape the upstream uses,
+    the proxy needs the same two numbers to compute the hit ratio it exposes
+    on /cache. Returns a dict with hit, miss, and ratio (0..1); ratio is
+    None when the upstream reported no cache fields at all.
+    """
+    if not isinstance(usage, dict):
+        return {"hit": 0, "miss": 0, "ratio": None}
+    input_tokens = usage.get("prompt_tokens", usage.get("input_tokens", 0))
+    hit_raw = usage.get("prompt_cache_hit_tokens")
+    miss_raw = usage.get("prompt_cache_miss_tokens")
+    cached_raw = (usage.get("prompt_tokens_details") or {}).get("cached_tokens")
+    # Only treat the upstream as cache-aware when it actually reported a cache
+    # field; a bare prompt count is not evidence about caching either way.
+    if hit_raw is None and miss_raw is None and cached_raw is None:
+        return {"hit": 0, "miss": 0, "ratio": None}
+    hit = hit_raw if isinstance(hit_raw, int) else (cached_raw if isinstance(cached_raw, int) else 0)
+    if not isinstance(hit, int):
+        hit = 0
+    miss = miss_raw if isinstance(miss_raw, int) else max(0, int(input_tokens or 0) - hit)
+    if hit == 0 and miss == 0:
+        return {"hit": 0, "miss": 0, "ratio": None}
+    total = hit + miss
+    return {"hit": hit, "miss": miss, "ratio": hit / total if total else None}
+
+
 def normalize_usage(usage: Any) -> Json | None:
     if not isinstance(usage, dict):
         return None
     input_tokens = usage.get("prompt_tokens", usage.get("input_tokens", 0))
     output_tokens = usage.get("completion_tokens", usage.get("output_tokens", 0))
-    return {
+    normalized: Json = {
         "input_tokens": input_tokens,
         "output_tokens": output_tokens,
         "total_tokens": usage.get("total_tokens", input_tokens + output_tokens),
     }
+    # Surf the upstream's own prefix-cache accounting back to Codex in the
+    # standard Responses shape so the app's token display shows cache hits,
+    # and keep the reasoning split when the provider reports one.
+    cache = cache_stats_from_usage(usage)
+    if cache["hit"] or cache["ratio"] is not None:
+        normalized["input_tokens_details"] = {"cached_tokens": cache["hit"]}
+    reasoning = (usage.get("completion_tokens_details") or {}).get("reasoning_tokens")
+    if isinstance(reasoning, int):
+        normalized["output_tokens_details"] = {"reasoning_tokens": reasoning}
+    return normalized
 
 
 def _first_choice(chat: Json) -> Json:

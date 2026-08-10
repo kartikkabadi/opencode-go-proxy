@@ -17,10 +17,12 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 
 from . import __version__
+from .cache import CacheTracker
 from .protocol import (
     DEFAULT_MODEL,
     IMAGE_MODEL_DEFAULT,
     KNOWN_MODELS,
+    cache_stats_from_usage,
     chat_completion_to_response,
     chat_message_to_response_output,
     new_response_id,
@@ -49,6 +51,7 @@ class ProxyConfig:
         self.api_key_env = api_key_env
         self.timeout_sec = timeout_sec
         self.max_body_bytes = max_body_bytes
+        self.cache_tracker = CacheTracker()
 
 
 def trace(event: str, **fields: Any) -> None:
@@ -56,10 +59,22 @@ def trace(event: str, **fields: Any) -> None:
     print(json.dumps(record, sort_keys=True), file=sys.stderr, flush=True)
 
 
+def record_cache(tracker: CacheTracker, model: str | None, usage: Any) -> None:
+    """Fold one upstream response's cache accounting into the tracker."""
+    stats = cache_stats_from_usage(usage)
+    if stats["ratio"] is None:
+        return
+    tracker.record(model or "unknown", stats["hit"], stats["miss"])
+
+
 class ResponsesProxyHandler(BaseHTTPRequestHandler):
     def do_GET(self) -> None:
         if self.path in {"/health", "/v1/health"}:
             self._send_json({"status": "ok"})
+            return
+        if self.path in {"/cache", "/v1/cache", "/metrics", "/v1/metrics"}:
+            config: ProxyConfig = self.server.config  # type: ignore[attr-defined]
+            self._send_json(config.cache_tracker.snapshot())
             return
         if self.path in {"/models", "/v1/models"}:
             self._send_json({
@@ -169,6 +184,7 @@ def handle_responses_request(payload: Json, config: ProxyConfig, request_id: str
         upstream_model=chat_payload.get("model"),
     )
     chat = call_upstream_chat(chat_payload, config, request_id)
+    record_cache(config.cache_tracker, chat_payload.get("model"), chat.get("usage"))
     response = chat_completion_to_response(chat, request_model=request_model)
     trace(
         "response.converted",
@@ -176,6 +192,7 @@ def handle_responses_request(payload: Json, config: ProxyConfig, request_id: str
         output_items=len(response.get("output", [])),
         output_text_len=len(response.get("output_text", "")),
         usage=response.get("usage"),
+        cache=cache_stats_from_usage(chat.get("usage")),
     )
     return response
 
@@ -189,6 +206,11 @@ def handle_streaming_request(payload: Json, config: ProxyConfig, request_id: str
         conversion_stats["upstream_model"] = chat_payload.get("model")
 
     chat_payload["stream"] = True
+    # Ask the upstream to include the usage object in the stream; without
+    # stream_options.include_usage most OpenAI-compatible endpoints omit it,
+    # and the cache accounting (prompt_cache_hit_tokens / cached_tokens)
+    # never reaches the proxy.
+    chat_payload["stream_options"] = {"include_usage": True}
     trace("request.converted", request_id=request_id, stats=conversion_stats,
           upstream_model=chat_payload.get("model"), stream=True)
 
@@ -369,6 +391,7 @@ def handle_streaming_request(payload: Json, config: ProxyConfig, request_id: str
 
     trace("upstream.done", request_id=request_id, status=200,
           elapsed_ms=int((time.time() - started) * 1000), stream=True)
+    record_cache(config.cache_tracker, chat_payload.get("model"), usage)
 
     if not got_data:
         send_error("upstream returned no SSE data")
@@ -429,7 +452,8 @@ def handle_streaming_request(payload: Json, config: ProxyConfig, request_id: str
     wfile.write(b"data: [DONE]\n\n")
     wfile.flush()
     trace("response.converted", request_id=request_id, output_items=len(output),
-          output_text_len=len(text), usage=final.get("usage"), stream=True)
+          output_text_len=len(text), usage=final.get("usage"), stream=True,
+          cache=cache_stats_from_usage(usage))
 
 
 def caption_images_in_messages(chat_payload: Json, target_model: str, config: ProxyConfig, request_id: str) -> Json:
@@ -506,6 +530,7 @@ def caption_image_via_mimo(image_url: str, image_model: str, config: ProxyConfig
     }
     try:
         chat = call_upstream_chat(caption_payload, config, request_id, timeout_sec=15.0)
+        record_cache(config.cache_tracker, image_model, chat.get("usage"))
         choice = (chat.get("choices") or [{}])[0]
         text = (choice.get("message", {}) or {}).get("content", "")
         return text.strip() if isinstance(text, str) and text.strip() else "[caption unavailable]"
@@ -563,6 +588,12 @@ def call_upstream_chat(chat_payload: Json, config: ProxyConfig, request_id: str,
 _api_key_cache: str | None = None
 _api_key_lock = threading.Lock()
 
+# Keychain services that may hold the OpenCode Go API key. The proxy's own
+# install uses opencode-go-api-key; the codex-router install on the same
+# machine stores it under codex-router-opencode-go. Trying both keeps the
+# proxy working regardless of which harness provisioned the credential.
+_KEYCHAIN_SERVICES: tuple[str, ...] = ("opencode-go-api-key", "codex-router-opencode-go")
+
 
 def resolve_api_key(config: ProxyConfig, request_id: str) -> str:
     global _api_key_cache
@@ -573,29 +604,43 @@ def resolve_api_key(config: ProxyConfig, request_id: str) -> str:
         if _api_key_cache:
             return _api_key_cache
 
-        api_key = os.environ.get(config.api_key_env)
-        if api_key:
-            _api_key_cache = api_key
-            trace("credential.source", request_id=request_id, source="env", env=config.api_key_env)
-            return api_key
+        # OPENCODE_API_KEY is the standard OpenCode env var; accept it as a
+        # fallback so the proxy works in environments that provisioned the
+        # key under the generic name.
+        for env in (config.api_key_env, "OPENCODE_API_KEY"):
+            if not env:
+                continue
+            api_key = os.environ.get(env)
+            if api_key:
+                _api_key_cache = api_key
+                trace("credential.source", request_id=request_id, source="env", env=env)
+                return api_key
 
-        keychain_service = os.environ.get("CODEX_KEYCHAIN_SERVICE", "opencode-go-api-key")
-        trace("credential.lookup", request_id=request_id, source="keychain", service=keychain_service)
-        try:
-            completed = subprocess.run(
-                ["security", "find-generic-password", "-a", os.environ.get("USER", ""), "-s", keychain_service, "-w"],
-                check=False, capture_output=True, text=True, stdin=subprocess.DEVNULL, timeout=10,
-            )
-        except (FileNotFoundError, subprocess.TimeoutExpired):
-            completed = None
-        if completed and completed.returncode == 0:
-            first_line = completed.stdout.splitlines()[0].strip() if completed.stdout.splitlines() else ""
-            if first_line:
-                _api_key_cache = first_line
-                trace("credential.source", request_id=request_id, source="keychain", service=keychain_service)
-                return first_line
+        services: list[str] = []
+        service_env = os.environ.get("CODEX_KEYCHAIN_SERVICE")
+        if service_env:
+            services.append(service_env)
+        services.extend(_KEYCHAIN_SERVICES)
+        for keychain_service in dict.fromkeys(services):
+            trace("credential.lookup", request_id=request_id, source="keychain", service=keychain_service)
+            try:
+                completed = subprocess.run(
+                    ["security", "find-generic-password", "-a", os.environ.get("USER", ""), "-s", keychain_service, "-w"],
+                    check=False, capture_output=True, text=True, stdin=subprocess.DEVNULL, timeout=10,
+                )
+            except (FileNotFoundError, subprocess.TimeoutExpired):
+                completed = None
+            if completed and completed.returncode == 0:
+                first_line = completed.stdout.splitlines()[0].strip() if completed.stdout.splitlines() else ""
+                if first_line:
+                    _api_key_cache = first_line
+                    trace("credential.source", request_id=request_id, source="keychain", service=keychain_service)
+                    return first_line
 
-        raise ProxyError(HTTPStatus.UNAUTHORIZED, f"missing API key: set ${config.api_key_env} or keychain:{keychain_service}")
+        raise ProxyError(
+            HTTPStatus.UNAUTHORIZED,
+            f"missing API key: set ${config.api_key_env} or $OPENCODE_API_KEY or keychain:{_KEYCHAIN_SERVICES[0]}",
+        )
 
 
 def build_parser() -> argparse.ArgumentParser:

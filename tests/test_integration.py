@@ -543,6 +543,95 @@ class TestStreamingToolCalls:
         assert len(added_events) >= 1, "function_call must have output_item.added event"
 
 
+class TestCacheAccounting:
+    def test_cache_endpoint_starts_empty(self, server):
+        port, _ = server
+        conn = HTTPConnection("127.0.0.1", port, timeout=5)
+        conn.request("GET", "/cache")
+        resp = conn.getresponse()
+        body = json.loads(resp.read())
+        conn.close()
+        assert resp.status == 200
+        assert body["totals"]["hit_ratio"] is None
+
+    def test_non_streaming_cache_usage_reaches_codex_and_metrics(self, server):
+        port, _ = server
+        cached_resp = {
+            "id": "chatcmpl-cache",
+            "object": "chat.completion",
+            "model": "deepseek-v4-flash",
+            "choices": [{"index": 0, "message": {"role": "assistant", "content": "ok"}, "finish_reason": "stop"}],
+            "usage": {
+                "prompt_tokens": 1000,
+                "completion_tokens": 5,
+                "total_tokens": 1005,
+                "prompt_cache_hit_tokens": 990,
+                "prompt_cache_miss_tokens": 10,
+            },
+        }
+
+        with mock.patch.dict(os.environ, {"OPENCODE_GO_API_KEY": "test-key"}), mock.patch(
+            "urllib.request.urlopen", return_value=MockUpstreamResponse(json.dumps(cached_resp).encode())
+        ):
+            conn = HTTPConnection("127.0.0.1", port, timeout=5)
+            conn.request("POST", "/v1/responses",
+                         json.dumps({"model": "deepseek-v4-flash", "input": "hi"}),
+                         {"content-type": "application/json"})
+            resp = conn.getresponse()
+            body = json.loads(resp.read())
+            conn.close()
+
+        assert resp.status == 200
+        # Codex sees the cache hit in the standard Responses usage shape.
+        assert body["usage"]["input_tokens_details"] == {"cached_tokens": 990}
+
+        conn = HTTPConnection("127.0.0.1", port, timeout=5)
+        conn.request("GET", "/cache")
+        metrics = json.loads(conn.getresponse().read())
+        conn.close()
+        assert metrics["totals"]["cache_hit_tokens"] == 990
+        assert metrics["totals"]["cache_miss_tokens"] == 10
+        assert metrics["totals"]["hit_ratio"] == 0.99
+
+    def test_streaming_sets_include_usage_and_reports_cache(self, server):
+        port, _ = server
+        sse_lines = [
+            b'data: {"id":"1","object":"chat.completion.chunk","model":"deepseek-v4-flash","choices":[{"index":0,"delta":{"content":"hi"}}]}\n',
+            b'data: {"id":"1","object":"chat.completion.chunk","model":"deepseek-v4-flash","choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":200,"completion_tokens":3,"total_tokens":203,"prompt_cache_hit_tokens":198,"prompt_cache_miss_tokens":2}}\n',
+            b'data: [DONE]\n',
+        ]
+        mock_body = b"".join(sse_lines)
+
+        with mock.patch.dict(os.environ, {"OPENCODE_GO_API_KEY": "test-key"}), mock.patch(
+            "urllib.request.urlopen", return_value=MockUpstreamResponse(mock_body)
+        ) as mock_urlopen:
+            conn = HTTPConnection("127.0.0.1", port, timeout=10)
+            conn.request("POST", "/v1/responses",
+                         json.dumps({"model": "deepseek-v4-flash", "input": "hi", "stream": True}),
+                         {"content-type": "application/json"})
+            resp = conn.getresponse()
+            raw = resp.read()
+            conn.close()
+
+        assert resp.status == 200
+        raw_text = raw.decode("utf-8")
+        assert "response.completed" in raw_text
+        # The completed event's usage must carry the cache hit to Codex.
+        assert '"cached_tokens":198' in raw_text
+
+        # The outbound request asked the upstream to include usage in the stream.
+        sent_payload = json.loads(mock_urlopen.call_args[0][0].data)
+        assert sent_payload["stream"] is True
+        assert sent_payload["stream_options"] == {"include_usage": True}
+
+        conn = HTTPConnection("127.0.0.1", port, timeout=5)
+        conn.request("GET", "/cache")
+        metrics = json.loads(conn.getresponse().read())
+        conn.close()
+        assert metrics["totals"]["cache_hit_tokens"] == 198
+        assert metrics["totals"]["cache_miss_tokens"] == 2
+
+
 class TestSSRFValidation:
     def test_file_scheme_rejected(self):
         from opencode_go_proxy.protocol import _is_safe_image_url
