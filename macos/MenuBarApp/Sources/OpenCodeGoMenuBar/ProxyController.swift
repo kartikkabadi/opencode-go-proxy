@@ -30,6 +30,15 @@ final class ProxyController {
         guard childPID < 0, !state.isStarting else { return }
         state = ProxyState(isRunning: false, isStarting: true, isHealthy: false, port: state.port)
 
+        // Single-port guard: if another process already owns the port (the
+        // launchd service, another proxy, anything else), refuse to spawn a
+        // second one. One proxy per port; the menu bar is the control surface,
+        // but it must not fight an existing process for the socket.
+        if portIsInUse() {
+            failStart("Port \(state.port) is already in use by another process. Stop the launchd service or the other proxy first (one proxy per port).")
+            return
+        }
+
         do {
             try FileManager.default.createDirectory(at: logDir, withIntermediateDirectories: true)
         } catch {
@@ -122,6 +131,26 @@ final class ProxyController {
     }
 
     // MARK: - Private
+
+    /// True when some process is already listening on 127.0.0.1:<port>.
+    /// Used by the single-port guard so the menu bar never spawns a second
+    /// proxy that would fail to bind (or fight a launchd service for the port).
+    private func portIsInUse() -> Bool {
+        let sock = socket(AF_INET, SOCK_STREAM, 0)
+        guard sock >= 0 else { return false }
+        defer { close(sock) }
+        var addr = sockaddr_in()
+        addr.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
+        addr.sin_family = sa_family_t(AF_INET)
+        addr.sin_port = in_port_t(state.port).bigEndian
+        addr.sin_addr.s_addr = inet_addr("127.0.0.1")
+        let rc = withUnsafePointer(to: &addr) { ptr in
+            ptr.withMemoryRebound(to: sockaddr.self, capacity: 1) { sa in
+                connect(sock, sa, socklen_t(MemoryLayout<sockaddr_in>.size))
+            }
+        }
+        return rc == 0
+    }
 
     private func failStart(_ message: String) {
         state = ProxyState(isRunning: false, isStarting: false, isHealthy: false, port: state.port)

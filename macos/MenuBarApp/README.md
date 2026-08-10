@@ -31,8 +31,9 @@ cp -R .build/release/OpenCodeGoMenuBar OpenCodeGoMenuBar.app/Contents/MacOS/
 ## Notes
 
 - The Python bridge is untouched; the app only manages it as a child process.
-- Do not run this app and the launchd agent at the same time: both bind 127.0.0.1:8787 and
-  the second one will fail to bind. Stop the launchd agent first
-  (`launchctl bootout gui/$(id -u) ~/Library/LaunchAgents/com.opencode-go.proxy.plist`).
+- Single-port guard: the app refuses to Start if another process already listens on
+  127.0.0.1:8787 (for example the launchd agent), instead of spawning a second proxy that
+  would fail to bind. One proxy per port. To switch from launchd to the menu bar, stop the
+  launchd agent first (`launchctl bootout gui/$(id -u) ~/Library/LaunchAgents/com.opencode-go.proxy.plist`).
 - The proxy resolves the API key exactly as the CLI does: `$OPENCODE_GO_API_KEY` first, then
   the macOS keychain service `opencode-go-api-key`.
