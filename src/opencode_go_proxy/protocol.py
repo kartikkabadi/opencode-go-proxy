@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 import os
 import time
 import uuid
@@ -27,13 +26,9 @@ MODEL_ALIASES: dict[str, str] = {
 
 def _load_catalog_models() -> set[str]:
     """Load known model slugs from the catalog JSON file."""
-    catalog_path = os.environ.get("CODEX_MODEL_CATALOG", os.path.expanduser("~/.codex/model-catalogs/opencode-go.json"))
-    try:
-        with open(catalog_path) as f:
-            catalog = json.load(f)
-        return {m["slug"] for m in catalog.get("models", []) if isinstance(m, dict) and "slug" in m}
-    except (OSError, json.JSONDecodeError, KeyError):
-        return {DEFAULT_MODEL, IMAGE_MODEL_DEFAULT}
+    from opencode_go_proxy import catalog as _catalog
+
+    return _catalog.load_known_slugs()
 
 
 KNOWN_MODELS: set[str] = _load_catalog_models()

@@ -616,6 +616,12 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> None:
     args = build_parser().parse_args(argv)
+    try:
+        from opencode_go_proxy import catalog as _catalog
+
+        _catalog.refresh_catalog()
+    except Exception as exc:  # noqa: BLE001 - startup refresh is best-effort
+        trace("catalog.refresh.skipped", error=str(exc))
     config = ProxyConfig(
         bind=args.bind,
         port=args.port,

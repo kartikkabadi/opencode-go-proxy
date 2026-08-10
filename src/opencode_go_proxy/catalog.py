@@ -351,9 +351,31 @@ __all__ = [
     "discover_models",
     "load_compact",
     "load_known_slugs",
+    "main_refresh",
     "merge_models",
     "parse_iso",
     "refresh_catalog",
     "render_full_catalog",
     "write_catalog",
 ]
+
+
+def main_refresh(argv: list[str] | None = None) -> int:
+    import argparse
+
+    p = argparse.ArgumentParser(prog="opencode-go-proxy refresh-catalog")
+    p.add_argument("--compact", default="contrib/opencode-go-models.json")
+    p.add_argument("--catalog", default="contrib/opencode-go-catalog.json")
+    p.add_argument("--force", action="store_true")
+    p.add_argument("--ttl", type=float, default=DEFAULT_TTL_HOURS)
+    args = p.parse_args(argv)
+    rendered = refresh_catalog(
+        compact_path=args.compact,
+        catalog_path=args.catalog,
+        ttl_hours=args.ttl,
+        force=args.force,
+    )
+    n = len(rendered.get("models", []))
+    size = os.path.getsize(args.catalog)
+    print(f"wrote {args.catalog} ({n} models, {size} bytes)")
+    return 0
