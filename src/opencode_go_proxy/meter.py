@@ -65,6 +65,7 @@ def record_usage_event(
     empty_completion: bool = False,
     retries: int | None = None,
     at: float | None = None,
+    kind: str = "turn",
 ) -> None:
     """Append one usage event to usage-events.jsonl, creating the dir on demand.
 
@@ -92,6 +93,8 @@ def record_usage_event(
         record["emptyCompletion"] = True
     if retries:
         record["retries"] = int(retries)
+    if kind and kind != "turn":
+        record["kind"] = kind
     line = json.dumps(record, sort_keys=True, separators=(",", ":"))
     with _lock:
         try:

@@ -2,6 +2,7 @@
 
 import base64
 import io
+import json
 import os
 import shutil
 import struct
@@ -9,6 +10,7 @@ import time
 import urllib.error
 import urllib.request
 import zlib
+from http import HTTPStatus
 from unittest import mock
 
 import pytest
@@ -91,32 +93,38 @@ class TestCaptionCache:
 
 
 class TestCaptionModelSelection:
-    def test_defaults_to_turn_model(self) -> None:
-        with mock.patch.dict(os.environ, {}, clear=True):
-            assert vision.resolve_caption_model("deepseek-v4-flash") == "deepseek-v4-flash"
+    def test_auto_picks_cheapest_catalog_model(self) -> None:
+        # Fixture catalog declares image input for both models; the flash
+        # cost hint ranks deepseek-v4-flash cheapest.
+        assert vision.resolve_caption_model("deepseek-v4-flash") == "deepseek-v4-flash"
 
     def test_codex_image_model_override_wins(self) -> None:
-        with mock.patch.dict(os.environ, {"CODEX_IMAGE_MODEL": "mimo-v2.5"}, clear=True):
+        with mock.patch.dict(os.environ, {"CODEX_IMAGE_MODEL": "mimo-v2.5"}):
             assert vision.resolve_caption_model("deepseek-v4-flash") == "mimo-v2.5"
 
-    def test_caption_model_auto_uses_turn_model(self) -> None:
-        with mock.patch.dict(os.environ, {"OPENCODE_GO_PROXY_CAPTION_MODEL": "auto"}, clear=True):
+    def test_caption_model_auto_uses_catalog_pick(self) -> None:
+        with mock.patch.dict(os.environ, {"OPENCODE_GO_PROXY_CAPTION_MODEL": "auto"}):
             assert vision.resolve_caption_model("deepseek-v4-flash") == "deepseek-v4-flash"
 
     def test_caption_model_explicit_pins_engine(self) -> None:
-        with mock.patch.dict(os.environ, {"OPENCODE_GO_PROXY_CAPTION_MODEL": "deepseek-v4-pro"}, clear=True):
+        with mock.patch.dict(os.environ, {"OPENCODE_GO_PROXY_CAPTION_MODEL": "deepseek-v4-pro"}):
             assert vision.resolve_caption_model("deepseek-v4-flash") == "deepseek-v4-pro"
 
     def test_codex_image_model_beats_caption_model(self) -> None:
         with mock.patch.dict(
             os.environ,
             {"CODEX_IMAGE_MODEL": "mimo-v2.5", "OPENCODE_GO_PROXY_CAPTION_MODEL": "deepseek-v4-pro"},
-            clear=True,
         ):
             assert vision.resolve_caption_model("deepseek-v4-flash") == "mimo-v2.5"
 
-    def test_empty_target_falls_back_to_mimo(self) -> None:
-        with mock.patch.dict(os.environ, {}, clear=True):
+    def test_local_pin_resolves_to_local(self) -> None:
+        with mock.patch.dict(os.environ, {"OPENCODE_GO_PROXY_CAPTION_MODEL": "local"}):
+            assert vision.resolve_caption_model("deepseek-v4-flash") == "local"
+
+    def test_empty_target_falls_back_to_mimo_with_empty_catalog(self, tmp_path) -> None:
+        cat = tmp_path / "cat.json"
+        cat.write_text(json.dumps({"models": []}))
+        with mock.patch.dict(os.environ, {"CODEX_MODEL_CATALOG": str(cat)}):
             assert vision.resolve_caption_model("") == IMAGE_MODEL_DEFAULT
 
 
@@ -225,3 +233,260 @@ class TestCaptionBudget:
         ), mock.patch("urllib.request.urlopen", side_effect=err) as urlopen, pytest.raises(ProxyError):
             call_upstream_chat(payload, make_config(), "req")
         assert urlopen.call_count == 2
+
+
+class _FakeResponse:
+    """Minimal urllib response double: context manager, status, read()."""
+
+    def __init__(self, status: int, payload) -> None:
+        self.status = status
+        self._payload = payload
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args) -> bool:
+        return False
+
+    def read(self) -> bytes:
+        return json.dumps(self._payload).encode("utf-8")
+
+
+class TestEvidence:
+    def test_layout_kind_when_coordinates_present(self) -> None:
+        text = 'button "Save" at (120, 45); input field at (300, 200)'
+        assert vision.classify_evidence(text) == "layout"
+
+    def test_text_kind_for_transcript_shape(self) -> None:
+        text = "## Summary\nA dialog.\n## Text\nHello world\n## Layout\n- ui: dialog at top\n## Uncertain\n(nothing)"
+        assert vision.classify_evidence(text) == "text"
+
+    def test_summary_kind_for_plain_description(self) -> None:
+        assert vision.classify_evidence("A screenshot of a code editor") == "summary"
+
+    def test_unreadable_kinds(self) -> None:
+        assert vision.classify_evidence("") == "unreadable"
+        assert vision.classify_evidence("[caption failed: boom]") == "unreadable"
+        assert vision.classify_evidence("[caption unavailable]") == "unreadable"
+
+
+class TestCatalogAutoPick:
+    @staticmethod
+    def _write_catalog(tmp_path, models) -> str:
+        path = tmp_path / "cat.json"
+        path.write_text(json.dumps({"models": models}))
+        return str(path)
+
+    def test_picks_cheapest_image_capable_model(self, tmp_path) -> None:
+        cat = self._write_catalog(
+            tmp_path,
+            [
+                {"slug": "mimo-v2.5", "input_modalities": ["text", "image"]},
+                {"slug": "deepseek-v4-flash", "input_modalities": ["text", "image"]},
+            ],
+        )
+        with mock.patch.dict(os.environ, {"CODEX_MODEL_CATALOG": cat}):
+            assert vision.auto_pick_caption_model() == "deepseek-v4-flash"
+
+    def test_skips_text_only_and_hidden_models(self, tmp_path) -> None:
+        cat = self._write_catalog(
+            tmp_path,
+            [
+                {"slug": "text-only", "input_modalities": ["text"]},
+                {"slug": "hidden-vision", "input_modalities": ["text", "image"], "visibility": "hidden"},
+                {"slug": "mimo-v2.5", "input_modalities": ["text", "image"]},
+            ],
+        )
+        with mock.patch.dict(os.environ, {"CODEX_MODEL_CATALOG": cat}):
+            assert vision.auto_pick_caption_model() == "mimo-v2.5"
+
+    def test_empty_catalog_falls_back_to_mimo(self, tmp_path) -> None:
+        cat = self._write_catalog(tmp_path, [])
+        with mock.patch.dict(os.environ, {"CODEX_MODEL_CATALOG": cat}):
+            assert vision.auto_pick_caption_model() == IMAGE_MODEL_DEFAULT
+
+    def test_missing_catalog_falls_back_to_mimo(self, tmp_path) -> None:
+        with mock.patch.dict(os.environ, {"CODEX_MODEL_CATALOG": str(tmp_path / "nope.json")}):
+            assert vision.auto_pick_caption_model() == IMAGE_MODEL_DEFAULT
+
+
+class TestEngineResolution:
+    def test_auto_orders_local_before_remote_when_enabled(self) -> None:
+        with mock.patch.object(vision, "local_runtime_enabled", return_value=True):
+            engines = vision.resolve_engines("deepseek-v4-flash")
+        assert isinstance(engines[0], vision.LocalVisionAdapter)
+        assert isinstance(engines[1], vision.RemoteVisionAdapter)
+        assert len(engines) == 2
+
+    def test_auto_skips_local_when_runtime_absent(self) -> None:
+        with mock.patch.object(vision, "local_runtime_enabled", return_value=False):
+            engines = vision.resolve_engines("deepseek-v4-flash")
+        assert len(engines) == 1
+        assert isinstance(engines[0], vision.RemoteVisionAdapter)
+
+    def test_local_pin_returns_only_local(self) -> None:
+        with mock.patch.dict(os.environ, {"OPENCODE_GO_PROXY_CAPTION_MODEL": "local"}):
+            engines = vision.resolve_engines("deepseek-v4-flash")
+        assert len(engines) == 1
+        assert isinstance(engines[0], vision.LocalVisionAdapter)
+
+    def test_remote_pin_returns_only_remote(self) -> None:
+        with mock.patch.dict(os.environ, {"CODEX_IMAGE_MODEL": "mimo-v2.5"}):
+            engines = vision.resolve_engines("deepseek-v4-flash")
+        assert len(engines) == 1
+        assert isinstance(engines[0], vision.RemoteVisionAdapter)
+        assert engines[0].model == "mimo-v2.5"
+
+
+class TestLocalProbe:
+    def test_enabled_when_configured_model_present(self) -> None:
+        with mock.patch(
+            "urllib.request.urlopen",
+            return_value=_FakeResponse(200, {"data": [{"id": "qwen2.5vl:3b"}, {"id": "llama3.2:3b"}]}),
+        ):
+            assert vision.local_runtime_enabled() is True
+
+    def test_enabled_when_vision_keyword_model_present(self) -> None:
+        with mock.patch(
+            "urllib.request.urlopen",
+            return_value=_FakeResponse(200, {"data": [{"id": "llama3.2-vision:11b"}]}),
+        ):
+            assert vision.local_runtime_enabled() is True
+
+    def test_disabled_when_only_text_models(self) -> None:
+        with mock.patch(
+            "urllib.request.urlopen",
+            return_value=_FakeResponse(200, {"data": [{"id": "llama3.2:3b"}]}),
+        ):
+            assert vision.local_runtime_enabled() is False
+
+    def test_disabled_when_runtime_absent_never_crashes(self) -> None:
+        with mock.patch("urllib.request.urlopen", side_effect=urllib.error.URLError("connection refused")):
+            assert vision.local_runtime_enabled() is False
+
+    def test_disabled_when_payload_malformed(self) -> None:
+        with mock.patch("urllib.request.urlopen", side_effect=json.JSONDecodeError("x", "y", 0)):
+            assert vision.local_runtime_enabled() is False
+
+
+class TestRemoteAdapter:
+    def test_describe_returns_classified_evidence(self) -> None:
+        chat = {
+            "choices": [{"message": {"role": "assistant", "content": 'button "Save" at (120, 45)'}, "finish_reason": "stop"}],
+            "usage": {"prompt_tokens": 5, "completion_tokens": 8, "total_tokens": 13},
+        }
+        with mock.patch.dict(os.environ, {"OPENCODE_GO_API_KEY": "test-key"}), mock.patch(
+            "urllib.request.urlopen", return_value=_FakeResponse(200, chat)
+        ):
+            result, exc = vision.RemoteVisionAdapter("mimo-v2.5").describe(
+                "data:image/png;base64,AAAA", vision.CAPTION_PROMPT, make_config(), "req"
+            )
+        assert exc is None
+        assert result.kind == "layout"
+        assert result.text == 'button "Save" at (120, 45)'
+        assert result.model == "mimo-v2.5"
+        assert result.usage["total_tokens"] == 13
+
+
+class TestLocalAdapter:
+    def test_describe_posts_to_local_endpoint_without_auth(self) -> None:
+        chat = {
+            "choices": [{"message": {"role": "assistant", "content": "A local reading"}}],
+            "usage": None,
+        }
+        adapter = vision.LocalVisionAdapter(base_url="http://127.0.0.1:11434/v1", model="qwen2.5vl:3b")
+        with mock.patch("urllib.request.urlopen", return_value=_FakeResponse(200, chat)) as urlopen:
+            result, exc = adapter.describe(
+                "data:image/png;base64,AAAA", vision.CAPTION_PROMPT, make_config(), "req"
+            )
+        assert exc is None
+        assert result.kind == "summary"
+        assert result.text == "A local reading"
+        request = urlopen.call_args.args[0]
+        assert request.full_url == "http://127.0.0.1:11434/v1/chat/completions"
+        sent = json.loads(request.data)
+        assert sent["model"] == "qwen2.5vl:3b"
+        assert "image_url" in sent["messages"][0]["content"][1]
+
+    def test_describe_failure_maps_to_proxy_error(self) -> None:
+        adapter = vision.LocalVisionAdapter(base_url="http://127.0.0.1:1234/v1", model="llama3.2-vision:11b")
+        with mock.patch("urllib.request.urlopen", side_effect=urllib.error.URLError("refused")):
+            result, exc = adapter.describe(
+                "data:image/png;base64,AAAA", vision.CAPTION_PROMPT, make_config(), "req"
+            )
+        assert result is None
+        assert isinstance(exc, ProxyError)
+        assert exc.status == HTTPStatus.BAD_GATEWAY
+
+
+class TestDescribeMetering:
+    @staticmethod
+    def _usage_events() -> list[dict]:
+        from opencode_go_proxy.meter import usage_events_path
+
+        path = usage_events_path()
+        if not os.path.exists(path):
+            return []
+        with open(path, encoding="utf-8") as handle:
+            return [json.loads(line) for line in handle if line.strip()]
+
+    class _OkAdapter:
+        model = "fake-vision"
+
+        def describe(self, image_url, prompt, config, request_id):
+            return vision.AdapterResult(
+                kind="summary",
+                text="cached-me",
+                model="fake-vision",
+                usage={"prompt_tokens": 5, "completion_tokens": 8, "total_tokens": 13},
+            ), None
+
+    class _FailingAdapter:
+        model = "bad-vision"
+
+        def describe(self, image_url, prompt, config, request_id):
+            return None, ProxyError(HTTPStatus.BAD_GATEWAY, "upstream exploded")
+
+    def test_miss_meters_kind_vision_and_caches(self) -> None:
+        image = "data:image/png;base64,AAAA"
+        first = vision.describe(image, engines=[self._OkAdapter()], request_id="req-1")
+        assert first.kind == "summary"
+        assert first.text == "cached-me"
+        assert first.cached is False
+        events = self._usage_events()
+        assert len(events) == 1
+        assert events[0]["kind"] == "vision"
+        assert events[0]["model"] == "fake-vision"
+        assert events[0]["status"] == 200
+        assert events[0]["total_tokens"] == 13
+
+        second = vision.describe(image, engines=[self._OkAdapter()], request_id="req-2")
+        assert second.cached is True
+        assert len(self._usage_events()) == 1
+
+    def test_total_failure_meters_unreadable(self) -> None:
+        evidence = vision.describe("data:image/png;base64,BBBB", engines=[self._FailingAdapter()], request_id="req-3")
+        assert evidence.kind == "unreadable"
+        assert "[caption failed" in evidence.text
+        events = self._usage_events()
+        assert len(events) == 1
+        assert events[0]["kind"] == "vision"
+        assert events[0]["status"] == 502
+        assert events[0]["model"] == "bad-vision"
+
+    def test_falls_back_to_next_engine(self) -> None:
+        class SecondAdapter:
+            model = "ok-vision"
+
+            def describe(self, image_url, prompt, config, request_id):
+                return vision.AdapterResult(kind="summary", text="saved by second", model="ok-vision"), None
+
+        evidence = vision.describe(
+            "data:image/png;base64,CCCC", engines=[self._FailingAdapter(), SecondAdapter()], request_id="req-4"
+        )
+        assert evidence.text == "saved by second"
+        assert evidence.model == "ok-vision"
+        events = self._usage_events()
+        assert len(events) == 1
+        assert events[0]["kind"] == "vision"
+        assert events[0]["model"] == "ok-vision"

@@ -1,23 +1,35 @@
-"""Vision caption helpers: cache, engine pick, and cheap image input.
+"""Vision bridge: structured evidence read from image-capable engines.
 
-Plan 001's urgent latency subset lives here so the fuller vision bridge
-(wayfinder ticket 14) can extend the same cache/engine structure instead of
-rewriting it. Stdlib only; ``sips`` (macOS system tool) is used for the
-downscale fallback.
+Plan 004 turns the caption path (plan 001's latency subset) into a real
+module. :func:`describe` reads one image through a vision engine and returns
+structured :class:`Evidence` (summary / text / layout / unreadable) so a
+downstream model gets something to quote instead of a vague impression.
+Engines sit behind one adapter interface: remote chat completions through
+upstream.py, and local runtimes (Ollama, llama.cpp server, LM Studio) that are
+probed read-only before they are ever nominated. Stdlib only; ``sips``
+(macOS system tool) is used for the downscale fallback.
 """
 
 from __future__ import annotations
 
 import base64
 import hashlib
+import json
 import os
+import re
 import shutil
 import subprocess
 import tempfile
 import threading
 import time
+import urllib.error
+import urllib.request
+from dataclasses import dataclass
+from http import HTTPStatus
 from typing import Any
 
+from .errors import ProxyError
+from .meter import record_usage_event
 from .protocol import IMAGE_MODEL_DEFAULT
 
 # Caption cache: the same screenshot bytes are re-sent on every tool call of a
@@ -41,6 +53,11 @@ CAPTION_PROMPT = (
     "(4) where the cursor/focus/selection currently is. "
     "Skip colors and styling unless they convey state (e.g. red error, green success)."
 )
+
+# Evidence kinds the contract returns. layout preserves spatial guidance so a
+# text-only model can still target clicks; text marks a verbatim transcript;
+# summary is a plain description; unreadable is an empty or failed read.
+EVIDENCE_KINDS = ("summary", "text", "layout", "unreadable")
 
 
 class CaptionCache:
@@ -105,23 +122,6 @@ def image_bytes_for_cache(image_url: str) -> bytes:
     return image_url.encode("utf-8", errors="replace")
 
 
-def resolve_caption_model(target_model: str) -> str:
-    """Pick the caption engine: explicit override, else the turn model.
-
-    ``CODEX_IMAGE_MODEL`` keeps its role as the hard override. The new
-    ``OPENCODE_GO_PROXY_CAPTION_MODEL`` default ``auto`` makes the turn model
-    the caption engine; setting it to a concrete model pins the engine. A 4xx
-    from the upstream still falls back to ``IMAGE_MODEL_DEFAULT`` in app.py.
-    """
-    explicit = os.environ.get("CODEX_IMAGE_MODEL")
-    if explicit:
-        return explicit
-    auto = os.environ.get("OPENCODE_GO_PROXY_CAPTION_MODEL", "auto")
-    if auto.strip().lower() not in {"", "auto"}:
-        return auto.strip()
-    return target_model or IMAGE_MODEL_DEFAULT
-
-
 def caption_detail() -> str | None:
     """Detail level for the caption image part; ``low`` default, ``none`` disables."""
     value = os.environ.get("OPENCODE_GO_PROXY_CAPTION_DETAIL", "low").strip().lower()
@@ -132,7 +132,7 @@ def caption_detail() -> str | None:
     return "low"
 
 
-def build_caption_payload(image_url: str, model: str, *, detail: str | None = "low") -> dict[str, Any]:
+def build_caption_payload(image_url: str, model: str, *, detail: str | None = "low", prompt: str = CAPTION_PROMPT) -> dict[str, Any]:
     """Chat payload for one caption sub-call, image detail included."""
     image: dict[str, Any] = {"url": image_url}
     if detail:
@@ -143,7 +143,7 @@ def build_caption_payload(image_url: str, model: str, *, detail: str | None = "l
             {
                 "role": "user",
                 "content": [
-                    {"type": "text", "text": CAPTION_PROMPT},
+                    {"type": "text", "text": prompt},
                     {"type": "image_url", "image_url": image},
                 ],
             }
@@ -197,15 +197,230 @@ def downscale_data_url(image_url: str, max_edge: int = SIPS_MAX_EDGE) -> str | N
 CAPTION_FALLBACK_STATUSES = {400, 404, 415, 422}
 
 
+@dataclass(frozen=True)
+class Evidence:
+    """One structured reading of an image for a model that cannot see it."""
+
+    kind: str
+    text: str
+    model: str | None = None
+    cached: bool = False
+
+
+@dataclass(frozen=True)
+class AdapterResult:
+    """Adapter outcome: classified evidence text plus the engine that read it."""
+
+    kind: str
+    text: str
+    model: str | None
+    usage: Any = None
+
+
+_COORD_PAIR_RE = re.compile(r"\(\s*-?\d{1,5}\s*[,;]\s*-?\d{1,5}\s*\)")
+_FAILED_PREFIXES = ("[caption failed", "[caption unavailable")
+
+
+def classify_evidence(text: str) -> str:
+    """Map engine output to an evidence kind.
+
+    ``layout`` keeps the spatial guidance a text-only agent needs for click
+    precision; ``text`` marks a verbatim-transcript shaped answer; ``summary``
+    is a plain description; ``unreadable`` is an empty or failed read.
+    """
+    stripped = (text or "").strip()
+    if not stripped or stripped.startswith(_FAILED_PREFIXES):
+        return "unreadable"
+    if _COORD_PAIR_RE.search(stripped):
+        return "layout"
+    if re.search(r"(?im)^#{1,6}\s+(?:text|layout|data|uncertain)\b", stripped):
+        return "text"
+    return "summary"
+
+
 def _caption_rejection_status(exc: Any) -> int:
     return exc.upstream_status if exc.upstream_status is not None else int(exc.status)
 
 
-def _caption_attempt(image_url: str, image_model: str, detail: str | None, config: Any, request_id: str) -> tuple[dict[str, Any] | None, Any | None]:
+def _error_status(exc: Exception) -> int:
+    status = getattr(exc, "status", None)
+    return int(status) if status is not None else int(HTTPStatus.BAD_GATEWAY)
+
+
+def _normalize_engine_name(value: str) -> str:
+    """Drop the ``opencode-go/`` prefix the reference router uses in config."""
+    name = value.strip()
+    if name.startswith("opencode-go/"):
+        return name[len("opencode-go/") :]
+    return name
+
+
+def _caption_engine_setting() -> str:
+    """Env-chosen engine: a model slug or ``local``; ``""`` means auto.
+
+    ``CODEX_IMAGE_MODEL`` stays the hard override. ``OPENCODE_GO_PROXY_CAPTION_MODEL``
+    pins a concrete model, ``local``, or falls back to auto.
+    """
+    explicit = os.environ.get("CODEX_IMAGE_MODEL")
+    if explicit and explicit.strip():
+        return _normalize_engine_name(explicit)
+    value = os.environ.get("OPENCODE_GO_PROXY_CAPTION_MODEL", "auto")
+    if value.strip().lower() in {"", "auto"}:
+        return ""
+    return _normalize_engine_name(value)
+
+
+def supports_image_input(model: dict[str, Any]) -> bool:
+    """True when the catalog record declares image input."""
+    return "image" in (model.get("input_modalities") or [])
+
+
+def catalog_image_models() -> list[dict[str, Any]]:
+    """Image-capable, listed models from the full-shape state catalog."""
+    from . import catalog as _catalog
+
+    path = _catalog.default_catalog_path()
+    try:
+        with open(path, encoding="utf-8") as handle:
+            data = json.load(handle)
+    except (OSError, json.JSONDecodeError):
+        return []
+    models = data.get("models") if isinstance(data, dict) else None
+    if not isinstance(models, list):
+        return []
+    return [
+        m
+        for m in models
+        if isinstance(m, dict) and supports_image_input(m) and m.get("visibility", "list") == "list"
+    ]
+
+
+# The catalog carries no per-token prices, so name-tier hints rank engines by
+# relative cost, mirroring the reference router: flash/haiku/mini/lite/small/
+# turbo are the cheap tiers, then priority, then slug as a stable tiebreak.
+_CHEAP_ENGINE_HINTS: tuple[re.Pattern[str], ...] = tuple(
+    re.compile(pattern, re.IGNORECASE)
+    for pattern in (r"flash", r"haiku", r"mini(?!max)", r"lite", r"small", r"turbo")
+)
+
+
+def _cost_rank(slug: str) -> int:
+    for index, hint in enumerate(_CHEAP_ENGINE_HINTS):
+        if hint.search(slug):
+            return index
+    return len(_CHEAP_ENGINE_HINTS)
+
+
+def rank_catalog_image_models(models: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Cheapest-first order: cost hint, then priority, then slug."""
+    return sorted(
+        models,
+        key=lambda m: (_cost_rank(str(m.get("slug", ""))), m.get("priority", 999), str(m.get("slug", ""))),
+    )
+
+
+def auto_pick_caption_model() -> str:
+    """Cheapest image-capable catalog model, or ``IMAGE_MODEL_DEFAULT``."""
+    ranked = rank_catalog_image_models(catalog_image_models())
+    if ranked:
+        slug = str(ranked[0].get("slug", ""))
+        if slug:
+            return slug
+    return IMAGE_MODEL_DEFAULT
+
+
+def resolve_caption_model(target_model: str) -> str:
+    """Resolve the caption engine to a model slug (or ``local``), env first.
+
+    The turn model no longer drives auto: the cheapest image-capable catalog
+    model does, with ``mimo-v2.5`` as the fallback when the catalog has none.
+    ``target_model`` is accepted for compatibility; auto ignores it.
+    """
+    setting = _caption_engine_setting()
+    if setting:
+        return setting
+    return auto_pick_caption_model()
+
+
+# Local runtime (Ollama / llama.cpp server / LM Studio) config. All three
+# expose the OpenAI-compatible /v1 surface, so one adapter covers them.
+LOCAL_VISION_BASE_URL_ENV = "OPENCODE_GO_PROXY_VISION_LOCAL_BASE_URL"
+LOCAL_VISION_MODEL_ENV = "OPENCODE_GO_PROXY_VISION_LOCAL_MODEL"
+DEFAULT_LOCAL_VISION_BASE_URL = "http://127.0.0.1:11434/v1"
+DEFAULT_LOCAL_VISION_MODEL = "qwen2.5vl:3b"
+LOCAL_PROBE_TIMEOUT_SEC = 1.5
+_LOCAL_PROBE_TTL_SEC = 30.0
+
+# Vision model names a local runtime must expose before auto will nominate it;
+# a runtime that is up but only serves text models is "not enabled".
+_LOCAL_VISION_KEYWORDS = re.compile(
+    r"(qwen2\.?5?-?vl|qwen2-vl|llama3\.2-vision|llava|moondream|gemma3|"
+    r"minicpm-v|internvl|phi-4-vision|phi-3-vision|bakllava|cogvlm|glm-4v)",
+    re.IGNORECASE,
+)
+
+_LOCAL_PROBE_CACHE: dict[tuple[str, str], tuple[float, bool]] = {}
+
+
+def local_vision_base_url() -> str:
+    return os.environ.get(LOCAL_VISION_BASE_URL_ENV, DEFAULT_LOCAL_VISION_BASE_URL).strip() or DEFAULT_LOCAL_VISION_BASE_URL
+
+
+def local_vision_model() -> str:
+    return os.environ.get(LOCAL_VISION_MODEL_ENV, DEFAULT_LOCAL_VISION_MODEL).strip() or DEFAULT_LOCAL_VISION_MODEL
+
+
+def _probe_local(base_url: str, model: str) -> bool:
+    """Read-only probe: does this runtime exist and offer a vision model?"""
+    url = f"{base_url}/models"
+    try:
+        with urllib.request.urlopen(url, timeout=LOCAL_PROBE_TIMEOUT_SEC) as response:
+            if response.status != 200:
+                return False
+            payload = json.load(response)
+    except Exception:  # noqa: BLE001 - a probe that can raise would break turns
+        # A missing runtime (refused connection, timeout) or malformed reply
+        # simply means "not enabled"; the probe never raises into the turn.
+        return False
+    entries = payload.get("data") if isinstance(payload, dict) else None
+    if not isinstance(entries, list):
+        return False
+    ids = [str(entry.get("id", "")) for entry in entries if isinstance(entry, dict)]
+    if model in ids:
+        return True
+    return any(_LOCAL_VISION_KEYWORDS.search(model_id) for model_id in ids)
+
+
+def local_runtime_enabled(*, base_url: str | None = None, model: str | None = None) -> bool:
+    """Whether the local runtime is up and vision-capable, cached briefly.
+
+    A negative result is cached too, so a stopped runtime costs one short
+    localhost probe per window instead of one per image turn.
+    """
+    base_url = (base_url or local_vision_base_url()).rstrip("/")
+    model = model or local_vision_model()
+    key = (base_url, model)
+    now = time.time()
+    cached = _LOCAL_PROBE_CACHE.get(key)
+    if cached is not None and now - cached[0] < _LOCAL_PROBE_TTL_SEC:
+        return cached[1]
+    enabled = _probe_local(base_url, model)
+    _LOCAL_PROBE_CACHE[key] = (now, enabled)
+    return enabled
+
+
+def clear_local_probe_cache() -> None:
+    """Forget cached probe results (tests switch runtimes per case)."""
+    _LOCAL_PROBE_CACHE.clear()
+
+
+def _caption_attempt(
+    image_url: str, image_model: str, detail: str | None, prompt: str, config: Any, request_id: str
+) -> tuple[dict[str, Any] | None, Any | None]:
     """One caption sub-call with no transient retries; returns (chat, error)."""
     from .upstream import call_upstream_chat, caption_timeout_sec
 
-    payload = build_caption_payload(image_url, image_model, detail=detail)
+    payload = build_caption_payload(image_url, image_model, detail=detail, prompt=prompt)
     try:
         chat, _retries = call_upstream_chat(payload, config, request_id, timeout_sec=caption_timeout_sec(), max_retries=0)
         return chat, None
@@ -213,56 +428,206 @@ def _caption_attempt(image_url: str, image_model: str, detail: str | None, confi
         return None, exc
 
 
-def caption_image(image_url: str, image_model: str, config: Any, request_id: str) -> str:
-    """Caption one image via a vision-capable model, served from a byte-keyed cache.
+def _caption_text_from_chat(chat: dict[str, Any]) -> str:
+    choice = (chat.get("choices") or [{}])[0]
+    text = (choice.get("message", {}) or {}).get("content", "")
+    return text.strip() if isinstance(text, str) and text.strip() else "[caption unavailable]"
 
-    Returns a text description. A failed caption degrades to a placeholder;
-    it never blocks the turn.
+
+class RemoteVisionAdapter:
+    """Vision engine reached through the proxy's upstream chat-completions client."""
+
+    def __init__(self, model: str) -> None:
+        self.model = model
+
+    def describe(
+        self, image_url: str, prompt: str, config: Any, request_id: str
+    ) -> tuple[AdapterResult | None, Exception | None]:
+        from .trace import trace
+
+        detail = caption_detail()
+        url, model = image_url, self.model
+        chat, exc = _caption_attempt(url, model, detail, prompt, config, request_id)
+        if exc is not None and _caption_rejection_status(exc) in CAPTION_FALLBACK_STATUSES and model != IMAGE_MODEL_DEFAULT:
+            # The pinned/auto model may reject image input; fall back to the
+            # known vision model for this one sub-call.
+            model = IMAGE_MODEL_DEFAULT
+            trace("split_turn.caption_fallback", request_id=request_id, kind="engine", model=model, status=_caption_rejection_status(exc))
+            chat, exc = _caption_attempt(url, model, detail, prompt, config, request_id)
+        if exc is not None and _caption_rejection_status(exc) in CAPTION_FALLBACK_STATUSES and detail is not None:
+            # Unknown detail values can 4xx on some upstreams; retry with a
+            # downscaled image (or the original URL) and no detail.
+            downscaled = downscale_data_url(url)
+            if downscaled is not None:
+                url = downscaled
+            detail = None
+            trace("split_turn.caption_fallback", request_id=request_id, kind="detail", status=_caption_rejection_status(exc))
+            chat, exc = _caption_attempt(url, model, detail, prompt, config, request_id)
+        if exc is not None:
+            return None, exc
+        if config is not None:
+            from .upstream import record_cache
+
+            # Keep the prefix-cache tracker fed: caption reads count toward the
+            # provider's cache accounting just like main-turn reads did.
+            record_cache(config.cache_tracker, model, chat.get("usage"))
+        text = _caption_text_from_chat(chat)
+        return AdapterResult(kind=classify_evidence(text), text=text, model=model, usage=chat.get("usage")), None
+
+
+def _local_engine_error(exc: Exception, model: str) -> ProxyError:
+    if isinstance(exc, urllib.error.HTTPError):
+        return ProxyError(HTTPStatus.BAD_GATEWAY, f"local vision engine {model} HTTP {exc.code}", upstream_status=exc.code)
+    return ProxyError(HTTPStatus.BAD_GATEWAY, f"local vision engine {model}: {exc}")
+
+
+class LocalVisionAdapter:
+    """Vision engine on this machine (Ollama, llama.cpp server, LM Studio).
+
+    All three speak the OpenAI-compatible chat-completions shape, so one
+    request path covers them. No credential; one bounded attempt, no retries.
+    """
+
+    def __init__(self, *, base_url: str, model: str) -> None:
+        self.base_url = base_url.rstrip("/")
+        self.model = model
+
+    def describe(
+        self, image_url: str, prompt: str, config: Any, request_id: str
+    ) -> tuple[AdapterResult | None, Exception | None]:
+        from .upstream import caption_timeout_sec
+
+        payload = build_caption_payload(image_url, self.model, detail=None, prompt=prompt)
+        raw = json.dumps(payload, separators=(",", ":")).encode("utf-8")
+        url = f"{self.base_url}/chat/completions"
+        request = urllib.request.Request(
+            url, data=raw, headers={"content-type": "application/json"}, method="POST"
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=caption_timeout_sec()) as response:
+                body = response.read()
+        except Exception as exc:  # noqa: BLE001 - surfaced as a failed caption
+            return None, _local_engine_error(exc, self.model)
+        try:
+            value = json.loads(body)
+        except json.JSONDecodeError:
+            return None, _local_engine_error(ValueError("invalid JSON from local vision engine"), self.model)
+        if not isinstance(value, dict):
+            return None, _local_engine_error(ValueError("non-object response from local vision engine"), self.model)
+        text = _caption_text_from_chat(value)
+        return AdapterResult(kind=classify_evidence(text), text=text, model=self.model), None
+
+
+VisionAdapter = RemoteVisionAdapter | LocalVisionAdapter
+
+
+def resolve_engines(target_model: str) -> list[VisionAdapter]:
+    """Ordered caption engines for this turn: env pins first, then auto.
+
+    Auto prefers an enabled local runtime (free, operator-owned) over the
+    cheapest image-capable catalog model; ``mimo-v2.5`` is the catalog
+    fallback. ``target_model`` is accepted for compatibility; auto ignores it.
+    """
+    setting = _caption_engine_setting()
+    if setting == "local":
+        return [LocalVisionAdapter(base_url=local_vision_base_url(), model=local_vision_model())]
+    if setting:
+        return [RemoteVisionAdapter(setting)]
+    engines: list[VisionAdapter] = []
+    if local_runtime_enabled():
+        engines.append(LocalVisionAdapter(base_url=local_vision_base_url(), model=local_vision_model()))
+    engines.append(RemoteVisionAdapter(auto_pick_caption_model()))
+    return engines
+
+
+def describe(
+    image_url: str,
+    prompt: str = CAPTION_PROMPT,
+    *,
+    config: Any = None,
+    request_id: str = "",
+    engines: list[VisionAdapter] | None = None,
+    target_model: str | None = None,
+) -> Evidence:
+    """Read one image into structured :class:`Evidence`, served from cache.
+
+    A cache hit returns instantly and is never metered. A miss walks the
+    engines in order (auto: local then remote) and meters every non-cached
+    read with ``kind=vision``; total failure degrades to unreadable evidence
+    that never blocks the turn.
     """
     from .trace import trace
-    from .upstream import record_cache
+    from .upstream import usage_tokens
 
     image_bytes = image_bytes_for_cache(image_url)
     cached = CAPTION_CACHE.get(image_bytes)
     if cached is not None:
         trace("split_turn.caption_cache_hit", request_id=request_id)
-        return cached
+        return Evidence(kind=classify_evidence(cached), text=cached, cached=True)
 
-    detail = caption_detail()
-    url, model = image_url, image_model
-    chat, exc = _caption_attempt(url, model, detail, config, request_id)
-    if exc is not None and _caption_rejection_status(exc) in CAPTION_FALLBACK_STATUSES and model != IMAGE_MODEL_DEFAULT:
-        # The turn model may reject image input; fall back to the known
-        # vision model for this one sub-call.
-        model = IMAGE_MODEL_DEFAULT
-        trace("split_turn.caption_fallback", request_id=request_id, kind="engine", model=model, status=_caption_rejection_status(exc))
-        chat, exc = _caption_attempt(url, model, detail, config, request_id)
-    if exc is not None and _caption_rejection_status(exc) in CAPTION_FALLBACK_STATUSES and detail is not None:
-        # Unknown detail values can 4xx on some upstreams; retry with a
-        # downscaled image (or the original URL) and no detail.
-        downscaled = downscale_data_url(url)
-        if downscaled is not None:
-            url = downscaled
-        detail = None
-        trace("split_turn.caption_fallback", request_id=request_id, kind="detail", status=_caption_rejection_status(exc))
-        chat, exc = _caption_attempt(url, model, detail, config, request_id)
-    if exc is not None:
-        trace("split_turn.caption_failed", request_id=request_id, status=getattr(exc, "status", None), message=str(getattr(exc, "message", exc))[:200])
-        return f"[caption failed: {str(getattr(exc, 'message', exc))[:100]}]"
+    if engines is None:
+        engines = resolve_engines(target_model or "")
 
-    record_cache(config.cache_tracker, model, chat.get("usage"))
-    choice = (chat.get("choices") or [{}])[0]
-    text = (choice.get("message", {}) or {}).get("content", "")
-    caption = text.strip() if isinstance(text, str) and text.strip() else "[caption unavailable]"
-    CAPTION_CACHE.put(image_bytes, caption)
-    return caption
+    last_adapter: VisionAdapter | None = None
+    last_error: Exception | None = None
+    started_all = time.time()
+    for adapter in engines:
+        result, exc = adapter.describe(image_url, prompt, config, request_id)
+        if exc is None:
+            model = result.model or adapter.model
+            inp, outp, total = usage_tokens(result.usage)
+            record_usage_event(
+                model=model,
+                status=200,
+                duration_ms=int((time.time() - started_all) * 1000),
+                input_tokens=inp,
+                output_tokens=outp,
+                total_tokens=total,
+                kind="vision",
+            )
+            CAPTION_CACHE.put(image_bytes, result.text)
+            return Evidence(kind=result.kind, text=result.text, model=model, cached=False)
+        last_adapter = adapter
+        last_error = exc
+        trace(
+            "split_turn.caption_failed",
+            request_id=request_id,
+            engine=adapter.model,
+            status=_error_status(exc),
+            message=str(getattr(exc, "message", exc))[:200],
+        )
+
+    if last_error is None:
+        last_error = ProxyError(HTTPStatus.BAD_GATEWAY, "no vision engine available")
+    record_usage_event(
+        model=last_adapter.model if last_adapter else None,
+        status=_error_status(last_error),
+        duration_ms=int((time.time() - started_all) * 1000),
+        kind="vision",
+    )
+    text = f"[caption failed: {str(getattr(last_error, 'message', last_error))[:100]}]"
+    return Evidence(kind="unreadable", text=text, model=last_adapter.model if last_adapter else None, cached=False)
+
+
+def caption_image(image_url: str, image_model: str, config: Any, request_id: str) -> str:
+    """Caption one image with an explicitly chosen engine; returns plain text.
+
+    ``image_model`` is the engine slug (or ``local`` for the local runtime).
+    """
+    if image_model == "local":
+        engines: list[VisionAdapter] = [
+            LocalVisionAdapter(base_url=local_vision_base_url(), model=local_vision_model())
+        ]
+    else:
+        engines = [RemoteVisionAdapter(image_model)]
+    return describe(image_url, CAPTION_PROMPT, config=config, request_id=request_id, engines=engines).text
 
 
 def caption_images_in_messages(chat_payload: dict[str, Any], target_model: str, config: Any, request_id: str) -> dict[str, Any]:
     """Replace image_url parts with vision-generated text captions. Routes turn to target_model after."""
     from .trace import trace
 
-    image_model = resolve_caption_model(target_model)
+    engines = resolve_engines(target_model)
     messages = chat_payload.get("messages", [])
 
     # Collect all image URLs across messages.
@@ -284,11 +649,11 @@ def caption_images_in_messages(chat_payload: dict[str, Any], target_model: str, 
     # Only caption the latest image; stub older ones to save 25+ seconds per turn.
     # Old screenshots are stale context — the model only needs the current screen to act.
     latest = image_jobs[-1]
-    caption = caption_image(latest[2], image_model, config, request_id)
+    evidence = describe(latest[2], CAPTION_PROMPT, config=config, request_id=request_id, engines=engines)
     for mi, pi, _url in image_jobs[:-1]:
         messages[mi]["content"][pi] = {"type": "text", "text": "[prior screenshot omitted]"}
     mi, pi, _ = latest
-    messages[mi]["content"][pi] = {"type": "text", "text": f"[screenshot: {caption}]"}
+    messages[mi]["content"][pi] = {"type": "text", "text": f"[screenshot: {evidence.text}]"}
 
     # Collapse text-only lists back to strings (fast path for upstream).
     for message in messages:
@@ -299,5 +664,14 @@ def caption_images_in_messages(chat_payload: dict[str, Any], target_model: str, 
             message["content"] = "\n".join(p.get("text", "") for p in content if p.get("text"))
 
     chat_payload["model"] = target_model
-    trace("split_turn.captioned", request_id=request_id, captions=1, omitted=len(image_jobs) - 1, model=chat_payload["model"])
+    trace(
+        "split_turn.captioned",
+        request_id=request_id,
+        captions=1,
+        omitted=len(image_jobs) - 1,
+        engine=evidence.model or "auto",
+        kind=evidence.kind,
+        cached=evidence.cached,
+        model=chat_payload["model"],
+    )
     return chat_payload

@@ -728,7 +728,11 @@ class TestImageCaptioning:
             MockUpstreamResponse(json.dumps(main_resp).encode()),
         ]
 
-        with mock.patch.dict(os.environ, {"OPENCODE_GO_API_KEY": "test-key"}), mock.patch("urllib.request.urlopen", side_effect=responses):
+        # The local-runtime probe also rides urlopen; pin it off so it cannot
+        # consume one of the fixed mock responses.
+        with mock.patch.dict(os.environ, {"OPENCODE_GO_API_KEY": "test-key"}), mock.patch(
+            "opencode_go_proxy.vision.local_runtime_enabled", return_value=False
+        ), mock.patch("urllib.request.urlopen", side_effect=responses):
             conn = HTTPConnection("127.0.0.1", port, timeout=10)
             conn.request("POST", "/v1/responses",
                          json.dumps({

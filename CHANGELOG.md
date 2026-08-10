@@ -4,6 +4,11 @@
 
 ### Added
 
+- Vision bridge module (plan 004): `vision.describe()` returns structured
+  `Evidence` (summary / text / layout / unreadable); the caption engine auto-picks the
+  cheapest image-capable catalog model or a probed local runtime (Ollama, llama.cpp
+  server, LM Studio); non-cached caption reads are metered with `kind=vision`; the old
+  caption path now lives entirely in `vision.py`.
 - Catalog contract with overlay and runtime reload (plan 003): `render_full_catalog`
   projects each model through the canonical key set Codex reads in
   `merged-models.json` (`multi_agent_version` at the model top level, plus
