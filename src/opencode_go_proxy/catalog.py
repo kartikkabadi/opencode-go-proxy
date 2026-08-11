@@ -65,8 +65,8 @@ def _canonical_model_defaults() -> dict[str, Any]:
     This is the canonical model contract: the exact merged key set sampled from
     codex-router's merged-models.json. render_full_catalog projects from this
     shape, so no key is hand-copied and a key added upstream can never silently
-    drop out of the rendered catalog. Keys marked in OPTIONAL_MODEL_KEYS may be
-    omitted by compact records; the remaining keys always carry real values.
+    drop out of the rendered catalog. The compact drop rules live in
+    ``_default_model_record()`` and ``make-compact-catalog.py``; keep them in sync.
     """
     return {
         "additional_speed_tiers": [],
@@ -127,22 +127,6 @@ MODEL_MESSAGES_KEYS: tuple[str, ...] = (
 
 
 # Compact records may omit any key whose canonical default is safe. This set is
-# the escape hatch for upstream fields the proxy does not compute: they stay in
-# the canonical shape and render from their default, never silently drop.
-OPTIONAL_MODEL_KEYS: frozenset[str] = frozenset(CANONICAL_MODEL_KEYS) - frozenset(
-    {
-        "slug",
-        "display_name",
-        "description",
-        "context_window",
-        "max_context_window",
-        "default_reasoning_level",
-        "supported_reasoning_levels",
-        "multi_agent_version",
-        "comp_hash",
-    }
-)
-
 
 # Keys the user overlay (user-models.json) may set on a compact record: the
 # canonical set minus the renderer-computed instruction fields.
@@ -253,6 +237,8 @@ def load_known_slugs(catalog_path: str | None = None) -> set[str]:
     try:
         with open(catalog_path) as f:
             catalog = json.load(f)
+        if not isinstance(catalog, dict):
+            return set()
         return {m["slug"] for m in catalog.get("models", []) if isinstance(m, dict) and "slug" in m}
     except (OSError, json.JSONDecodeError, KeyError):
         return set()
@@ -645,7 +631,10 @@ def render_runtime_catalog(compact: dict) -> dict:
     announced, next_announced = annotate_announcements(
         models, read_announced_at(), time.time(), curated_slugs
     )
-    write_announced_at(announced_models_path(), next_announced)
+    # Never persist an empty announcement state: an empty file would make the
+    # real first discovery look like brand-new models and announce them all.
+    if next_announced:
+        write_announced_at(announced_models_path(), next_announced)
     models = apply_hidden_models(announced, read_hidden_models())
     return render_full_catalog({**compact, "models": models})
 
@@ -709,8 +698,11 @@ def refresh_catalog(
     try:
         discovered = discover_models()
     except CatalogDiscoveryError:
-        if os.path.exists(compact_path):
-            return _render_and_write(load_compact(compact_path), catalog_path, overlay=overlay)
+        # Offline first run: fall back to the seed so a fresh install that
+        # cannot reach models.dev still renders a valid catalog.
+        fallback = _load_if_readable(compact_path) or load_seed_compact()
+        if fallback is not None:
+            return _render_and_write(fallback, catalog_path, overlay=overlay)
         raise
 
     existing = _load_if_readable(compact_path)
@@ -802,7 +794,6 @@ __all__ = [
     "DEFAULT_TTL_HOURS",
     "MODELS_DEV_URL",
     "MODEL_MESSAGES_KEYS",
-    "OPTIONAL_MODEL_KEYS",
     "OVERLAY_EDIT_KEYS",
     "SEED_CATALOG_ENV",
     "STATE_CATALOG_NAME",

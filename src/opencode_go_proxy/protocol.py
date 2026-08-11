@@ -140,6 +140,17 @@ MODEL_ALIASES: dict[str, str] = {
 }
 
 
+def _catalog_mtime() -> tuple[str, int | None]:
+    """(path, mtime_ns) for the catalog the proxy serves; mtime None when missing."""
+    from opencode_go_proxy import catalog as _catalog
+
+    path = _catalog.default_catalog_path()
+    try:
+        return path, os.stat(path).st_mtime_ns
+    except OSError:
+        return path, None
+
+
 _KNOWN_MODELS_CACHE: tuple[str, int | None, set[str]] | None = None
 
 
@@ -153,11 +164,7 @@ def known_models() -> set[str]:
     global _KNOWN_MODELS_CACHE
     from opencode_go_proxy import catalog as _catalog
 
-    path = _catalog.default_catalog_path()
-    try:
-        mtime = os.stat(path).st_mtime_ns
-    except OSError:
-        mtime = None
+    path, mtime = _catalog_mtime()
     if (
         _KNOWN_MODELS_CACHE is not None
         and _KNOWN_MODELS_CACHE[0] == path
@@ -171,9 +178,10 @@ def known_models() -> set[str]:
 
 def reload_known_models() -> set[str]:
     """Drop the mtime caches and re-read known slugs from the catalog."""
-    global _KNOWN_MODELS_CACHE, _IMAGE_CAPABLE_CACHE
+    global _KNOWN_MODELS_CACHE, _IMAGE_CAPABLE_CACHE, _CONTEXT_WINDOW_CACHE
     _KNOWN_MODELS_CACHE = None
     _IMAGE_CAPABLE_CACHE = None
+    _CONTEXT_WINDOW_CACHE = None
     return known_models()
 
 
@@ -188,13 +196,8 @@ def model_context_window(model: str) -> int | None:
     window instead of a proxy-wide default.
     """
     global _CONTEXT_WINDOW_CACHE
-    from opencode_go_proxy import catalog as _catalog
 
-    path = _catalog.default_catalog_path()
-    try:
-        mtime = os.stat(path).st_mtime_ns
-    except OSError:
-        mtime = None
+    path, mtime = _catalog_mtime()
     if (
         _CONTEXT_WINDOW_CACHE is not None
         and _CONTEXT_WINDOW_CACHE[0] == path
@@ -230,13 +233,8 @@ def image_capable_models() -> set[str]:
     actually accept images, instead of always forcing the image default.
     """
     global _IMAGE_CAPABLE_CACHE
-    from opencode_go_proxy import catalog as _catalog
 
-    path = _catalog.default_catalog_path()
-    try:
-        mtime = os.stat(path).st_mtime_ns
-    except OSError:
-        mtime = None
+    path, mtime = _catalog_mtime()
     if (
         _IMAGE_CAPABLE_CACHE is not None
         and _IMAGE_CAPABLE_CACHE[0] == path

@@ -129,11 +129,13 @@ def _toml_string(value: str) -> str:
 
 
 def _block_lines(base_url: str, catalog_path: str, root_lines: list[str]) -> list[str]:
-    lines = [
-        START_MARKER,
-        f"openai_base_url = {_toml_string(base_url)}",
-        f"model_catalog_json = {_toml_string(catalog_path)}",
-    ]
+    # A root assignment that already matches is preserved, not duplicated:
+    # repeating the key inside the block would produce invalid TOML.
+    lines = [START_MARKER]
+    if _root_value(root_lines, "openai_base_url") != base_url:
+        lines.append(f"openai_base_url = {_toml_string(base_url)}")
+    if _root_value(root_lines, "model_catalog_json") != catalog_path:
+        lines.append(f"model_catalog_json = {_toml_string(catalog_path)}")
     if not _root_has_value(root_lines, REALTIME_CALL_KEY):
         call_url = native_realtime_call_base_url("\n".join(root_lines))
         lines.append(f"{REALTIME_CALL_KEY} = {_toml_string(call_url)}")

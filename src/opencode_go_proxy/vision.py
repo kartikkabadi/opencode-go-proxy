@@ -381,7 +381,12 @@ def local_vision_model() -> str:
 
 
 def _probe_local(base_url: str, model: str) -> bool:
-    """Read-only probe: does this runtime exist and offer a vision model?"""
+    """Read-only probe: does this runtime exist and serve the configured model?
+
+    The configured model must be listed; a runtime that is up but only serves
+    other models is "not enabled", so captions never fire against a model the
+    runtime does not have.
+    """
     url = f"{base_url}/models"
     try:
         with urllib.request.urlopen(url, timeout=LOCAL_PROBE_TIMEOUT_SEC) as response:
@@ -396,9 +401,7 @@ def _probe_local(base_url: str, model: str) -> bool:
     if not isinstance(entries, list):
         return False
     ids = [str(entry.get("id", "")) for entry in entries if isinstance(entry, dict)]
-    if model in ids:
-        return True
-    return any(_LOCAL_VISION_KEYWORDS.search(model_id) for model_id in ids)
+    return model in ids
 
 
 def local_runtime_enabled(*, base_url: str | None = None, model: str | None = None) -> bool:
@@ -617,20 +620,6 @@ def describe(
     )
     text = f"[caption failed: {str(getattr(last_error, 'message', last_error))[:100]}]"
     return Evidence(kind="unreadable", text=text, model=last_adapter.model if last_adapter else None, cached=False)
-
-
-def caption_image(image_url: str, image_model: str, config: Any, request_id: str) -> str:
-    """Caption one image with an explicitly chosen engine; returns plain text.
-
-    ``image_model`` is the engine slug (or ``local`` for the local runtime).
-    """
-    if image_model == "local":
-        engines: list[VisionAdapter] = [
-            LocalVisionAdapter(base_url=local_vision_base_url(), model=local_vision_model())
-        ]
-    else:
-        engines = [RemoteVisionAdapter(image_model)]
-    return describe(image_url, CAPTION_PROMPT, config=config, request_id=request_id, engines=engines).text
 
 
 def caption_images_in_messages(chat_payload: dict[str, Any], target_model: str, config: Any, request_id: str) -> dict[str, Any]:

@@ -35,8 +35,15 @@ def _clean_int(value: Any) -> int | None:
 
 
 def _event_tokens(event: Json) -> int:
-    """Tokens for one event: totalTokens when present, else input+output."""
+    """Tokens for one event: totalTokens, or the zero-token estimate when the
+    upstream reported 0 (estimatedInputTokens plus any real output)."""
     total = _clean_int(event.get("totalTokens"))
+    if total is not None and total > 0:
+        return total
+    estimated = _clean_int(event.get("estimatedInputTokens"))
+    if estimated is not None and estimated > 0:
+        output = _clean_int(event.get("outputTokens")) or 0
+        return estimated + output
     if total is not None:
         return total
     return sum(_clean_int(event.get(key)) or 0 for key in _DAY_KEYS)
@@ -104,14 +111,14 @@ def usage_summary(now: datetime.datetime | None = None) -> Json:
     }
 
 
-def _sampled_at(value: Any) -> float:
-    """Epoch-seconds for a snapshot's sampledAt; 0.0 when unparseable."""
+def _sampled_at(value: Any) -> float | None:
+    """Epoch-seconds for a snapshot's sampledAt; None when unparseable."""
     if not isinstance(value, str):
-        return 0.0
+        return None
     try:
         instant = datetime.datetime.fromisoformat(value)
     except ValueError:
-        return 0.0
+        return None
     if instant.tzinfo is None:
         instant = instant.replace(tzinfo=datetime.UTC)
     return instant.timestamp()
@@ -132,7 +139,7 @@ def _latest_quota() -> Json | None:
         if remaining is None:
             continue
         sampled = _sampled_at(snapshot.get("sampledAt"))
-        if sampled <= best_sampled:
+        if sampled is None or sampled <= best_sampled:
             continue
         best_sampled = sampled
         provider = snapshot.get("provider")

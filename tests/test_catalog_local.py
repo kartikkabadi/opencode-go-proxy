@@ -325,3 +325,33 @@ def test_models_endpoint_grows_after_refresh_without_restart(proxy_server) -> No
     after = set(_list_models(port))
     assert "curated-flash" in after
     assert len(after) > len(before)
+
+
+class TestReviewFixups:
+    def test_load_known_slugs_tolerates_non_object_root(self, tmp_path) -> None:
+        path = tmp_path / "catalog.json"
+        path.write_text("[1, 2, 3]")
+        assert catalog.load_known_slugs(catalog_path=str(path)) == set()
+
+    def test_empty_announcement_state_is_not_persisted(self, tmp_path) -> None:
+        state = tmp_path / "state"
+        state.mkdir(exist_ok=True)
+        seed = catalog.load_seed_compact()
+        assert seed is not None
+        compact = {**seed, "models": []}
+        with mock.patch.dict(os.environ, {"OPENCODE_GO_PROXY_STATE_DIR": str(state)}, clear=True), mock.patch(
+            "opencode_go_proxy.catalog.read_announced_at", return_value=None
+        ):
+            catalog.render_runtime_catalog(compact)
+        assert not (state / "announced-models.json").exists()
+
+    def test_offline_refresh_falls_back_to_seed(self, tmp_path) -> None:
+        state = tmp_path / "state"
+        state.mkdir(exist_ok=True)
+        seed = catalog.load_seed_compact()
+        assert seed is not None
+        with mock.patch.dict(os.environ, {"OPENCODE_GO_PROXY_STATE_DIR": str(state)}, clear=True), mock.patch(
+            "opencode_go_proxy.catalog.discover_models", side_effect=catalog.CatalogDiscoveryError("offline")
+        ), mock.patch("opencode_go_proxy.catalog.load_seed_compact", return_value=seed):
+            rendered = catalog.refresh_catalog()
+        assert rendered.get("models")

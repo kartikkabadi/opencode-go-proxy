@@ -102,3 +102,25 @@ Commit: (next)
 - plans/DEPLOYMENT.md: kickstart label corrected to com.opencode-go.proxy.
 
 Verification: 448 passed locally. Commit: (next)
+
+### Step 5 - Review-driven fixes, batch 4 (config/catalog/protocol/state/vision/menu bar)
+
+- config_manager: enable no longer duplicates openai_base_url/model_catalog_json
+  when user-owned values already match (P1; TOML stays valid).
+- catalog.py: load_known_slugs tolerates a non-object catalog root (P2);
+  empty announcement state is never persisted so first discovery does not
+  announce the whole catalog (P2); offline first-run refresh falls back to
+  the seed instead of raising (P2); dead OPTIONAL_MODEL_KEYS constant removed.
+- protocol.py: shared _catalog_mtime() helper for the three mtime-cached
+  catalog readers; reload_known_models clears all three caches (P3).
+- state.py: /state counts zero-token-estimated turns via estimatedInputTokens
+  (P2); malformed sampledAt snapshots are skipped instead of winning (P2).
+- vision.py: local runtime probe requires the configured model to be served
+  (P2, no captions against nonexistent models); dead caption_image removed.
+- Menu bar Swift: /state fetch retains the last good state on transient
+  failure and ignores stale callbacks after the child PID changes (P2);
+  swift build verified.
+
+Verification: 454 passed locally, ruff clean, swift build complete, live e2e
+on 8790 (health, 91 models, /state, responses turn, chat passthrough 200).
+Commit: (next)

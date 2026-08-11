@@ -346,12 +346,15 @@ class TestLocalProbe:
         ):
             assert vision.local_runtime_enabled() is True
 
-    def test_enabled_when_vision_keyword_model_present(self) -> None:
+    def test_disabled_when_configured_model_not_served(self) -> None:
+        # A runtime serving only a vision-keyword model other than the
+        # configured one must not be enabled: captions would fire against a
+        # model the runtime does not have.
         with mock.patch(
             "urllib.request.urlopen",
             return_value=_FakeResponse(200, {"data": [{"id": "llama3.2-vision:11b"}]}),
         ):
-            assert vision.local_runtime_enabled() is True
+            assert vision.local_runtime_enabled() is False
 
     def test_disabled_when_only_text_models(self) -> None:
         with mock.patch(

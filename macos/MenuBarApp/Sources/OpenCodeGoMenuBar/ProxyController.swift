@@ -109,10 +109,14 @@ final class ProxyController {
     /// meaningful while the child process is alive; failures keep the last
     /// good state, and stop() clears it so the menu never shows stale numbers.
     func refreshState() {
-        guard childPID > 0 else { return }
+        let pid = childPID
+        guard pid > 0 else { return }
         StateFetcher.fetch(port: state.port) { [weak self] serverState in
             DispatchQueue.main.async {
-                guard let self else { return }
+                guard let self, self.childPID == pid else { return }
+                // A transient fetch failure must not clear the last good state;
+                // stop() clears serverState explicitly when the child exits.
+                guard let serverState else { return }
                 if self.serverState != serverState {
                     self.serverState = serverState
                     self.onStateChange?()

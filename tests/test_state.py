@@ -199,3 +199,43 @@ class TestStateEndpoint:
         assert state["quota"]["provider"] == "openai"
         assert state["quota"]["remaining"] == 99
         assert state["quota"]["limit"] == 500
+
+
+class TestZeroTokenEstimateAndQuota:
+    def test_estimated_input_tokens_counted(self, tmp_path) -> None:
+        import datetime
+        import os
+        from unittest import mock
+
+        from opencode_go_proxy.state import usage_summary
+
+        state = tmp_path / "state"
+        state.mkdir(exist_ok=True)
+        meter_file = state / "usage-events.jsonl"
+        meter_file.write_text(
+            '{"at":"2026-08-11T10:00:00Z","model":"m","status":200,"inputTokens":0,'
+            '"outputTokens":5,"totalTokens":0,"estimatedInputTokens":1000}\n'
+        )
+        with mock.patch.dict(os.environ, {"OPENCODE_GO_PROXY_STATE_DIR": str(state)}, clear=True):
+            summary = usage_summary(datetime.datetime(2026, 8, 11, 12, 0, tzinfo=datetime.UTC))
+        assert summary["todayTurns"] == 1
+        assert summary["todayTokens"] == 1005
+
+    def test_malformed_sampled_at_is_skipped(self, tmp_path) -> None:
+        import os
+        from unittest import mock
+
+        from opencode_go_proxy.state import build_state
+
+        state = tmp_path / "state"
+        state.mkdir(exist_ok=True)
+        quota_file = state / "quota-state.json"
+        quota_file.write_text(
+            '{"providers":{"openai":{"provider":"openai","remaining":5,"sampledAt":"not-a-time"},'
+            '"anthropic":{"provider":"anthropic","remaining":9,"sampledAt":"2026-08-11T10:00:00Z"}}}'
+        )
+        with mock.patch.dict(os.environ, {"OPENCODE_GO_PROXY_STATE_DIR": str(state)}, clear=True):
+            quota = build_state(8787, "https://upstream")["quota"]
+        assert quota is not None
+        assert quota["provider"] == "anthropic"
+        assert quota["remaining"] == 9

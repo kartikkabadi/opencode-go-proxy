@@ -6,6 +6,7 @@ Every test targets OPENCODE_GO_PROXY_CONFIG_PATH in tmp_path; the real
 
 import json
 import os
+from unittest import mock
 
 import pytest
 
@@ -207,3 +208,26 @@ class TestCli:
             handle.write('openai_base_url = "https://api.openai.com/v1"\n')
         assert config_manager.config_cmd(["enable"]) == 1
         assert "refusing to replace" in capsys.readouterr().err
+
+
+class TestNoDuplicateKeys:
+    def test_enable_with_matching_user_values_has_no_duplicate_keys(self, tmp_path) -> None:
+        path = tmp_path / "config.toml"
+        state = tmp_path / "state"
+        with mock.patch.dict(
+            os.environ,
+            {"OPENCODE_GO_PROXY_CONFIG_PATH": str(path), "OPENCODE_GO_PROXY_STATE_DIR": str(state)},
+            clear=True,
+        ):
+            base_url = config_manager.managed_base_url()
+            catalog_path = config_manager.managed_catalog_path()
+            path.write_text(
+                f'openai_base_url = "{base_url}"\n'
+                f'model_catalog_json = "{catalog_path}"\n'
+            )
+            result = config_manager.enable()
+        assert result["changed"] is True
+        text = path.read_text()
+        assert text.count("openai_base_url") == 1
+        assert text.count("model_catalog_json") == 1
+        assert config_manager.START_MARKER in text
