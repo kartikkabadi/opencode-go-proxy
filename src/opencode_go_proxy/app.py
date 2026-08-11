@@ -34,6 +34,7 @@ from .protocol import (
     known_models,
     responses_payload_to_chat_payload,
 )
+from .quota import read_quota_state
 from .streaming import handle_chat_stream_passthrough, handle_streaming_request
 from .trace import trace
 from .upstream import (
@@ -167,6 +168,9 @@ class ResponsesProxyHandler(BaseHTTPRequestHandler):
             return
         if self.path in {"/health", "/v1/health"}:
             self._send_json({"status": "ok"})
+            return
+        if self.path in {"/quota", "/v1/quota"}:
+            self._send_json(read_quota_state())
             return
         if self.path in {"/cache", "/v1/cache", "/metrics", "/v1/metrics"}:
             config: ProxyConfig = self.server.config  # type: ignore[attr-defined]

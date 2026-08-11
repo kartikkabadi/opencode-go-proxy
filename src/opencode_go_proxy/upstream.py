@@ -18,6 +18,7 @@ from typing import Any
 from .config import ProxyConfig
 from .errors import ProxyError
 from .protocol import cache_stats_from_usage
+from .quota import record_quota_from_headers
 from .secrets import resolve_api_key
 from .trace import _mask_trace_body, trace
 
@@ -109,6 +110,7 @@ def call_upstream_chat(chat_payload: Json, config: ProxyConfig, request_id: str,
         try:
             with urllib.request.urlopen(request, timeout=timeout_sec or config.timeout_sec) as response:
                 body = response.read()
+                record_quota_from_headers(getattr(response, "headers", None))
                 elapsed_ms = int((time.time() - started) * 1000)
                 trace("upstream.done", request_id=request_id, status=response.status, bytes=len(body), elapsed_ms=elapsed_ms)
                 try:
@@ -178,6 +180,7 @@ def call_upstream_chat_verbatim(
         try:
             with urllib.request.urlopen(request, timeout=timeout_sec or config.timeout_sec) as response:
                 body = response.read()
+                record_quota_from_headers(getattr(response, "headers", None))
                 elapsed_ms = int((time.time() - started) * 1000)
                 trace("upstream.done", request_id=request_id, status=response.status, bytes=len(body), elapsed_ms=elapsed_ms)
                 return response.status, body, retries

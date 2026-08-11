@@ -37,6 +37,7 @@ from .protocol import (
     now_unix,
     responses_payload_to_chat_payload,
 )
+from .quota import record_quota_from_headers
 from .secrets import resolve_api_key
 from .trace import _mask_trace_body, trace
 from .upstream import (
@@ -242,6 +243,7 @@ def handle_streaming_request(payload: Json, config: ProxyConfig, request_id: str
             while response is None:
                 try:
                     response = urllib.request.urlopen(req, timeout=config.timeout_sec)
+                    record_quota_from_headers(getattr(response, "headers", None))
                 except urllib.error.HTTPError as exc:
                     body = exc.read().decode("utf-8", errors="replace")
                     trace("upstream.error", request_id=request_id, status=exc.code, body=_mask_trace_body(body))
@@ -510,6 +512,7 @@ def handle_chat_stream_passthrough(payload: Json, config: ProxyConfig, request_i
     while response is None:
         try:
             response = urllib.request.urlopen(req, timeout=config.timeout_sec)
+            record_quota_from_headers(getattr(response, "headers", None))
         except urllib.error.HTTPError as exc:
             body = exc.read()
             trace("upstream.error", request_id=request_id, status=exc.code,

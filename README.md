@@ -198,6 +198,7 @@ See the [lazycodex docs](https://github.com/code-yeongyu/oh-my-openagent) for se
 - Correctness contract: empty upstream completions are retried once (a second empty stream answers an `empty_completion` error), zero-input-token reports are estimated for compaction (`OPENCODE_GO_PROXY_ESTIMATE_ZERO_INPUT=0` disables), and keepalive comments run until the stream truly ends without interleaving into data frames
 - Auth transport guard (zero config): missing Host answers `400`, non-loopback Host answers `403` (unless `OPENCODE_GO_PROXY_ALLOW_REMOTE=1`), browser-originated requests (Origin / Referer / Sec-Fetch-Site) answer `403`, non-JSON POSTs answer `415`, and OPTIONS preflight stays blocked
 - Verbatim `/v1/chat/completions` passthrough (stream and non-stream): the upstream status and body are relayed byte-for-byte, including the upstream's own error body, and `/v1/messages` answers an explicit `400`
+- Rate-limit harvesting (plan 011): upstream `x-ratelimit-*` and `anthropic-ratelimit-*` headers are parsed into per-provider quota snapshots, the latest snapshot per provider is kept, and `GET /quota` exposes `quota-state.json`
 - WebSocket upgrade requests answered with `426 Upgrade Required` (desktop app falls back to HTTP streaming)
 - zstd-compressed request bodies decompressed (`Content-Encoding: zstd`; the desktop app sends them)
 - Single-port guard in the menu bar app: refuses Start when 8787 is already owned
@@ -250,6 +251,33 @@ curl http://127.0.0.1:8787/cache
 Within a session, every request after the first shares the full previous prefix, so
 cache-eligible requests typically run at 99%+ hit ratio; only the genuinely new delta
 misses. The first request of a brand-new context always misses (nothing is cached yet).
+
+### Checking quota
+
+When the upstream answers 200 with rate-limit headers, the proxy records the latest
+per-provider snapshot (`limit` / `remaining` / `resetAt` / `sampledAt`) to
+`quota-state.json` in the state dir and exposes it as JSON:
+
+```bash
+curl http://127.0.0.1:8787/quota
+```
+
+```json
+{
+  "providers": {
+    "openai": {
+      "provider": "openai",
+      "limit": 500,
+      "remaining": 432,
+      "resetAt": "2026-08-11T06:30:00.000Z",
+      "sampledAt": "2026-08-11T06:00:00.000Z"
+    }
+  }
+}
+```
+
+A headerless upstream leaves the state empty (`"providers": {}`); the proxy never
+invents quota numbers.
 
 ## Install
 

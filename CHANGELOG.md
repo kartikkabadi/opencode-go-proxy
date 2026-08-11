@@ -34,6 +34,14 @@
   (the menu bar is reworked in a later plan); if a consumer needs the old
   fields, they return additively.
 
+- Rate-limit harvesting (plan 011): OpenAI-style (`x-ratelimit-*`) and
+  Anthropic-style (`anthropic-ratelimit-*`) response headers from upstream 200s
+  are parsed into per-provider quota snapshots (`limit` / `remaining` / `resetAt`
+  / `sampledAt`), the latest snapshot per provider is kept, and persisted
+  atomically to `quota-state.json` in the state dir. `GET /quota` (and
+  `/v1/quota`) returns the state; a headerless upstream degrades to an empty
+  snapshot.
+
 ### Added
 
 - Base-URL overrides (plan 010): the upstream chat base resolves as the
