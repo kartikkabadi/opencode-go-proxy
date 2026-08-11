@@ -333,7 +333,9 @@ class TestInstall:
         assert "macOS-only" in capsys.readouterr().out
 
     def test_requires_confirmation(self, capsys) -> None:
-        with mock.patch("opencode_go_proxy.ops.subprocess.run") as run:
+        with mock.patch("opencode_go_proxy.ops.subprocess.run") as run, mock.patch(
+            "opencode_go_proxy.ops.platform.system", return_value="Darwin"
+        ):
             assert ops.install([]) == 2
         run.assert_not_called()
         assert "--yes" in capsys.readouterr().out
@@ -353,7 +355,9 @@ class TestInstall:
         with mock.patch.dict(os.environ, {
             "OPENCODE_GO_PROXY_LAUNCH_AGENTS_DIR": str(agents),
             "OPENCODE_GO_PROXY_PLIST_SOURCE": str(plist),
-        }), mock.patch("opencode_go_proxy.ops.subprocess.run", side_effect=fake_run):
+        }), mock.patch("opencode_go_proxy.ops.subprocess.run", side_effect=fake_run), mock.patch(
+            "opencode_go_proxy.ops.platform.system", return_value="Darwin"
+        ):
             assert ops.install(["--yes"]) == 0
         assert (agents / "com.opencode-go.proxy.plist").exists()
         assert loaded is False
@@ -369,7 +373,9 @@ class TestInstall:
         with mock.patch.dict(os.environ, {
             "OPENCODE_GO_PROXY_LAUNCH_AGENTS_DIR": str(agents),
             "OPENCODE_GO_PROXY_PLIST_SOURCE": str(plist),
-        }), mock.patch("opencode_go_proxy.ops.subprocess.run", side_effect=fake_run):
+        }), mock.patch("opencode_go_proxy.ops.subprocess.run", side_effect=fake_run), mock.patch(
+            "opencode_go_proxy.ops.platform.system", return_value="Darwin"
+        ):
             assert ops.install(["--yes"]) == 0
         assert (agents / "com.opencode-go.proxy.plist").exists()
 

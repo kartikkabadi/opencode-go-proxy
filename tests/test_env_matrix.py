@@ -23,11 +23,34 @@ class TestEnvMatrix:
             assert upstream.caption_timeout_sec() == expected
 
     @pytest.mark.parametrize(
-        "value,expected", [("mimo-v2.5", "mimo-v2.5"), ("auto", "deepseek-v4-flash"), ("", "deepseek-v4-flash")]
+        "value,expected", [("mimo-v2.5", "mimo-v2.5"), ("local", "local"), ("gpt-junk", "gpt-junk")]
     )
-    def test_caption_model(self, value, expected) -> None:
+    def test_caption_model_pin(self, value, expected) -> None:
         with mock.patch.dict(os.environ, {"OPENCODE_GO_PROXY_CAPTION_MODEL": value}, clear=True):
             assert vision.resolve_caption_model("deepseek-v4-flash") == expected
+
+    def test_caption_model_codex_override(self) -> None:
+        with mock.patch.dict(
+            os.environ, {"CODEX_IMAGE_MODEL": "mimo-v2.5-pro", "OPENCODE_GO_PROXY_CAPTION_MODEL": "mimo-v2.5"},
+            clear=True,
+        ):
+            assert vision.resolve_caption_model("deepseek-v4-flash") == "mimo-v2.5-pro"
+
+    def test_caption_model_auto_picks_cheapest_enabled(self) -> None:
+        models = [
+            {"slug": "mimo-v2.5-pro", "input_modalities": ["text", "image"], "priority": 2},
+            {"slug": "deepseek-v4-flash", "input_modalities": ["text", "image"], "priority": 1},
+        ]
+        with mock.patch.dict(os.environ, {}, clear=True), mock.patch(
+            "opencode_go_proxy.vision.catalog_image_models", return_value=models
+        ):
+            assert vision.resolve_caption_model("deepseek-v4-flash") == "deepseek-v4-flash"
+
+    def test_caption_model_auto_falls_back_without_catalog(self) -> None:
+        with mock.patch.dict(os.environ, {}, clear=True), mock.patch(
+            "opencode_go_proxy.vision.catalog_image_models", return_value=[]
+        ):
+            assert vision.resolve_caption_model("deepseek-v4-flash") == "mimo-v2.5"
 
     @pytest.mark.parametrize("value,expected", [("low", "low"), ("high", "high"), ("none", None), ("off", None)])
     def test_caption_detail(self, value, expected) -> None:
