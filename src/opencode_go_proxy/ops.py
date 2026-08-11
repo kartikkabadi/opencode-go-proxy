@@ -42,7 +42,7 @@ _SECRET_KEY = re.compile(
 class Check:
     """One doctor check: a name, whether it passed, and an optional fix hint."""
 
-    __slots__ = ("name", "ok", "hint")
+    __slots__ = ("hint", "name", "ok")
 
     def __init__(self, name: str, ok: bool, hint: str | None = None) -> None:
         self.name = name
