@@ -179,9 +179,8 @@ class TestMeterThroughHandler:
         urlopen = mock.Mock(side_effect=http_error(429))
         with mock.patch.dict(os.environ, {"OPENCODE_GO_PROXY_MAX_RETRIES": "1"}), \
              mock.patch("urllib.request.urlopen", urlopen), \
-             mock.patch("opencode_go_proxy.app.time.sleep"):
-            with pytest.raises(ProxyError):
-                handle_responses_request(payload, cfg, "req9")
+             mock.patch("opencode_go_proxy.app.time.sleep"), pytest.raises(ProxyError):
+            handle_responses_request(payload, cfg, "req9")
         events = self._events()
         assert len(events) == 1
         e = events[0]

@@ -199,7 +199,7 @@ def decode_request_body(raw: bytes, content_encoding: str, max_body_bytes: int) 
                 return _decompress_bounded(reader, cap)
         except ProxyError:
             raise
-        except Exception as exc:  # noqa: BLE001 - surface a clean 400, not a crash
+        except Exception as exc:
             raise ProxyError(HTTPStatus.BAD_REQUEST, f"failed to decompress gzip request body: {exc}") from exc
     raise ProxyError(HTTPStatus.BAD_REQUEST, f"unsupported content-encoding: {content_encoding}")
 
