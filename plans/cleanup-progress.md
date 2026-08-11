@@ -156,3 +156,18 @@ Report: $TMPDIR/architecture-review-20260811-112434.html (opened).
 
 Verification: 454 passed locally, ruff clean, live e2e on 8790 (health,
 responses stream, chat passthrough stream, responses turn). Commit: (next)
+
+### Step 8 - PR stack restructure (all PRs)
+
+Kartik: base must be main, work must be stacked PRs, applies to all PRs.
+The stack was linearized bottom-up (rebases + force-pushes, no content loss):
+
+main <- PR3 catalog <- PR4 relay <- PR5 reliability <- PR7 ops <-
+PR6 menu <- PR8 skills <- PR21 build
+
+- All 7 PRs now have green `test` checks (hermetic catalog/state-dir conftest,
+  shape-based /v1/models assertion, ruff clean on every branch).
+- All 7 PRs report CLEAN merge state; mergeable bottom-up.
+- PR 21 rebased onto the linearized skills tip (454 tests green, ruff clean).
+- Commits per branch: catalog e2679e1+3 fixes, relay 67b0a1e, reliability
+  8c18327, ops b8a0f93, menu 51f3227, skills 3c347ed, build ee79c8e.
