@@ -428,6 +428,10 @@ def main(argv: list[str] | None = None) -> None:
         from . import config_manager
 
         sys.exit(config_manager.config_cmd(args_list[1:]))
+    if args_list and args_list[0] == "models":
+        from . import models_cmd
+
+        sys.exit(models_cmd.models_cmd(args_list[1:]))
     args = build_parser().parse_args(args_list)
     try:
         from opencode_go_proxy import catalog as _catalog
