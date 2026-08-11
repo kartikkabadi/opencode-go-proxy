@@ -84,7 +84,8 @@ class MeterRecordTests(unittest.TestCase):
             record_usage_event(model="m", status=200, duration_ms=1)  # must not raise
 
     def test_default_state_dir_is_codex_dir(self) -> None:
-        self.assertIn(".codex", state_dir())
+        with mock.patch.dict(os.environ, {}, clear=True):
+            self.assertIn(".codex", state_dir())
 
 
 if __name__ == "__main__":
