@@ -1,5 +1,6 @@
 """Usage meter: honest append-only accounting for proxied turns."""
 
+import datetime
 import json
 import os
 import shutil
@@ -42,11 +43,29 @@ class MeterRecordTests(unittest.TestCase):
         e = events[0]
         self.assertEqual(e["model"], "deepseek-v4-flash")
         self.assertEqual(e["status"], 200)
-        self.assertEqual(e["duration_ms"], 1500)
-        self.assertEqual(e["input_tokens"], 10)
-        self.assertEqual(e["total_tokens"], 15)
+        self.assertEqual(e["durationMs"], 1500)
+        self.assertEqual(e["inputTokens"], 10)
+        self.assertEqual(e["totalTokens"], 15)
         self.assertNotIn("streamAborted", e)
         self.assertNotIn("retries", e)
+
+    def test_canonical_schema_fields(self) -> None:
+        events = self._record(
+            model="deepseek-v4-flash", status=200, duration_ms=1500,
+            input_tokens=10, output_tokens=5, total_tokens=15, retries=1,
+        )
+        e = events[0]
+        self.assertEqual(e["meteringVersion"], "opencode-go-proxy/1")
+        self.assertEqual(e["provider"], "opencode-go")
+        self.assertEqual(e["durationMs"], 1500)
+        self.assertEqual(e["inputTokens"], 10)
+        self.assertEqual(e["outputTokens"], 5)
+        self.assertEqual(e["totalTokens"], 15)
+        # at is ISO 8601 UTC, parseable by the reference consumers.
+        parsed = datetime.datetime.fromisoformat(e["at"])
+        self.assertIsNotNone(parsed)
+        self.assertNotIn("input_tokens", e)
+        self.assertNotIn("duration_ms", e)
 
     def test_stream_aborted_marks_and_omits_tokens(self) -> None:
         events = self._record(model="deepseek-v4-flash", status=502, duration_ms=800, stream_aborted=True)
@@ -54,8 +73,8 @@ class MeterRecordTests(unittest.TestCase):
         e = events[0]
         self.assertEqual(e["status"], 502)
         self.assertEqual(e["streamAborted"], True)
-        self.assertNotIn("input_tokens", e)
-        self.assertNotIn("output_tokens", e)
+        self.assertNotIn("inputTokens", e)
+        self.assertNotIn("outputTokens", e)
 
     def test_empty_completion_marker(self) -> None:
         events = self._record(model="m", status=200, duration_ms=1, empty_completion=True)
@@ -67,7 +86,7 @@ class MeterRecordTests(unittest.TestCase):
             input_tokens=0, estimated_input_tokens=5000,
         )
         e = events[0]
-        self.assertEqual(e["input_tokens"], 0)
+        self.assertEqual(e["inputTokens"], 0)
         self.assertEqual(e["estimatedInputTokens"], 5000)
 
     def test_retries_recorded_only_when_present(self) -> None:
@@ -82,9 +101,9 @@ class MeterRecordTests(unittest.TestCase):
             input_tokens=-3, output_tokens="x", total_tokens=True,
         )
         e = events[0]
-        self.assertNotIn("input_tokens", e)
-        self.assertNotIn("output_tokens", e)
-        self.assertNotIn("total_tokens", e)
+        self.assertNotIn("inputTokens", e)
+        self.assertNotIn("outputTokens", e)
+        self.assertNotIn("totalTokens", e)
 
     def test_creates_dir_on_demand(self) -> None:
         nested = os.path.join(self.tmp, "a", "b")

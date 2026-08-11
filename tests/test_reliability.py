@@ -142,8 +142,8 @@ class TestMeterThroughHandler:
         assert len(events) == 1
         e = events[0]
         assert e["status"] == 200
-        assert e["input_tokens"] == 3
-        assert e["total_tokens"] == 4
+        assert e["inputTokens"] == 3
+        assert e["totalTokens"] == 4
         assert "streamAborted" not in e
 
     def _events(self) -> list[dict]:

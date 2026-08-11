@@ -2,6 +2,17 @@
 
 ## [Unreleased]
 
+### Changed
+
+- Usage meter events now match the codex-router reference schema (plan 008):
+  `at` is ISO 8601 UTC, token and duration fields are camelCase
+  (`inputTokens` / `outputTokens` / `totalTokens` / `durationMs`), and every
+  event carries `meteringVersion: "opencode-go-proxy/1"` plus
+  `provider: "opencode-go"`. The legacy snake_case/epoch spelling was dropped
+  rather than double-written because no live consumer reads the file today
+  (the menu bar is reworked in a later plan); if a consumer needs the old
+  fields, they return additively.
+
 ### Added
 
 - Correctness contract (plan 007): an upstream 200 that streams no

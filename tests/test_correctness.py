@@ -205,7 +205,7 @@ class TestZeroInputEstimation:
         assert completed["usage"]["input_tokens"] == expected
         assert completed["usage"]["estimatedInputTokens"] == expected
         assert completed["usage"]["total_tokens"] == expected + 5
-        assert meter[0]["input_tokens"] == 0  # provider's number stays in the meter
+        assert meter[0]["inputTokens"] == 0  # provider's number stays in the meter
         assert meter[0]["estimatedInputTokens"] == expected
 
     def test_kill_switch_disables_estimation(self) -> None:

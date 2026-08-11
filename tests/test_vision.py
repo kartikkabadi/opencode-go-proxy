@@ -458,7 +458,7 @@ class TestDescribeMetering:
         assert events[0]["kind"] == "vision"
         assert events[0]["model"] == "fake-vision"
         assert events[0]["status"] == 200
-        assert events[0]["total_tokens"] == 13
+        assert events[0]["totalTokens"] == 13
 
         second = vision.describe(image, engines=[self._OkAdapter()], request_id="req-2")
         assert second.cached is True
