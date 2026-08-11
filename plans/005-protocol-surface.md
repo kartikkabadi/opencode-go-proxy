@@ -1,3 +1,5 @@
+STATUS: IMPLEMENTED on codex/0.2.0-parity-build (see plans/README.md and DEPLOYMENT.md). Historical planning doc; the shipped code is authoritative.
+
 # Plan 005 - Protocol surface: chat/completions passthrough + /messages + WS 426 test
 
 ## Why this matters

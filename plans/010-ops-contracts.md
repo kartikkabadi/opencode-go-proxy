@@ -1,3 +1,5 @@
+STATUS: IMPLEMENTED on codex/0.2.0-parity-build (see plans/README.md and DEPLOYMENT.md). Historical planning doc; the shipped code is authoritative.
+
 # Plan 010 - Ops contracts: smoke through proxy, support-bundle JSON v1, doctor depth, setup/install/status
 
 ## Why this matters

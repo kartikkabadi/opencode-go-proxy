@@ -136,9 +136,9 @@ class TestBuildState:
         assert build_state(port=8787, upstream="u", now=NOW)["quota"] is None
 
 
-def make_config() -> ProxyConfig:
+def make_config(port: int = 8787) -> ProxyConfig:
     return ProxyConfig(
-        bind="127.0.0.1", port=8787, chat_base_url="https://up.test/v1",
+        bind="127.0.0.1", port=port, chat_base_url="https://up.test/v1",
         api_key_env="OPENCODE_GO_API_KEY", timeout_sec=10, max_body_bytes=1024 * 1024,
     )
 
@@ -151,7 +151,7 @@ def server() -> int:
     sock.close()
 
     httpd = ThreadingHTTPServer(("127.0.0.1", port), ResponsesProxyHandler)
-    httpd.config = make_config()  # type: ignore[attr-defined]
+    httpd.config = make_config(port=port)  # type: ignore[attr-defined]
 
     thread = threading.Thread(target=httpd.serve_forever, daemon=True)
     thread.start()
@@ -177,7 +177,7 @@ class TestStateEndpoint:
         assert status == 200
         assert set(state) == {"status", "port", "upstream", "quota", "usage", "model"}
         assert state["status"] == "ok"
-        assert state["port"] == 8787
+        assert state["port"] == server
         assert state["upstream"] == "https://up.test/v1"
         assert state["quota"] is None
         assert state["model"] == DEFAULT_MODEL

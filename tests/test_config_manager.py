@@ -32,7 +32,7 @@ class TestEnable:
         text = _read(cfg_path)
         assert config_manager.START_MARKER in text
         assert config_manager.END_MARKER in text
-        assert 'openai_base_url = "http://127.0.0.1:8787/v1"' in text
+        assert f"openai_base_url = {json.dumps(config_manager.managed_base_url())}" in text
         assert f"model_catalog_json = {json.dumps(config_manager.managed_catalog_path())}" in text
         assert config_manager.REALTIME_CALL_KEY in text
         assert config_manager.REALTIME_WS_KEY in text

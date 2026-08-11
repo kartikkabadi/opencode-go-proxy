@@ -1,3 +1,5 @@
+STATUS: IMPLEMENTED on codex/0.2.0-parity-build (see plans/README.md and DEPLOYMENT.md). Historical planning doc; the shipped code is authoritative.
+
 # Plan 009 - Session-model injection align + catalog discovery UA + image routing
 
 ## Why this matters

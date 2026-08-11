@@ -1,3 +1,5 @@
+STATUS: IMPLEMENTED on codex/0.2.0-parity-build (see plans/README.md and DEPLOYMENT.md). Historical planning doc; the shipped code is authoritative.
+
 # Plan 012 - Config manager: marker-block config.toml, refuse-to-clobber, Voice preservation
 
 ## Why this matters

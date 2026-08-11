@@ -446,6 +446,9 @@ def main(argv: list[str] | None = None) -> None:
     # The full refresh may fetch models.dev (up to a 10s timeout); run it in
     # the background so startup never blocks on the network.
     threading.Thread(target=_refresh_catalog_in_background, daemon=True, name="catalog-refresh").start()
+    if args.timeout_sec <= 0:
+        sys.stderr.write(f"error: --timeout-sec must be positive, got {args.timeout_sec}\n")
+        sys.exit(2)
     config = ProxyConfig(
         bind=args.bind,
         port=args.port,

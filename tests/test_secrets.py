@@ -81,9 +81,9 @@ class TestResolutionOrder:
     def test_missing_key_raises_401(self) -> None:
         clear_api_key_cache()
         with mock.patch.dict(os.environ, {}, clear=True), mock.patch(
-            "opencode_go_proxy.secrets.subprocess.run", return_value=_keychain_result("opencode-go-api-key", returncode=1)
-        ), mock.patch("opencode_go_proxy.secrets.subprocess.run", side_effect=None) as run:
-            run.side_effect = [_keychain_result(s, returncode=1) for s in keychain_services()]
+            "opencode_go_proxy.secrets.subprocess.run",
+            side_effect=[_keychain_result(service, returncode=1) for service in keychain_services()],
+        ):
             try:
                 resolve_api_key(make_config(), "req")
                 raise AssertionError("expected ProxyError")

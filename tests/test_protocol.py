@@ -479,17 +479,17 @@ class ImageRoutingTests(unittest.TestCase):
         catalog = self._write_catalog(
             [
                 {"slug": "text-only-model", "input_modalities": ["text"]},
-                {"slug": "mimo-v2.5", "input_modalities": ["text", "image"]},
+                {"slug": "other-vision-model", "input_modalities": ["text", "image"]},
             ]
         )
         with mock.patch.dict(
-            os.environ, {"CODEX_MODEL_CATALOG": catalog, "CODEX_IMAGE_MODEL": "mimo-v2.5"}
+            os.environ, {"CODEX_MODEL_CATALOG": catalog, "CODEX_IMAGE_MODEL": "other-vision-model"}
         ):
             chat, _model, stats = responses_payload_to_chat_payload(
                 self._image_payload("text-only-model")
             )
-        self.assertEqual(chat["model"], "mimo-v2.5")
-        self.assertEqual(stats["upstream_model"], "mimo-v2.5")
+        self.assertEqual(chat["model"], "other-vision-model")
+        self.assertEqual(stats["upstream_model"], "other-vision-model")
 
     def test_non_image_turn_never_uses_image_default(self) -> None:
         catalog = self._write_catalog([{"slug": "text-only-model", "input_modalities": ["text"]}])

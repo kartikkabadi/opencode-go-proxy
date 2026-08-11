@@ -260,6 +260,9 @@ class TestStreamImageFallback:
             events = _stream_request(image_payload("deepseek-v4-flash"), fake_urlopen)
 
         assert len(requests) == 2
+        retry_body = json.loads(requests[1].data)
+        retry_text = json.dumps(retry_body)
+        assert "image_url" not in retry_text
         assert not any(e["type"] == "response.error" for e in events)
         completed = next(e for e in events if e["type"] == "response.completed")["response"]
         assert completed["output_text"] == "hi"

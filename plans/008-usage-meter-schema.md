@@ -1,3 +1,5 @@
+STATUS: IMPLEMENTED on codex/0.2.0-parity-build (see plans/README.md and DEPLOYMENT.md). Historical planning doc; the shipped code is authoritative.
+
 # Plan 008 - Usage meter schema: rework to match the reference, additively
 
 ## Why this matters

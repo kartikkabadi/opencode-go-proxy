@@ -158,9 +158,10 @@
 - Caption latency: identical screenshot bytes are captioned once per hour (in-process
   byte-keyed cache, 256-entry bound), so repeat tool calls on the same screen skip the
   upstream round trip.
-- Caption engine defaults to the turn model (`OPENCODE_GO_PROXY_CAPTION_MODEL=auto`);
-  `CODEX_IMAGE_MODEL` still overrides, and `mimo-v2.5` remains the fallback when the
-  turn model rejects image input (4xx).
+- Caption engine: `OPENCODE_GO_PROXY_CAPTION_MODEL=auto` picks the cheapest
+  image-capable catalog model (an enabled local runtime first);
+  `CODEX_IMAGE_MODEL` overrides, and `mimo-v2.5` is the fallback when the picked
+  engine rejects image input (4xx).
 - Caption images are sent with `detail: low` (`OPENCODE_GO_PROXY_CAPTION_DETAIL=none`
   disables); if the upstream rejects the detail value, the proxy retries once with a
   `sips`-downscaled JPEG (or the original URL) and no detail.

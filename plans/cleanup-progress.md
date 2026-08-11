@@ -124,3 +124,19 @@ Verification: 448 passed locally. Commit: (next)
 Verification: 454 passed locally, ruff clean, swift build complete, live e2e
 on 8790 (health, 91 models, /state, responses turn, chat passthrough 200).
 Commit: (next)
+
+### Step 6 - Review-driven fixes, batch 5 (tests + docs + startup validation)
+
+- app.py: startup validates --timeout-sec is positive (P2).
+- tests: config_manager assertion uses managed_base_url(); protocol env
+  override uses a distinct vision slug; secrets drops the dead double patch;
+  state /state port contract uses the real bound port; image-fallback
+  streaming test asserts the retry body has no image_url; env-matrix state
+  dir uses the constant; concurrency tests isolated earlier.
+- CHANGELOG caption-engine wording corrected (auto picks cheapest image-capable
+  catalog model, not the turn model).
+- plans/: README table regenerated for all 13 plans + 009b with implemented
+  statuses; every plan file got a STATUS banner marking it historical so
+  stale line refs cannot mislead a future executor.
+
+Verification: 454 passed locally, ruff clean. Commit: (next)
