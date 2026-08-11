@@ -15,6 +15,7 @@ final class ProxyController {
     private(set) var state = ProxyState(isRunning: false, isStarting: false, isHealthy: false, port: 8787) {
         didSet { onStateChange?() }
     }
+    private(set) var serverState: ServerState?
 
     private var childPID: pid_t = -1
     private var healthURL: URL {
@@ -86,6 +87,7 @@ final class ProxyController {
         state = ProxyState(isRunning: true, isStarting: false, isHealthy: false, port: state.port)
         monitorChild(pid)
         refreshHealth()
+        refreshState()
     }
 
     func stop() {
@@ -100,6 +102,23 @@ final class ProxyController {
             }
         }
         state = ProxyState(isRunning: false, isStarting: false, isHealthy: false, port: state.port)
+        serverState = nil
+    }
+
+    /// Fetch the /state contract (quota card, usage bars, provider row). Only
+    /// meaningful while the child process is alive; failures keep the last
+    /// good state, and stop() clears it so the menu never shows stale numbers.
+    func refreshState() {
+        guard childPID > 0 else { return }
+        StateFetcher.fetch(port: state.port) { [weak self] serverState in
+            DispatchQueue.main.async {
+                guard let self else { return }
+                if self.serverState != serverState {
+                    self.serverState = serverState
+                    self.onStateChange?()
+                }
+            }
+        }
     }
 
     func refreshHealth() {
@@ -167,6 +186,7 @@ final class ProxyController {
             DispatchQueue.main.async {
                 guard self.childPID == pid else { return }
                 self.childPID = -1
+                self.serverState = nil
                 self.state = ProxyState(isRunning: false, isStarting: false,
                                         isHealthy: false, port: self.state.port)
             }

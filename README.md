@@ -199,6 +199,7 @@ See the [lazycodex docs](https://github.com/code-yeongyu/oh-my-openagent) for se
 - Auth transport guard (zero config): missing Host answers `400`, non-loopback Host answers `403` (unless `OPENCODE_GO_PROXY_ALLOW_REMOTE=1`), browser-originated requests (Origin / Referer / Sec-Fetch-Site) answer `403`, non-JSON POSTs answer `415`, and OPTIONS preflight stays blocked
 - Verbatim `/v1/chat/completions` passthrough (stream and non-stream): the upstream status and body are relayed byte-for-byte, including the upstream's own error body, and `/v1/messages` answers an explicit `400`
 - Rate-limit harvesting (plan 011): upstream `x-ratelimit-*` and `anthropic-ratelimit-*` headers are parsed into per-provider quota snapshots, the latest snapshot per provider is kept, and `GET /quota` exposes `quota-state.json`
+- Menu bar state contract (plan 013): `GET /state` returns one JSON document (status, port, upstream, latest quota snapshot, today's turns/tokens, last-7-day token bars, current model) computed from the meter file and quota state
 - WebSocket upgrade requests answered with `426 Upgrade Required` (desktop app falls back to HTTP streaming)
 - zstd-compressed request bodies decompressed (`Content-Encoding: zstd`; the desktop app sends them)
 - Single-port guard in the menu bar app: refuses Start when 8787 is already owned
@@ -278,6 +279,49 @@ curl http://127.0.0.1:8787/quota
 
 A headerless upstream leaves the state empty (`"providers": {}`); the proxy never
 invents quota numbers.
+
+### Checking state
+
+`GET /state` (or `/v1/state`) composes the same local files into the single
+contract the macOS menu bar reads. `quota` is the latest provider snapshot by
+`sampledAt` (or `null`), `usage.last7d` is always seven entries (oldest first,
+including today) so the UI renders a stable bar list, and `model` is the model of
+the most recent meter event, falling back to the default:
+
+```bash
+curl http://127.0.0.1:8787/state
+```
+
+```json
+{
+  "status": "ok",
+  "port": 8787,
+  "upstream": "https://opencode.ai/zen/go/v1",
+  "quota": {
+    "provider": "openai",
+    "remaining": 432,
+    "limit": 500,
+    "resetAt": "2026-08-11T06:30:00.000Z"
+  },
+  "usage": {
+    "todayTurns": 12,
+    "todayTokens": 3456,
+    "last7d": [
+      { "date": "2026-08-05", "tokens": 0 },
+      { "date": "2026-08-06", "tokens": 1200 },
+      { "date": "2026-08-07", "tokens": 900 },
+      { "date": "2026-08-08", "tokens": 2100 },
+      { "date": "2026-08-09", "tokens": 1800 },
+      { "date": "2026-08-10", "tokens": 2700 },
+      { "date": "2026-08-11", "tokens": 3456 }
+    ]
+  },
+  "model": "deepseek-v4-flash"
+}
+```
+
+Missing or corrupt meter/quota files degrade to zeros or `null`; the endpoint
+always returns this shape.
 
 ## Install
 

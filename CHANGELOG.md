@@ -111,6 +111,16 @@
 - User overlay for custom models: `user-models.json` (add / hide / edit display)
   plus hidden-model flags from `model-picker.json`, seven-day `availability_nux`
   announcements tracked in `announced-models.json`.
+- Menu bar state contract (plan 013): `GET /state` (and `/v1/state`) returns
+  one JSON document - `status`, `port`, `upstream`, the latest quota snapshot
+  by `sampledAt` (`{provider, remaining, limit?, resetAt?}` or `null`),
+  `usage` with `todayTurns` / `todayTokens` / a stable seven-entry `last7d`
+  token list (local calendar days, oldest first), and `model` (most recent
+  meter event, else the default). A missing or corrupt meter/quota file
+  degrades to zeros or `null`. The Swift menu bar renders the Standard tier
+  from that contract: quota card with reset countdown, today's turns/tokens,
+  a 7-day usage bar list, and model/upstream rows, keeping the single-port
+  guard and existing controls.
 
 ## [0.2.0] - 2026-08-10
 
