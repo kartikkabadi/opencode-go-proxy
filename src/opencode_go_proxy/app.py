@@ -110,7 +110,7 @@ def decode_request_body(raw: bytes, content_encoding: str, max_body_bytes: int) 
             return b"".join(chunks)
         except ProxyError:
             raise
-        except Exception as exc:  # noqa: BLE001 - surface a clean 400, not a crash
+        except Exception as exc:
             raise ProxyError(HTTPStatus.BAD_REQUEST, f"failed to decompress zstd request body: {exc}") from exc
     if encoding in {"gzip", "x-gzip"}:
         try:
