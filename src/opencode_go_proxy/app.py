@@ -159,13 +159,15 @@ class ResponsesProxyHandler(BaseHTTPRequestHandler):
         return True
 
     def do_GET(self) -> None:
+        # A realtime WebSocket upgrade must answer 426 before any auth guard:
+        # upgrades carry browser markers (Origin) that would otherwise 403.
+        if self._reject_websocket_upgrade():
+            return
         try:
             self._guard_request()
         except ProxyError as exc:
             trace("request.failed", status=exc.status, message=exc.message)
             self._send_json(self._error_payload(exc), status=exc.status)
-            return
-        if self._reject_websocket_upgrade():
             return
         if self.path in {"/health", "/v1/health"}:
             self._send_json({"status": "ok"})
@@ -319,7 +321,7 @@ def handle_responses_request(payload: Json, config: ProxyConfig, request_id: str
             except ProxyError as exc2:
                 record_usage_event(
                     model=request_model, status=int(exc2.status), duration_ms=int((time.time() - started) * 1000),
-                    retries=exc2.retries or None,
+                    retries=(exc2.retries or 0) + 1,
                 )
                 raise
         else:
@@ -359,9 +361,9 @@ def handle_chat_completions_request(handler: ResponsesProxyHandler, payload: Jso
     if payload.get("stream") is True:
         handle_chat_stream_passthrough(payload, config, request_id, handler)
         return
-    status, body, _retries = call_upstream_chat_verbatim(payload, config, request_id)
+    status, body, _retries, content_type = call_upstream_chat_verbatim(payload, config, request_id)
     handler.send_response(status)
-    handler.send_header("content-type", "application/json")
+    handler.send_header("content-type", content_type or "application/json")
     handler.send_header("content-length", str(len(body)))
     handler.end_headers()
     handler.wfile.write(body)

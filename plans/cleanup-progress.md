@@ -68,3 +68,23 @@ Triage of real, actionable findings (P1 first):
 - test_env_matrix.py: state_dir default asserted against meter.DEFAULT_STATE_DIR.
 
 Verification: 443 passed locally. Commit: (next)
+
+### Step 3 - Review-driven fixes, batch 2 (streaming/app correctness)
+
+- streaming.py: output_index is now a monotonic counter assigned once per
+  output_item.added and reused by every delta/done/completed; mixed text and
+  tool calls can no longer share an index (P1, regression test added).
+- trace.py: module-level lock serializes each stderr JSONL record (P2).
+- app.py do_GET: WebSocket upgrades answer 426 before the auth guard, so a
+  realtime handshake carrying Origin is no longer 403 (P2; live-verified).
+- app.py: failed image-fallback turns now meter retries=(exc.retries+1) (P3).
+- app.py + upstream.py: verbatim chat passthrough relays the upstream
+  content-type instead of always labeling application/json (P3).
+- streaming.py: mid-stream upstream read failures in the chat passthrough
+  terminate the relay without rendering a second HTTP response (P2).
+- streaming.py: dropped the never-True empty flag and the emptyCompletion
+  marker on 502 no-data streams (empty completion stays a 200-only concept).
+
+Verification: 444 passed locally; live e2e on 8790: health 200, WS+Origin
+426, chat passthrough relays upstream content-type, stream ends with [DONE].
+Commit: (next)

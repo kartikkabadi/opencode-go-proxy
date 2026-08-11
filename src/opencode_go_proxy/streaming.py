@@ -189,6 +189,13 @@ def handle_streaming_request(payload: Json, config: ProxyConfig, request_id: str
         # reasoning item that is already closed still occupies output_index 0 and
         # text/tool calls cannot collide with it.
         reasoning_emitted = False
+        # output_index is a monotonic counter assigned once per emitted
+        # output_item.added and reused by every delta/done/completed for that
+        # item, so mixed text and tool calls can never share an index.
+        next_output_index = 0
+        msg_index: int | None = None
+        tool_indices: dict[int, int] = {}
+        reasoning_index = 0
         total_retries = 0
 
         def run_attempt() -> str:
@@ -204,6 +211,7 @@ def handle_streaming_request(payload: Json, config: ProxyConfig, request_id: str
             """
             nonlocal text, reasoning, tool_calls, tool_call_items, tool_call_open, usage
             nonlocal item_open, reasoning_open, reasoning_emitted, total_retries
+            nonlocal next_output_index, msg_index, tool_indices, reasoning_index
             nonlocal req, raw_payload, chat_payload, fell_back, fallback_attempts
 
             # Per-attempt emission state; an empty attempt never opens items,
@@ -217,6 +225,19 @@ def handle_streaming_request(payload: Json, config: ProxyConfig, request_id: str
             reasoning_open = False
             reasoning_emitted = False
             got_data = False
+            # output_index is a monotonic counter assigned once per emitted
+            # output_item.added and reused by every delta/done/completed for
+            # that item, so mixed text and tool calls can never share an index.
+            next_output_index = 0
+            msg_index = None
+            tool_indices = {}
+            reasoning_index = 0
+
+            def allocate_index() -> int:
+                nonlocal next_output_index
+                index = next_output_index
+                next_output_index += 1
+                return index
 
             def emit_tool_added(idx: int) -> None:
                 """Emit output_item.added for tool call `idx` with its complete name.
@@ -244,8 +265,9 @@ def handle_streaming_request(payload: Json, config: ProxyConfig, request_id: str
                 if ns:
                     tc_item["namespace"] = ns
                 tool_call_items[idx] = tc_item
+                tool_indices[idx] = allocate_index()
                 send_event({"type": "response.output_item.added",
-                            "output_index": (1 if reasoning_emitted else 0) + idx, "item": tc_item})
+                            "output_index": tool_indices[idx], "item": tc_item})
                 tool_call_open.add(idx)
 
             max_retries = default_max_retries()
@@ -334,32 +356,33 @@ def handle_streaming_request(payload: Json, config: ProxyConfig, request_id: str
                         r = delta.get("reasoning_content")
                         if isinstance(r, str) and r:
                             if not reasoning_open:
-                                send_event({"type": "response.output_item.added", "output_index": 0, "item": {
+                                reasoning_index = allocate_index()
+                                send_event({"type": "response.output_item.added", "output_index": reasoning_index, "item": {
                                     "type": "reasoning", "id": reasoning_id, "summary": [], "status": "in_progress",
                                 }})
                                 reasoning_open = True
                                 reasoning_emitted = True
                             reasoning += r
                             send_event({"type": "response.reasoning_summary_text.delta",
-                                        "item_id": reasoning_id, "output_index": 0, "summary_index": 0, "delta": r})
+                                        "item_id": reasoning_id, "output_index": reasoning_index, "summary_index": 0, "delta": r})
                         # Text delta — open item lazily, then stream.
                         d = delta.get("content")
                         if isinstance(d, str) and d:
                             if not item_open:
-                                idx = 1 if reasoning_emitted else 0
-                                send_event({"type": "response.output_item.added", "output_index": idx, "item": {
+                                msg_index = allocate_index()
+                                send_event({"type": "response.output_item.added", "output_index": msg_index, "item": {
                                     "type": "message", "id": message_id, "role": "assistant",
                                     "status": "in_progress", "content": [],
                                 }})
                                 item_open = True
                             text += d
-                            send_event({"type": "response.output_text.delta", "item_id": message_id, "output_index": 1 if reasoning_emitted else 0, "delta": d})
+                            send_event({"type": "response.output_text.delta", "item_id": message_id, "output_index": msg_index, "delta": d})
                         tcs = delta.get("tool_calls")
                         if isinstance(tcs, list) and tcs and reasoning_open:
                             # Close reasoning item before tool calls so UI shows tool calls, not "thinking".
                             rs_done = {"type": "reasoning", "id": reasoning_id,
                                        "summary": [{"type": "summary_text", "text": reasoning}], "status": "completed"}
-                            send_event({"type": "response.output_item.done", "output_index": 0, "item": rs_done})
+                            send_event({"type": "response.output_item.done", "output_index": reasoning_index, "item": rs_done})
                             reasoning_open = False
                         if isinstance(tcs, list):
                             for tc in tcs:
@@ -400,7 +423,7 @@ def handle_streaming_request(payload: Json, config: ProxyConfig, request_id: str
             if not got_data:
                 send_error("upstream returned no SSE data")
                 record_usage_event(model=model, status=502, duration_ms=int((time.time() - started) * 1000),
-                                   empty_completion=True, retries=total_retries + fallback_attempts)
+                                   retries=total_retries + fallback_attempts)
                 return "nodata"
             if not text and not tool_calls and not reasoning:
                 return "empty"
@@ -450,17 +473,16 @@ def handle_streaming_request(payload: Json, config: ProxyConfig, request_id: str
         if reasoning_open:
             rs_done = {"type": "reasoning", "id": reasoning_id,
                         "summary": [{"type": "summary_text", "text": reasoning}], "status": "completed"}
-            send_event({"type": "response.output_item.done", "output_index": 0, "item": rs_done})
+            send_event({"type": "response.output_item.done", "output_index": reasoning_index, "item": rs_done})
 
         # Emit output_item.done for tool calls that were opened during streaming,
         # and added+done for any that weren't (e.g. name only completed at stream
         # end) — always with the complete name.
-        tc_base = 1 if reasoning_emitted else 0
         tc_count = 0
         for item in output:
             if item.get("type") != "function_call":
                 continue
-            idx = tc_base + tc_count
+            idx = tool_indices.get(tc_count, 0)
             if tc_count in tool_call_open:
                 # Already emitted added during streaming; close with the final
                 # name/arguments and keep the streamed item id.
@@ -481,12 +503,11 @@ def handle_streaming_request(payload: Json, config: ProxyConfig, request_id: str
                 send_event({"type": "response.output_item.done", "output_index": idx, "item": item})
             tc_count += 1
 
-        # Close message item if opened.
-        if item_open:
-            msg_idx = tc_base + len(tool_calls)
+        # Close message item if opened, at the index it was added with.
+        if item_open and msg_index is not None:
             msg_done = {"type": "message", "id": message_id, "role": "assistant", "status": "completed",
                          "content": [{"type": "output_text", "text": text, "annotations": []}]}
-            send_event({"type": "response.output_item.done", "output_index": msg_idx, "item": msg_done})
+            send_event({"type": "response.output_item.done", "output_index": msg_index, "item": msg_done})
 
         # Reuse the ids already streamed in response.completed.
         for out_item in output:
@@ -510,11 +531,12 @@ def handle_streaming_request(payload: Json, config: ProxyConfig, request_id: str
         trace("response.converted", request_id=request_id, output_items=len(output),
               output_text_len=len(text), usage=final.get("usage"), stream=True,
               cache=cache_stats_from_usage(usage))
-        empty = not text and not tool_calls and not reasoning
+        # An empty 200 never reaches this finalize path (it retries then errors
+        # with empty_completion=True), so the success record is never empty.
         record_usage_event(model=model, status=200, duration_ms=duration_ms,
                            input_tokens=inp, output_tokens=outp, total_tokens=total,
                            estimated_input_tokens=estimated,
-                           retries=total_retries + empty_attempts + fallback_attempts, empty_completion=empty)
+                           retries=total_retries + empty_attempts + fallback_attempts)
     finally:
         keepalive_stop.set()
 
@@ -624,6 +646,11 @@ def handle_chat_stream_passthrough(payload: Json, config: ProxyConfig, request_i
                     trace("client.disconnected", request_id=request_id,
                           message="client closed connection during stream")
                     break
+    except (urllib.error.HTTPError, urllib.error.URLError, TimeoutError, OSError) as exc:
+        # The SSE head is already committed; terminate the relay without
+        # rendering a second HTTP response inside the stream.
+        trace("upstream.stream_aborted", request_id=request_id,
+              status=getattr(exc, "code", None) or getattr(exc, "reason", str(exc)))
     finally:
         keepalive_stop.set()
 

@@ -183,7 +183,8 @@ class TestEmptyCompletionRetry:
         assert len(calls) == 1
         assert any(e["type"] == "response.error" for e in events)
         assert meter[0]["status"] == 502
-        assert meter[0]["emptyCompletion"] is True
+        # A no-data stream is an upstream failure, not an empty completion.
+        assert not meter[0].get("emptyCompletion")
 
 
 class TestZeroInputEstimation:

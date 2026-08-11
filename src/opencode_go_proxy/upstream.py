@@ -157,8 +157,8 @@ def call_upstream_chat(chat_payload: Json, config: ProxyConfig, request_id: str,
 def call_upstream_chat_verbatim(
     chat_payload: Json, config: ProxyConfig, request_id: str,
     *, timeout_sec: float | None = None, max_retries: int | None = None,
-) -> tuple[int, bytes, int]:
-    """POST chat/completions and return ``(upstream_status, raw_body, retries)``.
+) -> tuple[int, bytes, int, str | None]:
+    """POST chat/completions and return ``(status, raw_body, retries, content_type)``.
 
     The /chat/completions passthrough relay: an upstream HTTP error is returned
     with the upstream's own status and body so the proxy relays it verbatim
@@ -183,7 +183,7 @@ def call_upstream_chat_verbatim(
                 record_quota_from_headers(getattr(response, "headers", None))
                 elapsed_ms = int((time.time() - started) * 1000)
                 trace("upstream.done", request_id=request_id, status=response.status, bytes=len(body), elapsed_ms=elapsed_ms)
-                return response.status, body, retries
+                return response.status, body, retries, response.headers.get("content-type")
         except urllib.error.HTTPError as exc:
             body = exc.read()
             trace("upstream.error", request_id=request_id, status=exc.code, body=_mask_trace_body(body.decode("utf-8", errors="replace")))
@@ -192,7 +192,7 @@ def call_upstream_chat_verbatim(
                 trace("upstream.retry", request_id=request_id, attempt=retries, status=exc.code)
                 retry_sleep(retries)
                 continue
-            return exc.code, body, retries
+            return exc.code, body, retries, (exc.headers.get("content-type") if exc.headers else None)
         except urllib.error.URLError as exc:
             trace("upstream.network_error", request_id=request_id, reason=str(getattr(exc, "reason", exc)))
             if retries < max_retries:

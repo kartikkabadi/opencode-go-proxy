@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import re
 import sys
+import threading
 import time
 from typing import Any
 
@@ -33,6 +34,12 @@ def _mask_trace_body(body: str, limit: int = 2000) -> str:
     return _MASK_RE.sub(_repl, text)
 
 
+_STDERR_LOCK = threading.Lock()
+
+
 def trace(event: str, **fields: Any) -> None:
+    """Emit one JSON line to stderr; serialized so concurrent calls cannot
+    interleave a record across separate write calls."""
     record = {"ts": time.time(), "event": event, **fields}
-    print(json.dumps(record, sort_keys=True), file=sys.stderr, flush=True)
+    with _STDERR_LOCK:
+        print(json.dumps(record, sort_keys=True), file=sys.stderr, flush=True)

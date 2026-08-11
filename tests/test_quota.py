@@ -203,7 +203,7 @@ class TestUpstreamHooks:
     def test_call_upstream_chat_verbatim_records_quota(self) -> None:
         with mock.patch.dict(os.environ, {"OPENCODE_GO_API_KEY": "test-key"}), \
              mock.patch("urllib.request.urlopen", return_value=ok_response({"x-ratelimit-remaining": "7"})):
-            status, _body, _retries = call_upstream_chat_verbatim(chat_payload(), make_config(), "req")
+            status, _body, _retries, _ct = call_upstream_chat_verbatim(chat_payload(), make_config(), "req")
         assert status == 200
         assert read_quota_state()["providers"]["openai"]["remaining"] == 7
 

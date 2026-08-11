@@ -101,9 +101,9 @@ class TestOutputIndex:
 
 
 class TestEmptyCompletion:
-    def test_no_sse_data_meters_empty_completion(self, tmp_path) -> None:
-        # An upstream that opens but never sends data must produce an SSE
-        # error and an empty_completion meter record, not a success.
+    def test_no_sse_data_is_metered_as_502_not_empty(self, tmp_path) -> None:
+        # An upstream that opens but never sends data is an upstream failure
+        # (502), not an empty 200; it must not carry the emptyCompletion marker.
         state = str(tmp_path / "state")
         with mock.patch("urllib.request.urlopen", return_value=_UpstreamStream([])):
             events, wfile, meter = _stream([], state_dir=state)
@@ -112,7 +112,7 @@ class TestEmptyCompletion:
         assert meter, "expected a meter record"
         record = meter[0]
         assert record["status"] == 502
-        assert record.get("emptyCompletion") is True
+        assert record.get("emptyCompletion") is not True
 
     def test_success_is_not_empty(self, tmp_path) -> None:
         state = str(tmp_path / "state")
@@ -127,3 +127,25 @@ class TestEmptyCompletion:
         record = meter[0]
         assert record["status"] == 200
         assert not record.get("emptyCompletion")
+
+
+class TestOutputIndexes:
+    def test_mixed_text_and_tool_calls_get_unique_indexes(self) -> None:
+        # Regression: a message and the first function call must never share
+        # an output_index (they used to collide when both appeared in one turn).
+        lines = [
+            b'data: {"choices":[{"delta":{"content":"reading "}}]}\n',
+            b'data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","function":{"name":"read_file","arguments":""}}]}}]}\n',
+            b'data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\\"path\\":\\"/tmp/x\\"}"}}]}}]}\n',
+            b'data: {"id":"1","choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}\n',
+            b"data: [DONE]\n",
+        ]
+        with mock.patch("urllib.request.urlopen", return_value=_UpstreamStream(lines)):
+            events, _, _meter = _stream(lines)
+        added = [e for e in events if e["type"] == "response.output_item.added"]
+        assert len(added) == 2, added
+        indices = [e["output_index"] for e in added]
+        assert len(set(indices)) == len(indices), f"collision: {indices}"
+        done = [e for e in events if e["type"] == "response.output_item.done"]
+        done_indices = [e["output_index"] for e in done]
+        assert len(set(done_indices)) == len(done_indices), f"done collision: {done_indices}"
