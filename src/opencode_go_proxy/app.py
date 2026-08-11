@@ -176,11 +176,11 @@ class ResponsesProxyHandler(BaseHTTPRequestHandler):
             self._send_json(read_quota_state())
             return
         if self.path in {"/state", "/v1/state"}:
-            config: ProxyConfig = self.server.config  # type: ignore[attr-defined]
+            config = self._config()
             self._send_json(build_state(port=config.port, upstream=config.chat_base_url))
             return
         if self.path in {"/cache", "/v1/cache", "/metrics", "/v1/metrics"}:
-            config: ProxyConfig = self.server.config  # type: ignore[attr-defined]
+            config = self._config()
             self._send_json(config.cache_tracker.snapshot())
             return
         if self.path in {"/models", "/v1/models"}:
@@ -206,7 +206,7 @@ class ResponsesProxyHandler(BaseHTTPRequestHandler):
                     self._send_json({"error": {"message": "not found"}}, status=HTTPStatus.NOT_FOUND)
                 return
             check_content_type(self.headers.get("content-type"))
-            config: ProxyConfig = self.server.config  # type: ignore[attr-defined]
+            config = self._config()
             payload = self._read_json(config)
             trace(
                 "request.received",
@@ -250,6 +250,9 @@ class ResponsesProxyHandler(BaseHTTPRequestHandler):
                 )
             except BrokenPipeError:
                 pass
+
+    def _config(self) -> ProxyConfig:
+        return self.server.config  # type: ignore[attr-defined]
 
     def _read_json(self, config: ProxyConfig) -> Json:
         try:

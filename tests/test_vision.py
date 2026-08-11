@@ -93,39 +93,50 @@ class TestCaptionCache:
 
 
 class TestCaptionModelSelection:
+    """Engine resolution contract, pinned on resolve_engines (the real seam)."""
+
+    def _models(self, engines):
+        return [e.model for e in engines]
+
     def test_auto_picks_cheapest_catalog_model(self) -> None:
         # Fixture catalog declares image input for both models; the flash
         # cost hint ranks deepseek-v4-flash cheapest.
-        assert vision.resolve_caption_model("deepseek-v4-flash") == "deepseek-v4-flash"
+        with mock.patch("opencode_go_proxy.vision.local_runtime_enabled", return_value=False):
+            assert self._models(vision.resolve_engines("deepseek-v4-flash")) == ["deepseek-v4-flash"]
 
     def test_codex_image_model_override_wins(self) -> None:
         with mock.patch.dict(os.environ, {"CODEX_IMAGE_MODEL": "mimo-v2.5"}):
-            assert vision.resolve_caption_model("deepseek-v4-flash") == "mimo-v2.5"
+            assert self._models(vision.resolve_engines("deepseek-v4-flash")) == ["mimo-v2.5"]
 
     def test_caption_model_auto_uses_catalog_pick(self) -> None:
-        with mock.patch.dict(os.environ, {"OPENCODE_GO_PROXY_CAPTION_MODEL": "auto"}):
-            assert vision.resolve_caption_model("deepseek-v4-flash") == "deepseek-v4-flash"
+        with mock.patch.dict(os.environ, {"OPENCODE_GO_PROXY_CAPTION_MODEL": "auto"}), mock.patch(
+            "opencode_go_proxy.vision.local_runtime_enabled", return_value=False
+        ):
+            assert self._models(vision.resolve_engines("deepseek-v4-flash")) == ["deepseek-v4-flash"]
 
     def test_caption_model_explicit_pins_engine(self) -> None:
         with mock.patch.dict(os.environ, {"OPENCODE_GO_PROXY_CAPTION_MODEL": "deepseek-v4-pro"}):
-            assert vision.resolve_caption_model("deepseek-v4-flash") == "deepseek-v4-pro"
+            assert self._models(vision.resolve_engines("deepseek-v4-flash")) == ["deepseek-v4-pro"]
 
     def test_codex_image_model_beats_caption_model(self) -> None:
         with mock.patch.dict(
             os.environ,
             {"CODEX_IMAGE_MODEL": "mimo-v2.5", "OPENCODE_GO_PROXY_CAPTION_MODEL": "deepseek-v4-pro"},
         ):
-            assert vision.resolve_caption_model("deepseek-v4-flash") == "mimo-v2.5"
+            assert self._models(vision.resolve_engines("deepseek-v4-flash")) == ["mimo-v2.5"]
 
     def test_local_pin_resolves_to_local(self) -> None:
         with mock.patch.dict(os.environ, {"OPENCODE_GO_PROXY_CAPTION_MODEL": "local"}):
-            assert vision.resolve_caption_model("deepseek-v4-flash") == "local"
+            engines = vision.resolve_engines("deepseek-v4-flash")
+        assert isinstance(engines[0], vision.LocalVisionAdapter)
 
-    def test_empty_target_falls_back_to_mimo_with_empty_catalog(self, tmp_path) -> None:
+    def test_empty_catalog_falls_back_to_mimo(self, tmp_path) -> None:
         cat = tmp_path / "cat.json"
         cat.write_text(json.dumps({"models": []}))
-        with mock.patch.dict(os.environ, {"CODEX_MODEL_CATALOG": str(cat)}):
-            assert vision.resolve_caption_model("") == IMAGE_MODEL_DEFAULT
+        with mock.patch.dict(os.environ, {"CODEX_MODEL_CATALOG": str(cat)}), mock.patch(
+            "opencode_go_proxy.vision.local_runtime_enabled", return_value=False
+        ):
+            assert self._models(vision.resolve_engines("deepseek-v4-flash")) == [IMAGE_MODEL_DEFAULT]
 
 
 class TestCaptionDetail:

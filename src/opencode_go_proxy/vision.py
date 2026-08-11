@@ -339,19 +339,6 @@ def auto_pick_caption_model() -> str:
     return IMAGE_MODEL_DEFAULT
 
 
-def resolve_caption_model(target_model: str) -> str:
-    """Resolve the caption engine to a model slug (or ``local``), env first.
-
-    The turn model no longer drives auto: the cheapest image-capable catalog
-    model does, with ``mimo-v2.5`` as the fallback when the catalog has none.
-    ``target_model`` is accepted for compatibility; auto ignores it.
-    """
-    setting = _caption_engine_setting()
-    if setting:
-        return setting
-    return auto_pick_caption_model()
-
-
 # Local runtime (Ollama / llama.cpp server / LM Studio) config. All three
 # expose the OpenAI-compatible /v1 surface, so one adapter covers them.
 LOCAL_VISION_BASE_URL_ENV = "OPENCODE_GO_PROXY_VISION_LOCAL_BASE_URL"

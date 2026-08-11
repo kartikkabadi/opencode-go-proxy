@@ -140,3 +140,19 @@ Commit: (next)
   stale line refs cannot mislead a future executor.
 
 Verification: 454 passed locally, ruff clean. Commit: (next)
+
+### Step 7 - Architecture pass (improve-codebase-architecture)
+
+Report: $TMPDIR/architecture-review-20260811-112434.html (opened).
+
+- A4: app.py handlers use one _config() accessor (removes 3 type-ignore dups).
+- A2: deleted dead resolve_caption_model(); the engine-resolution contract
+  tests now pin resolve_engines (the real seam).
+- A1: extracted _open_upstream_stream() + _ConnectFailed in streaming.py; the
+  responses engine and the chat passthrough now share one connect-with-retry
+  seam (their terminal handling stays distinct).
+- A3 (protocol.py split) documented as a candidate, not executed: no current
+  pain, characterization tests exist.
+
+Verification: 454 passed locally, ruff clean, live e2e on 8790 (health,
+responses stream, chat passthrough stream, responses turn). Commit: (next)

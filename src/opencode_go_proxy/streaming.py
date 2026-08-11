@@ -62,6 +62,56 @@ def keepalive_sec() -> float:
         return DEFAULT_KEEPALIVE_SEC
 
 
+class _ConnectFailed(Exception):
+    """Upstream connect failed after bounded transient retries.
+
+    Carries the terminal exception (HTTPError / URLError / TimeoutError), the
+    number of retry attempts burned, and the response body for HTTP errors so
+    the caller can decide how to surface it (error event + meter, or a
+    verbatim relay of the upstream body).
+    """
+
+    def __init__(self, exc: Exception, attempts: int, body: bytes = b"") -> None:
+        super().__init__(str(exc))
+        self.exc = exc
+        self.attempts = attempts
+        self.body = body
+
+
+def _open_upstream_stream(
+    req: urllib.request.Request, config: ProxyConfig, request_id: str, max_retries: int
+) -> tuple[Any, int]:
+    """Open the upstream stream with bounded transient retries.
+
+    Returns ``(response, attempts)``; after retries are exhausted raises
+    :class:`_ConnectFailed` with the terminal exception. Quota headers are
+    harvested from the successful response.
+    """
+    attempts = 0
+    while True:
+        try:
+            response = urllib.request.urlopen(req, timeout=config.timeout_sec)
+            record_quota_from_headers(getattr(response, "headers", None))
+            return response, attempts
+        except urllib.error.HTTPError as exc:
+            body = exc.read().decode("utf-8", errors="replace")
+            trace("upstream.error", request_id=request_id, status=exc.code, body=_mask_trace_body(body))
+            if retriable_http_status(exc.code) and attempts < max_retries:
+                attempts += 1
+                trace("upstream.retry", request_id=request_id, attempt=attempts, status=exc.code)
+                retry_sleep(attempts)
+                continue
+            raise _ConnectFailed(exc, attempts, body.encode("utf-8", errors="replace")) from exc
+        except (urllib.error.URLError, TimeoutError) as exc:
+            trace("upstream.network_error", request_id=request_id, reason=str(getattr(exc, "reason", exc)))
+            if attempts < max_retries:
+                attempts += 1
+                trace("upstream.retry", request_id=request_id, attempt=attempts, reason=str(getattr(exc, "reason", exc)))
+                retry_sleep(attempts)
+                continue
+            raise _ConnectFailed(exc, attempts) from exc
+
+
 def handle_streaming_request(payload: Json, config: ProxyConfig, request_id: str, wfile: Any) -> None:
     """Stream upstream response as SSE in real-time: created → text deltas → completed.
 
@@ -270,25 +320,18 @@ def handle_streaming_request(payload: Json, config: ProxyConfig, request_id: str
                             "output_index": tool_indices[idx], "item": tc_item})
                 tool_call_open.add(idx)
 
-            max_retries = default_max_retries()
             # Connect with bounded retry on transient failures before any SSE
             # byte arrives. Once the response object is open we stream it below;
             # a failure inside that loop means the upstream died after its 200
             # head was already committed to the client, which we mark as an
             # aborted stream rather than a success.
-            response = None
-            while response is None:
-                try:
-                    response = urllib.request.urlopen(req, timeout=config.timeout_sec)
-                    record_quota_from_headers(getattr(response, "headers", None))
-                except urllib.error.HTTPError as exc:
-                    body = exc.read().decode("utf-8", errors="replace")
-                    trace("upstream.error", request_id=request_id, status=exc.code, body=_mask_trace_body(body))
-                    if retriable_http_status(exc.code) and total_retries < max_retries:
-                        total_retries += 1
-                        trace("upstream.retry", request_id=request_id, attempt=total_retries, status=exc.code)
-                        retry_sleep(total_retries)
-                        continue
+            try:
+                response, retry_attempts = _open_upstream_stream(req, config, request_id, default_max_retries())
+                total_retries += retry_attempts
+            except _ConnectFailed as fail:
+                total_retries += fail.attempts
+                exc = fail.exc
+                if isinstance(exc, urllib.error.HTTPError):
                     if (
                         not fell_back
                         and conversion_stats.get("has_image")
@@ -318,19 +361,12 @@ def handle_streaming_request(payload: Json, config: ProxyConfig, request_id: str
                     record_usage_event(model=model, status=exc.code, duration_ms=int((time.time() - started) * 1000),
                                        retries=total_retries + fallback_attempts)
                     return "error"
-                except (urllib.error.URLError, TimeoutError) as exc:
-                    trace("upstream.network_error", request_id=request_id, reason=str(getattr(exc, "reason", exc)))
-                    if total_retries < max_retries:
-                        total_retries += 1
-                        trace("upstream.retry", request_id=request_id, attempt=total_retries, reason=str(getattr(exc, "reason", exc)))
-                        retry_sleep(total_retries)
-                        continue
-                    send_error(f"upstream network error: {getattr(exc, 'reason', exc)}")
-                    # Network failure: no upstream status exists (502) and nothing was
-                    # streamed, so no streamAborted marker.
-                    record_usage_event(model=model, status=502, duration_ms=int((time.time() - started) * 1000),
-                                       retries=total_retries + fallback_attempts)
-                    return "error"
+                send_error(f"upstream network error: {getattr(exc, 'reason', exc)}")
+                # Network failure: no upstream status exists (502) and nothing was
+                # streamed, so no streamAborted marker.
+                record_usage_event(model=model, status=502, duration_ms=int((time.time() - started) * 1000),
+                                   retries=total_retries + fallback_attempts)
+                return "error"
 
             try:
                 with response as resp:
@@ -562,24 +598,15 @@ def handle_chat_stream_passthrough(payload: Json, config: ProxyConfig, request_i
     }, method="POST")
     trace("upstream.start", request_id=request_id, url=url, bytes=len(raw_payload), stream=True)
 
-    retries = 0
-    max_retries = default_max_retries()
-    response = None
-    while response is None:
-        try:
-            response = urllib.request.urlopen(req, timeout=config.timeout_sec)
-            record_quota_from_headers(getattr(response, "headers", None))
-        except urllib.error.HTTPError as exc:
-            body = exc.read()
-            trace("upstream.error", request_id=request_id, status=exc.code,
-                  body=_mask_trace_body(body.decode("utf-8", errors="replace")))
-            if retriable_http_status(exc.code) and retries < max_retries:
-                retries += 1
-                trace("upstream.retry", request_id=request_id, attempt=retries, status=exc.code)
-                retry_sleep(retries)
-                continue
+    try:
+        response, retries = _open_upstream_stream(req, config, request_id, default_max_retries())
+    except _ConnectFailed as fail:
+        retries = fail.attempts
+        exc = fail.exc
+        if isinstance(exc, urllib.error.HTTPError):
             # Nothing was committed yet, so the client sees the upstream's own
             # status and error body, not a proxy envelope.
+            body = fail.body
             content_type = (exc.headers.get("content-type") if exc.headers else None) or "application/json"
             handler.send_response(exc.code)
             handler.send_header("content-type", content_type)
@@ -588,22 +615,9 @@ def handle_chat_stream_passthrough(payload: Json, config: ProxyConfig, request_i
             handler.wfile.write(body)
             handler.wfile.flush()
             return
-        except urllib.error.URLError as exc:
-            trace("upstream.network_error", request_id=request_id, reason=str(getattr(exc, "reason", exc)))
-            if retries < max_retries:
-                retries += 1
-                trace("upstream.retry", request_id=request_id, attempt=retries, reason=str(getattr(exc, "reason", exc)))
-                retry_sleep(retries)
-                continue
-            raise ProxyError(HTTPStatus.BAD_GATEWAY, f"upstream network error: {getattr(exc, 'reason', exc)}", retries=retries) from exc
-        except TimeoutError:
-            trace("upstream.timeout", request_id=request_id, timeout=config.timeout_sec)
-            if retries < max_retries:
-                retries += 1
-                trace("upstream.retry", request_id=request_id, attempt=retries, reason="timeout")
-                retry_sleep(retries)
-                continue
-            raise ProxyError(HTTPStatus.GATEWAY_TIMEOUT, "upstream timeout", retries=retries) from None
+        if isinstance(exc, TimeoutError):
+            raise ProxyError(HTTPStatus.GATEWAY_TIMEOUT, "upstream timeout", retries=retries) from exc
+        raise ProxyError(HTTPStatus.BAD_GATEWAY, f"upstream network error: {getattr(exc, 'reason', exc)}", retries=retries) from exc
 
     handler.send_response(HTTPStatus.OK)
     handler.send_header("content-type", "text/event-stream")
