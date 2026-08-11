@@ -16,10 +16,7 @@ from opencode_go_proxy.app import (
     ProxyError,
     call_upstream_chat,
     handle_responses_request,
-<<<<<<< HEAD
-=======
     handle_streaming_request,
->>>>>>> 023aafd (fix: apply 0.2.0 review findings (12-agent review pass))
 )
 from opencode_go_proxy.meter import usage_events_path
 
