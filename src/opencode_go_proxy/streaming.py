@@ -47,7 +47,7 @@ from .upstream import (
     retry_sleep,
     usage_tokens,
 )
-from .vision import caption_images_in_messages
+from .vision import caption_images_in_messages, is_image_rejection_status
 
 Json = dict[str, Any]
 
@@ -110,6 +110,14 @@ def handle_streaming_request(payload: Json, config: ProxyConfig, request_id: str
             chat_payload = caption_images_in_messages(chat_payload, request_model, config, request_id)
             conversion_stats["upstream_model"] = chat_payload.get("model")
 
+        # Runtime image fallback (plan 009 escape hatch): a non-tools image turn
+        # routed to a catalog-promised model can still be rejected by the
+        # upstream (400/404/415/422). The first such rejection re-captions the
+        # images and retries the same requested model once; the client sees one
+        # stream either way.
+        fell_back = False
+        fallback_attempts = 0
+
         chat_payload["stream"] = True
         # Ask the upstream to include the usage object in the stream; without
         # stream_options.include_usage most OpenAI-compatible endpoints omit it,
@@ -152,11 +160,15 @@ def handle_streaming_request(payload: Json, config: ProxyConfig, request_id: str
 
         url = f"{config.chat_base_url}/chat/completions"
         raw_payload = json.dumps(chat_payload, separators=(",",":")).encode("utf-8")
-        req = urllib.request.Request(url, data=raw_payload, headers={
-            "authorization": f"Bearer {api_key}", "content-type": "application/json",
-            "accept": "text/event-stream",
-            "user-agent": os.environ.get("OPENCODE_GO_PROXY_USER_AGENT", "codex/1.0"),
-        }, method="POST")
+
+        def _make_req() -> urllib.request.Request:
+            return urllib.request.Request(url, data=raw_payload, headers={
+                "authorization": f"Bearer {api_key}", "content-type": "application/json",
+                "accept": "text/event-stream",
+                "user-agent": os.environ.get("OPENCODE_GO_PROXY_USER_AGENT", "codex/1.0"),
+            }, method="POST")
+
+        req = _make_req()
         trace("upstream.start", request_id=request_id, url=url, bytes=len(raw_payload), stream=True)
         started = time.time()
 
@@ -180,16 +192,19 @@ def handle_streaming_request(payload: Json, config: ProxyConfig, request_id: str
         total_retries = 0
 
         def run_attempt() -> str:
-            """Run one upstream stream; returns 'content', 'empty', 'nodata', or 'gone'.
+            """Run one upstream stream; returns 'content', 'empty', 'nodata', 'gone', or 'fallback'.
 
             'content'/'empty' split a streamed 200 by whether it produced any
             output; 'nodata' means the upstream opened but never sent SSE;
-            'gone' means the client disconnected. Terminal error paths send
-            their own events, meter the turn, and return 'error' so the caller
-            stops instead of retrying an upstream failure or a client abort.
+            'gone' means the client disconnected. 'fallback' means the image
+            payload was rejected and the caller must re-run with captioned
+            text. Terminal error paths send their own events, meter the turn,
+            and return 'error' so the caller stops instead of retrying an
+            upstream failure or a client abort.
             """
             nonlocal text, reasoning, tool_calls, tool_call_items, tool_call_open, usage
             nonlocal item_open, reasoning_open, reasoning_emitted, total_retries
+            nonlocal req, raw_payload, chat_payload, fell_back, fallback_attempts
 
             # Per-attempt emission state; an empty attempt never opens items,
             # but resetting keeps a retry provably clean.
@@ -252,6 +267,23 @@ def handle_streaming_request(payload: Json, config: ProxyConfig, request_id: str
                         trace("upstream.retry", request_id=request_id, attempt=total_retries, status=exc.code)
                         retry_sleep(total_retries)
                         continue
+                    if (
+                        not fell_back
+                        and conversion_stats.get("has_image")
+                        and not conversion_stats.get("tools_present")
+                        and is_image_rejection_status(exc.code)
+                    ):
+                        fell_back = True
+                        fallback_attempts += 1
+                        trace("image_fallback", request_id=request_id, kind="caption", status=exc.code,
+                              model=request_model, stream=True)
+                        chat_payload = caption_images_in_messages(chat_payload, request_model, config, request_id)
+                        conversion_stats["upstream_model"] = chat_payload.get("model")
+                        raw_payload = json.dumps(chat_payload, separators=(",",":")).encode("utf-8")
+                        req = _make_req()
+                        trace("upstream.start", request_id=request_id, url=url, bytes=len(raw_payload),
+                              stream=True, fallback=True)
+                        return "fallback"
                     if exc.code == 429:
                         retry_after = exc.headers.get("retry-after", "5")
                         send_error(f"rate limited (retry after {retry_after}s)")
@@ -262,7 +294,7 @@ def handle_streaming_request(payload: Json, config: ProxyConfig, request_id: str
                     # No upstream bytes were ever streamed, so this is not a mid-stream
                     # abort: meter the real final upstream status, not a synthetic 502.
                     record_usage_event(model=model, status=exc.code, duration_ms=int((time.time() - started) * 1000),
-                                       retries=total_retries)
+                                       retries=total_retries + fallback_attempts)
                     return "error"
                 except (urllib.error.URLError, TimeoutError) as exc:
                     trace("upstream.network_error", request_id=request_id, reason=str(getattr(exc, "reason", exc)))
@@ -275,7 +307,7 @@ def handle_streaming_request(payload: Json, config: ProxyConfig, request_id: str
                     # Network failure: no upstream status exists (502) and nothing was
                     # streamed, so no streamAborted marker.
                     record_usage_event(model=model, status=502, duration_ms=int((time.time() - started) * 1000),
-                                       retries=total_retries)
+                                       retries=total_retries + fallback_attempts)
                     return "error"
 
             try:
@@ -355,7 +387,7 @@ def handle_streaming_request(payload: Json, config: ProxyConfig, request_id: str
                       status=code or getattr(exc, "reason", str(exc)))
                 send_error("upstream stream aborted")
                 record_usage_event(model=model, status=502, duration_ms=int((time.time() - started) * 1000),
-                                   stream_aborted=True, retries=total_retries)
+                                   stream_aborted=True, retries=total_retries + fallback_attempts)
                 return "error"
 
             trace("upstream.done", request_id=request_id, status=200,
@@ -368,7 +400,7 @@ def handle_streaming_request(payload: Json, config: ProxyConfig, request_id: str
             if not got_data:
                 send_error("upstream returned no SSE data")
                 record_usage_event(model=model, status=502, duration_ms=int((time.time() - started) * 1000),
-                                   empty_completion=True, retries=total_retries)
+                                   empty_completion=True, retries=total_retries + fallback_attempts)
                 return "nodata"
             if not text and not tool_calls and not reasoning:
                 return "empty"
@@ -380,6 +412,8 @@ def handle_streaming_request(payload: Json, config: ProxyConfig, request_id: str
             outcome = run_attempt()
             if outcome in ("error", "gone", "nodata"):
                 return
+            if outcome == "fallback":
+                continue
             if outcome == "empty":
                 empty_attempts += 1
                 if empty_attempts == 1:
@@ -395,7 +429,7 @@ def handle_streaming_request(payload: Json, config: ProxyConfig, request_id: str
                 record_usage_event(model=model, status=200, duration_ms=duration_ms,
                                    input_tokens=inp, output_tokens=outp, total_tokens=total,
                                    estimated_input_tokens=estimated,
-                                   empty_completion=True, retries=total_retries + 1)
+                                   empty_completion=True, retries=total_retries + 1 + fallback_attempts)
                 return
             break
 
@@ -480,7 +514,7 @@ def handle_streaming_request(payload: Json, config: ProxyConfig, request_id: str
         record_usage_event(model=model, status=200, duration_ms=duration_ms,
                            input_tokens=inp, output_tokens=outp, total_tokens=total,
                            estimated_input_tokens=estimated,
-                           retries=total_retries + empty_attempts, empty_completion=empty)
+                           retries=total_retries + empty_attempts + fallback_attempts, empty_completion=empty)
     finally:
         keepalive_stop.set()
 

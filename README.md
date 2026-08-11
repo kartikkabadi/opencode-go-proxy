@@ -135,7 +135,9 @@ When images are present in a turn with tools, the proxy captions the latest imag
 (older ones are stubbed) and routes the main turn to your configured model. Image
 turns without tools stay on the requested model when the catalog marks it
 image-capable (`input_modalities` contains `image`); a text-only requested model
-falls back to the image default. The caption
+falls back to the image default. If the upstream still rejects the image payload
+at runtime (400/404/415/422), the proxy captions the images and retries the
+requested model once before failing the turn. The caption
 engine auto-picks the cheapest image-capable model from the catalog (`input_modalities`
 contains image) with `mimo-v2.5` as the fallback, or a local vision runtime (Ollama,
 llama.cpp server, LM Studio) that answers a read-only probe. Captions are cached by

@@ -197,6 +197,16 @@ def downscale_data_url(image_url: str, max_edge: int = SIPS_MAX_EDGE) -> str | N
 CAPTION_FALLBACK_STATUSES = {400, 404, 415, 422}
 
 
+def is_image_rejection_status(status: int | None) -> bool:
+    """Whether an HTTP status means "this model cannot read the image".
+
+    The same 4xx set the caption path already falls back on (plan 001/004)
+    rescues a main image turn: a catalog-promised model that rejects image
+    input at runtime gets one caption-and-retry instead of a failed turn.
+    """
+    return status in CAPTION_FALLBACK_STATUSES
+
+
 @dataclass(frozen=True)
 class Evidence:
     """One structured reading of an image for a model that cannot see it."""

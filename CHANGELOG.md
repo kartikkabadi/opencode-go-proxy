@@ -25,6 +25,12 @@
   model when the catalog marks it image-capable (`input_modalities`
   contains `image`), otherwise it falls back to `CODEX_IMAGE_MODEL` /
   `mimo-v2.5`; the image-plus-tools caption path is unchanged.
+- Image fallback (plan 009b): when the upstream rejects a non-tools image
+  turn at runtime with a caption-fallback 4xx (400/404/415/422), the proxy
+  captions the images through the vision module and retries the same
+  requested model once instead of failing the turn. The split-turn
+  (image plus tools) caption path and the verbatim `/chat/completions`
+  passthrough are unchanged.
 - Usage meter events now match the codex-router reference schema (plan 008):
   `at` is ISO 8601 UTC, token and duration fields are camelCase
   (`inputTokens` / `outputTokens` / `totalTokens` / `durationMs`), and every

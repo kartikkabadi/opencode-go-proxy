@@ -44,7 +44,7 @@ from .upstream import (
     record_cache,
     usage_tokens,
 )
-from .vision import caption_images_in_messages
+from .vision import caption_images_in_messages, is_image_rejection_status
 
 Json = dict[str, Any]
 
@@ -297,14 +297,37 @@ def handle_responses_request(payload: Json, config: ProxyConfig, request_id: str
         stats=conversion_stats,
         upstream_model=chat_payload.get("model"),
     )
+    fell_back = False
     try:
         chat, retries = call_upstream_chat(chat_payload, config, request_id)
     except ProxyError as exc:
-        record_usage_event(
-            model=request_model, status=int(exc.status), duration_ms=int((time.time() - started) * 1000),
-            retries=exc.retries or None,
-        )
-        raise
+        status = exc.upstream_status if exc.upstream_status is not None else int(exc.status)
+        if (
+            conversion_stats.get("has_image")
+            and not conversion_stats.get("tools_present")
+            and is_image_rejection_status(status)
+        ):
+            # Runtime rescue (plan 009 escape hatch): the catalog promised the
+            # requested model image input but the upstream rejected the payload.
+            # Caption the images and retry the same requested model once.
+            fell_back = True
+            trace("image_fallback", request_id=request_id, kind="caption", status=status, model=request_model)
+            chat_payload = caption_images_in_messages(chat_payload, request_model, config, request_id)
+            conversion_stats["upstream_model"] = chat_payload.get("model")
+            try:
+                chat, retries = call_upstream_chat(chat_payload, config, request_id)
+            except ProxyError as exc2:
+                record_usage_event(
+                    model=request_model, status=int(exc2.status), duration_ms=int((time.time() - started) * 1000),
+                    retries=exc2.retries or None,
+                )
+                raise
+        else:
+            record_usage_event(
+                model=request_model, status=int(exc.status), duration_ms=int((time.time() - started) * 1000),
+                retries=exc.retries or None,
+            )
+            raise
     record_cache(config.cache_tracker, chat_payload.get("model"), chat.get("usage"))
     response = chat_completion_to_response(chat, request_model=request_model)
     trace(
@@ -318,7 +341,8 @@ def handle_responses_request(payload: Json, config: ProxyConfig, request_id: str
     inp, outp, total = usage_tokens(chat.get("usage"))
     record_usage_event(
         model=request_model, status=200, duration_ms=int((time.time() - started) * 1000),
-        input_tokens=inp, output_tokens=outp, total_tokens=total, retries=retries,
+        input_tokens=inp, output_tokens=outp, total_tokens=total,
+        retries=retries + (1 if fell_back else 0),
     )
     return response
 
