@@ -44,6 +44,28 @@ def clear_api_key_cache() -> None:
     _api_key_cache = None
 
 
+def api_key_source(config: ProxyConfig) -> str | None:
+    """Where the proxy would resolve its key: "env:<NAME>" or "keychain:<SERVICE>".
+
+    Walks the same order as resolve_api_key without reading the value, so
+    doctor can report resolution without ever printing the credential.
+    """
+    for env in (config.api_key_env, "OPENCODE_API_KEY"):
+        if env and os.environ.get(env):
+            return f"env:{env}"
+    for keychain_service in keychain_services():
+        try:
+            completed = subprocess.run(
+                ["security", "find-generic-password", "-a", os.environ.get("USER", ""), "-s", keychain_service, "-w"],
+                check=False, capture_output=True, text=True, stdin=subprocess.DEVNULL, timeout=10,
+            )
+        except (FileNotFoundError, subprocess.TimeoutExpired):
+            continue
+        if completed and completed.returncode == 0 and completed.stdout.splitlines():
+            return f"keychain:{keychain_service}"
+    return None
+
+
 def resolve_api_key(config: ProxyConfig, request_id: str) -> str:
     global _api_key_cache
     if _api_key_cache:

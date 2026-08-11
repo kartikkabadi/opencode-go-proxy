@@ -22,7 +22,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 
 from . import __version__
-from .config import ProxyConfig
+from .config import ProxyConfig, resolve_chat_base_url
 from .errors import ProxyError
 from .guards import check_browser_origin, check_content_type, check_host
 from .meter import record_usage_event
@@ -343,7 +343,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--chat-base-url",
         dest="chat_base_url",
-        default=os.environ.get("CHAT_COMPLETIONS_BASE_URL", "https://opencode.ai/zen/go/v1"),
+        default=resolve_chat_base_url(),
     )
     parser.add_argument("--api-key-env", default=os.environ.get("OPENCODE_GO_PROXY_API_KEY_ENV", "OPENCODE_GO_API_KEY"))
     parser.add_argument("--timeout-sec", type=float, default=float(os.environ.get("OPENCODE_GO_PROXY_TIMEOUT_SEC", "180")))
@@ -378,7 +378,15 @@ def main(argv: list[str] | None = None) -> None:
     if args_list and args_list[0] == "smoke-test":
         from . import ops
 
-        sys.exit(ops.smoke_test())
+        sys.exit(ops.smoke_test(args_list[1:]))
+    if args_list and args_list[0] in {"setup", "install"}:
+        from . import ops
+
+        sys.exit(ops.install(args_list[1:]))
+    if args_list and args_list[0] == "status":
+        from . import ops
+
+        sys.exit(ops.status(args_list[1:]))
     if args_list and args_list[0] == "support-bundle":
         from . import ops
 

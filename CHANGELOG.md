@@ -4,6 +4,16 @@
 
 ### Changed
 
+- Ops contracts match the codex-router reference (plan 010): `smoke-test` posts
+  a marker prompt through the local proxy at `http://127.0.0.1:8787/v1/responses`
+  and asserts the marker comes back (custom base via `--base-url` or
+  `OPENCODE_GO_PROXY_BASE_URL`); `support-bundle` emits a single JSON document
+  (schemaVersion 1, mode 0600) with version, generatedAt, env summary, redacted
+  config snapshot, meter tail, log tail, catalog model count, and doctor checks
+  instead of a tar.gz; `doctor` gains reference-style `ok`/`warn`/`fail` checks
+  (config file presence, catalog readability, port free/owned, log writability,
+  best-effort upstream reachability) plus `--fix`, which repairs only what is
+  safe without writing config.toml.
 - Session-model inheritance matches the reference (plan 009): only
   `create_thread` calls get the session model injected and
   `chatgptWorkCloud` targets are skipped; `send_message_to_thread` is no
@@ -26,6 +36,17 @@
 
 ### Added
 
+- Base-URL overrides (plan 010): the upstream chat base resolves as the
+  `--chat-base-url` flag, then `OPENCODE_GO_BASE_URL`, then
+  `OPENCODE_ZEN_BASE_URL`, then the legacy `CHAT_COMPLETIONS_BASE_URL`, then the
+  built-in default.
+- Ops install/status (plan 010): `install` and its `setup` alias copy the
+  launchd plist into `~/Library/LaunchAgents` and load the agent on macOS,
+  gated on an explicit `--yes` flag (running it is a deploy step); `status`
+  reports running state, port ownership, launchd state, and log paths.
+- Doctor/keychain seam (plan 010): `secrets.api_key_source()` reports where the
+  key would resolve (env or keychain service) without reading the value, so
+  doctor never prints the credential.
 - Correctness contract (plan 007): an upstream 200 that streams no
   text, tool call, or reasoning is retried once with the identical request
   (terminal events held, ids reused); a second empty stream answers

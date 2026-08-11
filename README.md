@@ -193,7 +193,7 @@ See the [lazycodex docs](https://github.com/code-yeongyu/oh-my-openagent) for se
 - Prefix caching: byte-stable request prefixes plus `include_usage`, with per-model hit ratio on `/cache`
 - Honest usage meter: append-only `usage-events.jsonl` in the state dir (truncated or empty responses never count as success)
 - Upstream retry with bounded exponential backoff on transient failures (429/5xx/network/timeout)
-- Ops CLI: `doctor` (self-check), `smoke-test` (live upstream probe), `support-bundle` (redacted tarball)
+- Ops CLI: `doctor` (reference-style checks with `--fix` for safe repairs), `smoke-test` (marker prompt through the local proxy), `support-bundle` (JSON schema v1, mode 0600), `install`/`setup` (launchd, gated on `--yes`) and `status`
 - Spawned threads inherit the parent session's model (`create_thread`; `chatgptWorkCloud` targets are skipped)
 - Correctness contract: empty upstream completions are retried once (a second empty stream answers an `empty_completion` error), zero-input-token reports are estimated for compaction (`OPENCODE_GO_PROXY_ESTIMATE_ZERO_INPUT=0` disables), and keepalive comments run until the stream truly ends without interleaving into data frames
 - Auth transport guard (zero config): missing Host answers `400`, non-loopback Host answers `403` (unless `OPENCODE_GO_PROXY_ALLOW_REMOTE=1`), browser-originated requests (Origin / Referer / Sec-Fetch-Site) answer `403`, non-JSON POSTs answer `415`, and OPTIONS preflight stays blocked
@@ -288,12 +288,14 @@ All flags have environment variable defaults:
 |------|---------|---------|
 | `--bind` | `OPENCODE_GO_PROXY_BIND` | `127.0.0.1` |
 | `--port` | `OPENCODE_GO_PROXY_PORT` | `8787` |
-| `--chat-base-url` | `CHAT_COMPLETIONS_BASE_URL` | `https://opencode.ai/zen/go/v1` |
+| `--chat-base-url` | `OPENCODE_GO_BASE_URL` then `OPENCODE_ZEN_BASE_URL` then `CHAT_COMPLETIONS_BASE_URL` | `https://opencode.ai/zen/go/v1` |
 | `--api-key-env` | `OPENCODE_GO_PROXY_API_KEY_ENV` | `OPENCODE_GO_API_KEY` |
 | `--timeout-sec` | `OPENCODE_GO_PROXY_TIMEOUT_SEC` | `180` |
 | `--max-body-mb` | `OPENCODE_GO_PROXY_MAX_BODY_MB` | `20` |
 
 The proxy accepts both `/responses` and `/v1/responses`.
+
+The upstream base URL resolves in this order: the `--chat-base-url` flag, then `OPENCODE_GO_BASE_URL`, then `OPENCODE_ZEN_BASE_URL`, then the legacy `CHAT_COMPLETIONS_BASE_URL`, then the built-in default.
 
 **One HTTP port only.** The proxy binds a single listener: `OPENCODE_GO_PROXY_PORT`
 (default `8787`). There is no admin port, control channel, or secondary service. If
@@ -312,6 +314,30 @@ name = "Go"  # shows as "Go" instead of "opencode go/"
 
 The reference catalog's per-model `display_name` values are already short
 ("DeepSeek V4 Flash", "Kimi K2.7 Code", etc).
+
+## Ops CLI
+
+All commands run as subcommands of the console script, for example `opencode-go-proxy doctor --json`.
+
+- `doctor [--json] [--fix]` - runs the check set: API key resolution (env or
+  keychain), config.toml presence and proxy pointer, catalog readability, port
+  free/owned, service health, meter writability, log writability, and best-effort
+  upstream reachability. `--fix` repairs only what is safe without writing
+  config.toml (log/meter directories, catalog render). Config writes are handled
+  by the config-manager step and stay approval-gated.
+- `smoke-test [--base-url URL]` - posts one marker prompt to the local proxy at
+  `http://127.0.0.1:8787/v1/responses` and asserts the marker comes back. Point
+  it at an isolated scratch proxy with `--base-url` or `OPENCODE_GO_PROXY_BASE_URL`.
+- `support-bundle [--output PATH]` - writes the JSON schema v1 diagnostic bundle
+  (version, generatedAt, env summary, redacted config snapshot, meter tail, log
+  tail, catalog model count, doctor checks) to a mode-600 file. Secret-shaped
+  values are redacted.
+- `install` / `setup --yes` - copies the launchd plist into `~/Library/LaunchAgents`
+  and loads the agent (macOS). The `--yes` flag is the explicit confirmation
+  gate; running it against the live agent is a deploy step, not part of this
+  build. Uninstall, update, and rollback are documented but not implemented.
+- `status [--json]` - reports whether the proxy is running, who owns the port,
+  launchd state, and where logs live.
 
 ## Model catalog
 

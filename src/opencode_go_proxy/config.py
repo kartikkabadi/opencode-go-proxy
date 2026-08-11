@@ -2,7 +2,27 @@
 
 from __future__ import annotations
 
+import os
+
 from .cache import CacheTracker
+
+DEFAULT_CHAT_BASE_URL = "https://opencode.ai/zen/go/v1"
+
+
+def resolve_chat_base_url(explicit: str | None = None) -> str:
+    """Upstream chat base URL: explicit flag, then env overrides, then default.
+
+    Precedence is OPENCODE_GO_BASE_URL, then OPENCODE_ZEN_BASE_URL, then the
+    legacy CHAT_COMPLETIONS_BASE_URL (kept so existing installs do not break),
+    then the built-in default.
+    """
+    if explicit:
+        return explicit.rstrip("/")
+    for name in ("OPENCODE_GO_BASE_URL", "OPENCODE_ZEN_BASE_URL", "CHAT_COMPLETIONS_BASE_URL"):
+        value = os.environ.get(name)
+        if value:
+            return value.rstrip("/")
+    return DEFAULT_CHAT_BASE_URL
 
 
 class ProxyConfig:
