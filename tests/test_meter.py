@@ -7,7 +7,12 @@ import tempfile
 import unittest
 from unittest import mock
 
-from opencode_go_proxy.meter import STATE_DIR_ENV, record_usage_event, state_dir, usage_events_path
+from opencode_go_proxy.meter import (
+    STATE_DIR_ENV,
+    record_usage_event,
+    state_dir,
+    usage_events_path,
+)
 
 
 class MeterRecordTests(unittest.TestCase):

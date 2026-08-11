@@ -11,7 +11,12 @@ from unittest import mock
 
 import pytest
 
-from opencode_go_proxy.app import ProxyConfig, ProxyError, call_upstream_chat, handle_responses_request
+from opencode_go_proxy.app import (
+    ProxyConfig,
+    ProxyError,
+    call_upstream_chat,
+    handle_responses_request,
+)
 from opencode_go_proxy.meter import usage_events_path
 
 
@@ -83,7 +88,7 @@ class TestRetry:
             return ok_response(ok_chat())
         with mock.patch("urllib.request.urlopen", side_effect=fake_urlopen), \
              mock.patch("opencode_go_proxy.app.time.sleep"):
-            value, retries = call_upstream_chat(chat_payload(), cfg, "req2")
+            _value, retries = call_upstream_chat(chat_payload(), cfg, "req2")
         assert retries == 1
         assert len(calls) == 2
 
@@ -97,7 +102,7 @@ class TestRetry:
             return ok_response(ok_chat())
         with mock.patch("urllib.request.urlopen", side_effect=fake_urlopen), \
              mock.patch("opencode_go_proxy.app.time.sleep"):
-            value, retries = call_upstream_chat(chat_payload(), cfg, "req3")
+            _value, retries = call_upstream_chat(chat_payload(), cfg, "req3")
         assert retries == 1
         assert len(calls) == 2
 
@@ -106,9 +111,8 @@ class TestRetry:
         urlopen = mock.Mock(side_effect=http_error(429))
         with mock.patch.dict(os.environ, {"OPENCODE_GO_PROXY_MAX_RETRIES": "2"}), \
              mock.patch("urllib.request.urlopen", urlopen), \
-             mock.patch("opencode_go_proxy.app.time.sleep"):
-            with pytest.raises(ProxyError) as ei:
-                call_upstream_chat(chat_payload(), cfg, "req4")
+             mock.patch("opencode_go_proxy.app.time.sleep"), pytest.raises(ProxyError) as ei:
+            call_upstream_chat(chat_payload(), cfg, "req4")
         assert ei.value.status == HTTPStatus.TOO_MANY_REQUESTS
         assert urlopen.call_count == 3  # initial + 2 retries
 
@@ -118,17 +122,15 @@ class TestRetry:
         def fake_urlopen(req, **kw):
             calls.append(req)
             raise http_error(400)
-        with mock.patch("urllib.request.urlopen", side_effect=fake_urlopen):
-            with pytest.raises(ProxyError):
-                call_upstream_chat(chat_payload(), cfg, "req5")
+        with mock.patch("urllib.request.urlopen", side_effect=fake_urlopen), pytest.raises(ProxyError):
+            call_upstream_chat(chat_payload(), cfg, "req5")
         assert len(calls) == 1  # no retry on 400
 
     def test_disabled_retries(self, env) -> None:
         cfg = make_config()
         with mock.patch.dict(os.environ, {"OPENCODE_GO_PROXY_MAX_RETRIES": "0"}), \
-             mock.patch("urllib.request.urlopen", side_effect=http_error(429)):
-            with pytest.raises(ProxyError):
-                call_upstream_chat(chat_payload(), cfg, "req6")
+             mock.patch("urllib.request.urlopen", side_effect=http_error(429)), pytest.raises(ProxyError):
+            call_upstream_chat(chat_payload(), cfg, "req6")
 
 
 class TestMeterThroughHandler:
