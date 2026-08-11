@@ -1,6 +1,11 @@
+import json
+import os
+import tempfile
 import unittest
+from unittest import mock
 
 from opencode_go_proxy.protocol import (
+    IMAGE_MODEL_DEFAULT,
     cache_stats_from_usage,
     chat_completion_to_response,
     normalize_usage,
@@ -410,6 +415,90 @@ class CacheAccountingTests(unittest.TestCase):
             }
         )
         self.assertEqual(response["usage"]["input_tokens_details"], {"cached_tokens": 99})
+
+
+class ImageRoutingTests(unittest.TestCase):
+    """Plan 009: image turns keep the requested model when it is image-capable."""
+
+    IMAGE_URL = "data:image/png;base64,iVBORw0KGgo="
+
+    def _write_catalog(self, models: list[dict]) -> str:
+        path = tempfile.mkdtemp()
+        catalog = os.path.join(path, "catalog.json")
+        with open(catalog, "w") as f:
+            json.dump({"models": models}, f)
+        return catalog
+
+    def _image_payload(self, model: str) -> dict:
+        return {
+            "model": model,
+            "input": [
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": [
+                        {"type": "input_text", "text": "What is on screen?"},
+                        {"type": "input_image", "image_url": self.IMAGE_URL},
+                    ],
+                }
+            ],
+        }
+
+    def test_image_turn_keeps_image_capable_requested_model(self) -> None:
+        catalog = self._write_catalog(
+            [
+                {
+                    "slug": "deepseek-v4-flash",
+                    "input_modalities": ["text", "image"],
+                },
+                {"slug": "mimo-v2.5", "input_modalities": ["text", "image"]},
+            ]
+        )
+        with mock.patch.dict(os.environ, {"CODEX_MODEL_CATALOG": catalog}):
+            chat, _model, stats = responses_payload_to_chat_payload(
+                self._image_payload("deepseek-v4-flash")
+            )
+        self.assertEqual(chat["model"], "deepseek-v4-flash")
+        self.assertEqual(stats["upstream_model"], "deepseek-v4-flash")
+
+    def test_image_turn_falls_back_to_image_default_for_text_only_model(self) -> None:
+        catalog = self._write_catalog(
+            [
+                {"slug": "text-only-model", "input_modalities": ["text"]},
+                {"slug": "mimo-v2.5", "input_modalities": ["text", "image"]},
+            ]
+        )
+        with mock.patch.dict(os.environ, {"CODEX_MODEL_CATALOG": catalog}):
+            chat, _model, stats = responses_payload_to_chat_payload(
+                self._image_payload("text-only-model")
+            )
+        self.assertEqual(chat["model"], IMAGE_MODEL_DEFAULT)
+        self.assertEqual(stats["upstream_model"], IMAGE_MODEL_DEFAULT)
+
+    def test_image_turn_env_override_wins_for_text_only_model(self) -> None:
+        catalog = self._write_catalog(
+            [
+                {"slug": "text-only-model", "input_modalities": ["text"]},
+                {"slug": "mimo-v2.5", "input_modalities": ["text", "image"]},
+            ]
+        )
+        with mock.patch.dict(
+            os.environ, {"CODEX_MODEL_CATALOG": catalog, "CODEX_IMAGE_MODEL": "mimo-v2.5"}
+        ):
+            chat, _model, stats = responses_payload_to_chat_payload(
+                self._image_payload("text-only-model")
+            )
+        self.assertEqual(chat["model"], "mimo-v2.5")
+        self.assertEqual(stats["upstream_model"], "mimo-v2.5")
+
+    def test_non_image_turn_never_uses_image_default(self) -> None:
+        catalog = self._write_catalog([{"slug": "text-only-model", "input_modalities": ["text"]}])
+        with mock.patch.dict(os.environ, {"CODEX_MODEL_CATALOG": catalog}):
+            chat, _model, stats = responses_payload_to_chat_payload(
+                {"model": "text-only-model", "input": "hello"}
+            )
+        self.assertEqual(chat["model"], "text-only-model")
+        self.assertEqual(stats["upstream_model"], "text-only-model")
 
 
 if __name__ == "__main__":

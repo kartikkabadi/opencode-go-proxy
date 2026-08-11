@@ -1,4 +1,4 @@
-"""Session-model inheritance for spawned threads (create_thread / send_message_to_thread)."""
+"""Session-model inheritance for spawned threads (create_thread only)."""
 
 import copy
 import json
@@ -49,11 +49,12 @@ class SessionModelInjectionTests(unittest.TestCase):
         item = result["input"][0]
         self.assertEqual(json.loads(item["arguments"]), {"model": "explicit-model"})
 
-    def test_send_message_to_thread_without_model_injects(self) -> None:
+    def test_send_message_to_thread_untouched(self) -> None:
         payload = payload_with(thread_call(name="send_message_to_thread", arguments="{}"))
+        expected = copy.deepcopy(payload)
         result = inject_session_model(payload, SESSION_MODEL)
-        item = result["input"][0]
-        self.assertEqual(json.loads(item["arguments"]), {"model": SESSION_MODEL})
+        self.assertEqual(result, expected)
+        self.assertEqual(result["input"][0]["arguments"], "{}")
 
     def test_flat_namespaced_name_preserved(self) -> None:
         payload = payload_with(thread_call(arguments="{}"))
@@ -63,14 +64,37 @@ class SessionModelInjectionTests(unittest.TestCase):
         self.assertEqual(item["name"], "codex_app__create_thread")
         self.assertEqual(json.loads(item["arguments"]), {"model": SESSION_MODEL})
 
+    def test_chatgpt_work_cloud_target_untouched(self) -> None:
+        payload = payload_with(
+            thread_call(arguments='{"target":{"type":"chatgptWorkCloud"},"prompt":"hi"}')
+        )
+        expected = copy.deepcopy(payload)
+        result = inject_session_model(payload, SESSION_MODEL)
+        self.assertEqual(result, expected)
+        self.assertEqual(
+            result["input"][0]["arguments"],
+            '{"target":{"type":"chatgptWorkCloud"},"prompt":"hi"}',
+        )
+
+    def test_projectless_target_injects_session_model(self) -> None:
+        payload = payload_with(
+            thread_call(arguments='{"target":{"type":"projectless"},"prompt":"hi"}')
+        )
+        result = inject_session_model(payload, SESSION_MODEL)
+        item = result["input"][0]
+        self.assertEqual(
+            json.loads(item["arguments"]),
+            {"target": {"type": "projectless"}, "prompt": "hi", "model": SESSION_MODEL},
+        )
+
     def test_native_namespace_name_form_handled(self) -> None:
         payload = payload_with(
-            thread_call(namespace="codex_app", name="send_message_to_thread", arguments="{}")
+            thread_call(namespace="codex_app", name="create_thread", arguments="{}")
         )
         result = inject_session_model(payload, SESSION_MODEL)
         item = result["input"][0]
         self.assertEqual(item["namespace"], "codex_app")
-        self.assertEqual(item["name"], "send_message_to_thread")
+        self.assertEqual(item["name"], "create_thread")
         self.assertEqual(json.loads(item["arguments"]), {"model": SESSION_MODEL})
 
     def test_other_tools_untouched(self) -> None:

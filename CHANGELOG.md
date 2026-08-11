@@ -4,6 +4,17 @@
 
 ### Changed
 
+- Session-model inheritance matches the reference (plan 009): only
+  `create_thread` calls get the session model injected and
+  `chatgptWorkCloud` targets are skipped; `send_message_to_thread` is no
+  longer rewritten.
+- Catalog discovery sends an identifying `User-Agent`
+  (`opencode-go-proxy/<version>`) because models.dev answers 403 to
+  urllib's default UA (plan 009).
+- Image routing (plan 009): a non-tools image turn keeps the requested
+  model when the catalog marks it image-capable (`input_modalities`
+  contains `image`), otherwise it falls back to `CODEX_IMAGE_MODEL` /
+  `mimo-v2.5`; the image-plus-tools caption path is unchanged.
 - Usage meter events now match the codex-router reference schema (plan 008):
   `at` is ISO 8601 UTC, token and duration fields are camelCase
   (`inputTokens` / `outputTokens` / `totalTokens` / `durationMs`), and every

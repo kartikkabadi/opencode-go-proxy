@@ -31,6 +31,7 @@ import urllib.error
 import urllib.request
 from typing import Any
 
+from . import __version__
 from .meter import state_dir
 
 Json = dict[str, Any]
@@ -203,11 +204,15 @@ def discover_models(timeout: int = 10) -> list[dict]:
     """Return model dicts from models.dev whose providerID is "opencode".
 
     Each returned dict is a models.dev model entry (id, name, description,
-    context/modalities/reasoning/cost when present). Raises
-    CatalogDiscoveryError on network failure or malformed JSON.
+    context/modalities/reasoning/cost when present). models.dev rejects
+    the default urllib User-Agent with 403, so the fetch sends an identifying
+    UA. Raises CatalogDiscoveryError on network failure or malformed JSON.
     """
+    request = urllib.request.Request(
+        MODELS_DEV_URL, headers={"User-Agent": f"opencode-go-proxy/{__version__}"}
+    )
     try:
-        with urllib.request.urlopen(MODELS_DEV_URL, timeout=timeout) as resp:
+        with urllib.request.urlopen(request, timeout=timeout) as resp:
             payload: Json = json.load(resp)
     except (urllib.error.URLError, TimeoutError, OSError, json.JSONDecodeError) as exc:
         raise CatalogDiscoveryError(f"failed to fetch {MODELS_DEV_URL}: {exc}") from exc

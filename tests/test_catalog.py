@@ -50,11 +50,22 @@ class DiscoverModelsTests(unittest.TestCase):
                 }
             },
         }
-        with mock.patch("opencode_go_proxy.catalog.urllib.request.urlopen", return_value=FakeResponse(payload)):
+        seen: dict = {}
+
+        def capture(request, *args, **kwargs):
+            seen["url"] = request.full_url
+            seen["ua"] = request.headers.get("User-agent")
+            return FakeResponse(payload)
+
+        with mock.patch("opencode_go_proxy.catalog.urllib.request.urlopen", side_effect=capture):
             models = discover_models()
 
         self.assertEqual([m["id"] for m in models], ["gpt-5.5", "deepseek-v4-flash"])
         self.assertNotIn("some-model", {m["id"] for m in models})
+        # models.dev rejects the default urllib UA with 403; the discovery
+        # fetch must carry an identifying UA.
+        self.assertEqual(seen["url"], "https://models.dev/api.json")
+        self.assertTrue(seen["ua"].startswith("opencode-go-proxy/"))
 
     def test_discover_models_raises_on_urlopen_failure(self) -> None:
         with mock.patch(

@@ -132,7 +132,10 @@ The proxy picks the upstream model based on what Codex sends:
 3. Otherwise, it falls back to `deepseek-v4-flash`.
 
 When images are present in a turn with tools, the proxy captions the latest image
-(older ones are stubbed) and routes the main turn to your configured model. The caption
+(older ones are stubbed) and routes the main turn to your configured model. Image
+turns without tools stay on the requested model when the catalog marks it
+image-capable (`input_modalities` contains `image`); a text-only requested model
+falls back to the image default. The caption
 engine auto-picks the cheapest image-capable model from the catalog (`input_modalities`
 contains image) with `mimo-v2.5` as the fallback, or a local vision runtime (Ollama,
 llama.cpp server, LM Studio) that answers a read-only probe. Captions are cached by
@@ -191,7 +194,7 @@ See the [lazycodex docs](https://github.com/code-yeongyu/oh-my-openagent) for se
 - Honest usage meter: append-only `usage-events.jsonl` in the state dir (truncated or empty responses never count as success)
 - Upstream retry with bounded exponential backoff on transient failures (429/5xx/network/timeout)
 - Ops CLI: `doctor` (self-check), `smoke-test` (live upstream probe), `support-bundle` (redacted tarball)
-- Spawned threads inherit the parent session's model (`create_thread` / `send_message_to_thread`)
+- Spawned threads inherit the parent session's model (`create_thread`; `chatgptWorkCloud` targets are skipped)
 - Correctness contract: empty upstream completions are retried once (a second empty stream answers an `empty_completion` error), zero-input-token reports are estimated for compaction (`OPENCODE_GO_PROXY_ESTIMATE_ZERO_INPUT=0` disables), and keepalive comments run until the stream truly ends without interleaving into data frames
 - Auth transport guard (zero config): missing Host answers `400`, non-loopback Host answers `403` (unless `OPENCODE_GO_PROXY_ALLOW_REMOTE=1`), browser-originated requests (Origin / Referer / Sec-Fetch-Site) answer `403`, non-JSON POSTs answer `415`, and OPTIONS preflight stays blocked
 - Verbatim `/v1/chat/completions` passthrough (stream and non-stream): the upstream status and body are relayed byte-for-byte, including the upstream's own error body, and `/v1/messages` answers an explicit `400`
