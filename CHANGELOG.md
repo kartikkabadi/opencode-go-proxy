@@ -41,6 +41,17 @@
   atomically to `quota-state.json` in the state dir. `GET /quota` (and
   `/v1/quota`) returns the state; a headerless upstream degrades to an empty
   snapshot.
+- Config manager (plan 012): `config enable|disable|status [--json]` owns a
+  marker-commented block in `~/.codex/config.toml` (`# BEGIN
+  opencode-go-proxy-managed` to `# END opencode-go-proxy-managed`). Enable
+  writes `openai_base_url` plus `model_catalog_json` (state-dir catalog) and
+  refuses to replace user-owned values; disable removes only the block and
+  deletes the file when the block was its only content. Codex Voice realtime
+  keys (`experimental_realtime_webrtc_call_base_url` and
+  `experimental_realtime_ws_base_url`) are added only when the user has not
+  set them, so Voice stays on native endpoints. Tests and CI run against a
+  temp file via `OPENCODE_GO_PROXY_CONFIG_PATH`; the real config.toml is a
+  gated deploy step.
 
 ### Added
 

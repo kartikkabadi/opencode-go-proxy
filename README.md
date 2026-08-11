@@ -353,6 +353,14 @@ All commands run as subcommands of the console script, for example `opencode-go-
   upstream reachability. `--fix` repairs only what is safe without writing
   config.toml (log/meter directories, catalog render). Config writes are handled
   by the config-manager step and stay approval-gated.
+- `config enable|disable|status [--json]` - owns one marker-commented block in
+  `~/.codex/config.toml` (`# BEGIN opencode-go-proxy-managed` to
+  `# END opencode-go-proxy-managed`): enable writes `openai_base_url` and
+  `model_catalog_json` and never replaces user-owned values, disable removes
+  only the managed block (and deletes the file when the block was its only
+  content), and Codex Voice realtime keys are preserved on native endpoints
+  unless you set them yourself. Point it at another file for testing with
+  `OPENCODE_GO_PROXY_CONFIG_PATH`.
 - `smoke-test [--base-url URL]` - posts one marker prompt to the local proxy at
   `http://127.0.0.1:8787/v1/responses` and asserts the marker comes back. Point
   it at an isolated scratch proxy with `--base-url` or `OPENCODE_GO_PROXY_BASE_URL`.
