@@ -61,7 +61,7 @@ class TestEnvMatrix:
         with mock.patch.dict(os.environ, {"OPENCODE_GO_PROXY_STATE_DIR": str(tmp_path)}, clear=True):
             assert meter.state_dir() == str(tmp_path)
         with mock.patch.dict(os.environ, {}, clear=True):
-            assert meter.state_dir() == os.path.join(os.path.expanduser("~"), ".codex", "opencode-go-proxy")
+            assert meter.state_dir() == meter.DEFAULT_STATE_DIR
 
     def test_key_env(self) -> None:
         with mock.patch.dict(os.environ, {"OPENCODE_GO_PROXY_API_KEY_ENV": "CUSTOM_KEY_VAR"}, clear=True):

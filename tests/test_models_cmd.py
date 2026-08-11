@@ -71,3 +71,25 @@ def test_overlay_is_applied_by_catalog(state) -> None:
     assert "my-custom-model" in slugs
     custom = next(m for m in merged if m.get("slug") == "my-custom-model")
     assert custom.get("visibility") == "hide"
+
+
+def test_hide_preserves_other_overlay_fields(state) -> None:
+    models_cmd.models_cmd(["add", "m5", "--display-name", "Keep Me", "--set", "context_window=200000"])
+    assert models_cmd.models_cmd(["hide", "m5"]) == 0
+    entry = _overlay(state)["models"][0]
+    assert entry["display_name"] == "Keep Me"
+    assert entry["context_window"] == 200000
+    assert entry.get("hide") is True
+    assert models_cmd.models_cmd(["show", "m5"]) == 0
+    entry = _overlay(state)["models"][0]
+    assert entry["display_name"] == "Keep Me"
+    assert entry.get("visibility") == "list"
+    assert "hide" not in entry
+
+
+def test_set_parses_numeric_fields(state) -> None:
+    assert models_cmd.models_cmd(["add", "m6", "--set", "context_window=200000", "--set", "priority=1.5"]) == 0
+    entry = _overlay(state)["models"][0]
+    assert entry["context_window"] == 200000
+    assert entry["priority"] == 1.5
+    assert models_cmd.models_cmd(["add", "m7", "--set", "context_window=abc"]) != 0

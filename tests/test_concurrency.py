@@ -16,6 +16,12 @@ from opencode_go_proxy.config import ProxyConfig
 N = 10
 
 
+@pytest.fixture(autouse=True)
+def isolated_state_dir(tmp_path, monkeypatch) -> None:
+    """Never let these real requests touch the machine's default state dir."""
+    monkeypatch.setenv("OPENCODE_GO_PROXY_STATE_DIR", str(tmp_path / "state"))
+
+
 class MockUpstreamHandler(BaseHTTPRequestHandler):
     lock = threading.Lock()
     requests = 0

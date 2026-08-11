@@ -84,7 +84,10 @@ def _parse_duration(text: str) -> float | None:
     tokens = _DURATION_TOKEN.findall(text)
     if not tokens or "".join(f"{number}{unit}" for number, unit in tokens) != text:
         return None
-    return sum(float(number) * _UNIT_SECONDS[unit] for number, unit in tokens)
+    try:
+        return sum(float(number) * _UNIT_SECONDS[unit] for number, unit in tokens)
+    except (ValueError, OverflowError):
+        return None
 
 
 def _parse_reset_epoch(value: Any) -> float | None:
@@ -106,7 +109,7 @@ def _parse_reset_epoch(value: Any) -> float | None:
         return time.time() + duration
     try:
         number = float(text)
-    except ValueError:
+    except (ValueError, OverflowError):
         return None
     if number < 0:
         return None
@@ -137,7 +140,11 @@ def _snapshot(provider: str, limit: Any, remaining: Any, reset: Any) -> Json | N
         snapshot["limit"] = limit_clean
     reset_epoch = _parse_reset_epoch(reset)
     if reset_epoch is not None:
-        snapshot["resetAt"] = _iso_at(reset_epoch)
+        try:
+            snapshot["resetAt"] = _iso_at(reset_epoch)
+        except (ValueError, OverflowError, OSError):
+            # A parseable-but-unrepresentable reset (huge epoch) is best-effort.
+            pass
     return snapshot
 
 

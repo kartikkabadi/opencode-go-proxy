@@ -16,7 +16,11 @@ from typing import Any
 
 from . import catalog
 
-JSON_DOC = "https://github.com/kartikkabadi/opencode-go-proxy"  # placeholder
+# --set values are typed so numeric model fields survive the overlay.
+_INT_KEYS = frozenset(
+    {"context_window", "max_context_window", "context_window_override", "comp_hash"}
+)
+_FLOAT_KEYS = frozenset({"priority"})
 
 
 def _overlay_path() -> str:
@@ -52,6 +56,21 @@ def _save(path: str, data: dict[str, Any]) -> None:
         except OSError:
             pass
         raise
+
+
+def _typed_value(key: str, raw: str):
+    """Coerce a --set value to the overlay field's type; raises ValueError."""
+    if key in _INT_KEYS:
+        try:
+            return int(raw)
+        except ValueError:
+            raise ValueError(f"{key} must be an integer, got {raw!r}") from None
+    if key in _FLOAT_KEYS:
+        try:
+            return float(raw)
+        except ValueError:
+            raise ValueError(f"{key} must be a number, got {raw!r}") from None
+    return raw
 
 
 def _find(models: list[dict], slug: str) -> int:
@@ -101,7 +120,7 @@ def _cmd_add(argv: list[str]) -> int:
         if "=" not in kv:
             print(f"error: --set expects KEY=VALUE, got {kv!r}", file=sys.stderr)
             return 2
-        key, value = kv.split("=", 1)
+        key, raw_value = kv.split("=", 1)
         key = key.strip()
         if key == "slug" or key == "hide":
             print(f"error: use dedicated flags for {key!r}", file=sys.stderr)
@@ -109,7 +128,11 @@ def _cmd_add(argv: list[str]) -> int:
         if key not in catalog.OVERLAY_EDIT_KEYS:
             print(f"error: unknown overlay key {key!r}", file=sys.stderr)
             return 2
-        entry[key] = value
+        try:
+            entry[key] = _typed_value(key, raw_value)
+        except ValueError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 2
     path = _overlay_path()
     data = _load(path)
     idx = _find(data["models"], slug)
@@ -148,15 +171,17 @@ def _cmd_visibility(argv: list[str], hidden: bool) -> int:
     path = _overlay_path()
     data = _load(path)
     idx = _find(data["models"], args.slug)
-    entry = {"slug": args.slug}
+    if idx >= 0:
+        entry = data["models"][idx]
+    else:
+        entry = {"slug": args.slug}
+        data["models"].append(entry)
     if hidden:
         entry["hide"] = True
+        entry.pop("visibility", None)
     else:
         entry["visibility"] = "list"
-    if idx >= 0:
-        data["models"][idx] = entry
-    else:
-        data["models"].append(entry)
+        entry.pop("hide", None)
     _save(path, data)
     print(f"{'hidden' if hidden else 'shown'} {args.slug}")
     return 0

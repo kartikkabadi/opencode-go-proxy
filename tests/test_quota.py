@@ -282,3 +282,15 @@ class TestQuotaEndpoint:
         assert status == 200
         state = json.loads(raw)
         assert state["providers"]["openai"]["remaining"] == 99
+
+
+class TestMalformedHeaders:
+    def test_huge_reset_does_not_raise(self) -> None:
+        headers = {"x-ratelimit-remaining-requests": "5", "x-ratelimit-reset-requests": "9" * 400}
+        snapshots = quota_snapshot_from_headers(headers)
+        assert snapshots
+        assert "resetAt" not in snapshots["openai"]
+
+    def test_huge_remaining_duration_does_not_raise(self) -> None:
+        headers = {"x-ratelimit-remaining-requests": "5", "x-ratelimit-reset-requests": ("9" * 400) + "s"}
+        assert quota_snapshot_from_headers(headers)["openai"]["remaining"] == 5
