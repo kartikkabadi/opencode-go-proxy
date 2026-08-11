@@ -395,3 +395,57 @@ class TestStatus:
         assert state["port"] == 8787
         assert state["launchd"]["loaded"] is True
         assert state["logs"]["files"] == ["opencode-go-proxy.log"]
+
+
+class TestReviewFixups:
+    def test_install_renders_home_not_percent_h(self, tmp_path) -> None:
+        agents = tmp_path / "LaunchAgents"
+        plist = tmp_path / "com.opencode-go.proxy.plist"
+        plist.write_text("<plist/>\n<key>HOME</key><string>%h</string>\n")
+        with mock.patch.dict(os.environ, {
+            "OPENCODE_GO_PROXY_LAUNCH_AGENTS_DIR": str(agents),
+            "OPENCODE_GO_PROXY_PLIST_SOURCE": str(plist),
+            "HOME": str(tmp_path),
+        }), mock.patch("opencode_go_proxy.ops.platform.system", return_value="Darwin"), mock.patch(
+            "opencode_go_proxy.ops.subprocess.run", return_value=mock.Mock(returncode=0, stdout="", stderr="")
+        ):
+            assert ops.install(["--yes"]) == 0
+        rendered = (agents / "com.opencode-go.proxy.plist").read_text()
+        assert "%h" not in rendered
+        assert str(tmp_path) in rendered
+
+    def test_support_bundle_redacts_bearer_under_generic_key(self, tmp_path) -> None:
+        # config values shaped like bearer credentials must not survive the bundle
+        config = tmp_path / "config.toml"
+        config.write_text('openai_base_url = "https://example.test/v1"\ncustom_key = "Bearer sk-abcdef1234567890"\n')
+        with mock.patch("opencode_go_proxy.ops.CONFIG_PATH", str(config)):
+            snapshot = ops._config_snapshot()
+        assert "sk-abcdef1234567890" not in snapshot["redacted"]
+        assert "REDACTED" in snapshot["redacted"]
+
+    def test_check_config_ignores_comments_and_sections(self, tmp_path) -> None:
+        config = tmp_path / "config.toml"
+        config.write_text(
+            '# openai_base_url = "http://127.0.0.1:8787"\n[model_providers.opencode-go]\nbase_url = "http://127.0.0.1:8787"\n'
+        )
+        with mock.patch("opencode_go_proxy.ops.CONFIG_PATH", str(config)):
+            check = ops.check_config()
+        assert check.ok is False
+        config.write_text('openai_base_url = "http://127.0.0.1:8787/v1"\n')
+        with mock.patch("opencode_go_proxy.ops.CONFIG_PATH", str(config)):
+            check = ops.check_config()
+        assert check.ok is True
+
+    def test_check_port_detects_occupied_non_http_listener(self) -> None:
+        import socket as sock_mod
+
+        listener = sock_mod.socket()
+        listener.bind(("127.0.0.1", 0))
+        listener.listen(1)
+        port = listener.getsockname()[1]
+        try:
+            check = ops.check_port(f"http://127.0.0.1:{port}/health")
+            assert check.ok is False
+            assert "occupied" in check.detail
+        finally:
+            listener.close()

@@ -19,11 +19,12 @@ import json
 import os
 import platform
 import re
-import shutil
+import socket
 import subprocess
 import sys
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from typing import Any
 
@@ -115,6 +116,18 @@ def check_config_file() -> Check:
     return Check("config file", "fail", f"{CONFIG_PATH} missing", fix="Start Codex once so it writes config.toml, then rerun doctor.")
 
 
+def _root_openai_base_url(text: str) -> str | None:
+    """Value of the root openai_base_url assignment, ignoring comments and sections."""
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith(("#", "[")):
+            continue
+        match = re.match(r'openai_base_url\s*=\s*"([^"]+)"', line)
+        if match:
+            return match.group(1)
+    return None
+
+
 def check_config() -> Check:
     """Codex config points openai_base_url at the proxy."""
     if not os.path.exists(CONFIG_PATH):
@@ -124,9 +137,10 @@ def check_config() -> Check:
             text = f.read()
     except OSError as exc:
         return Check("config", "fail", str(exc))
-    if f"{DEFAULT_HOST}:{DEFAULT_PORT}" in text:
-        return Check("config", "ok", f"openai_base_url points at {DEFAULT_HOST}:{DEFAULT_PORT}")
-    return Check("config", "fail", f"openai_base_url does not point at {DEFAULT_HOST}:{DEFAULT_PORT}", fix="Run the config-manager enable step (plan 012) once it ships.")
+    base_url = _root_openai_base_url(text)
+    if base_url and f"{DEFAULT_HOST}:{DEFAULT_PORT}" in base_url:
+        return Check("config", "ok", f"openai_base_url points at {base_url}")
+    return Check("config", "fail", f"root openai_base_url does not point at {DEFAULT_HOST}:{DEFAULT_PORT}", fix="Run the config-manager enable step (plan 012) once it ships.")
 
 
 def _catalog_models() -> tuple[str, list[Json]]:
@@ -169,7 +183,30 @@ def check_port(url: str = HEALTH_URL) -> Check:
     except urllib.error.HTTPError as exc:
         return Check("port", "warn", f"listener on {url} answered HTTP {exc.code}")
     except (urllib.error.URLError, OSError, ValueError) as exc:
+        if _port_occupied(url):
+            return Check("port", "warn", "port is occupied by another process (health did not answer)")
         return Check("port", "ok", f"free; proxy not running ({exc})")
+
+
+def _port_occupied(url: str = HEALTH_URL) -> bool:
+    """True when something is listening on the URL's host/port (bind fails)."""
+    try:
+        parsed = urllib.parse.urlparse(url)
+        host = parsed.hostname or DEFAULT_HOST
+        port = parsed.port or DEFAULT_PORT
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        try:
+            sock.bind((host, port))
+            return False
+        except PermissionError:
+            # Unprivileged bind to a privileged port is not evidence of occupancy.
+            return False
+        except OSError:
+            return True
+        finally:
+            sock.close()
+    except (ValueError, OSError):
+        return False
 
 
 def check_service(url: str = HEALTH_URL) -> Check:
@@ -382,7 +419,7 @@ def _config_snapshot() -> Json:
     try:
         with open(CONFIG_PATH, encoding="utf-8") as f:
             text = f.read()
-        return {"path": CONFIG_PATH, "exists": True, "redacted": _mask_secret_values(text)}
+        return {"path": CONFIG_PATH, "exists": True, "redacted": _redact_text(text)}
     except OSError as exc:
         return {"path": CONFIG_PATH, "exists": True, "error": str(exc)}
 
@@ -504,10 +541,15 @@ def install(argv: list[str] | None = None) -> int:
         sys.stdout.write(f"install FAIL: plist not found at {source} (set {PLIST_SOURCE_ENV} to point at one)\n")
         return 1
     agents_dir = _launch_agents_dir()
+    target = os.path.join(agents_dir, os.path.basename(source))
     try:
         os.makedirs(agents_dir, exist_ok=True)
-        target = os.path.join(agents_dir, os.path.basename(source))
-        shutil.copy2(source, target)
+        with open(source, encoding="utf-8") as f:
+            plist_text = f.read()
+        # launchd does not expand %h; render the real home directory so the
+        # installed agent's HOME/PATH/log/catalog paths are valid.
+        with open(target, "w", encoding="utf-8") as f:
+            f.write(plist_text.replace("%h", os.path.expanduser("~")))
         os.chmod(target, 0o644)
     except OSError as exc:
         sys.stdout.write(f"install FAIL: could not write {target}: {exc}\n")

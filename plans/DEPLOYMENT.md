@@ -30,7 +30,7 @@ ddce6d7 plan 013 menu bar /state contract + Swift Standard tier
    git fetch origin codex/0.2.0-parity-build
    git checkout live/0.2.0-fixed
    git merge --ff-only FETCH_HEAD   # or: git reset --hard origin/codex/0.2.0-parity-build
-   launchctl kickstart -k gui/$(id -u)/com.opencode.go.proxy
+   launchctl kickstart -k gui/$(id -u)/com.opencode-go.proxy
    Verify: curl -s http://127.0.0.1:8787/health ; curl -s http://127.0.0.1:8787/v1/models | wc -c
 2. Managed config (writes ~/.codex/config.toml, approval-gated):
    uv run python -m opencode_go_proxy config status   # dry look first
@@ -44,7 +44,7 @@ ddce6d7 plan 013 menu bar /state contract + Swift Standard tier
 Old code is at live/0.2.0-fixed HEAD 9bb411d. To revert:
    cd ~/Documents/Codex/2026-08-10/re/work/opencode-go-proxy
    git checkout live/0.2.0-fixed && git reset --hard 9bb411d
-   launchctl kickstart -k gui/$(id -u)/com.opencode.go.proxy
+   launchctl kickstart -k gui/$(id -u)/com.opencode-go.proxy
 Run `opencode-go-proxy config disable` if the managed block was enabled.
 
 ## Notes

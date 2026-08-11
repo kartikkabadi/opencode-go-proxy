@@ -88,3 +88,17 @@ Verification: 443 passed locally. Commit: (next)
 Verification: 444 passed locally; live e2e on 8790: health 200, WS+Origin
 426, chat passthrough relays upstream content-type, stream ends with [DONE].
 Commit: (next)
+
+### Step 4 - Review-driven fixes, batch 3 (ops security + install + doctor)
+
+- ops.py support-bundle: config snapshot now runs the full redactor (bearer,
+  sk- keys, private keys), not just key=value patterns (P1).
+- ops.py install: renders the launchd plist with the real home directory
+  instead of literal %h paths (P1), and computes the target path before the
+  write block so a failure reports cleanly (P2). Tests added.
+- ops.py doctor: check_config parses the root openai_base_url assignment
+  instead of grepping the whole file (P2); check_port probes the socket after
+  a failed health request to detect non-HTTP occupants (P2). Tests added.
+- plans/DEPLOYMENT.md: kickstart label corrected to com.opencode-go.proxy.
+
+Verification: 448 passed locally. Commit: (next)
