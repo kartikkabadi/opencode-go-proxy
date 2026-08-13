@@ -195,7 +195,7 @@ See the [lazycodex docs](https://github.com/code-yeongyu/oh-my-openagent) for se
 - Prefix caching: byte-stable request prefixes plus `include_usage`, with per-model hit ratio on `/cache`
 - Honest usage meter: append-only `usage-events.jsonl` in the state dir (truncated or empty responses never count as success)
 - Upstream retry with bounded exponential backoff on transient failures (429/5xx/network/timeout)
-- Ops CLI: `doctor` (reference-style checks with `--fix` for safe repairs), `smoke-test` (marker prompt through the local proxy), `support-bundle` (JSON schema v1, mode 0600), `install`/`setup` (launchd, gated on `--yes`) and `status`
+- Ops CLI: `doctor` (reference-style checks with `--fix` for safe repairs), `smoke-test` (marker prompt through the local proxy), `support-bundle` (JSON schema v1, mode 0600), `install` (points at the macOS menu bar app; no launchd agent), `install-skills`, `refresh-runtime`, and `status`
 - Spawned threads inherit the parent session's model (`create_thread`; `chatgptWorkCloud` targets are skipped)
 - Correctness contract: empty upstream completions are retried once (a second empty stream answers an `empty_completion` error), zero-input-token reports are estimated for compaction (`OPENCODE_GO_PROXY_ESTIMATE_ZERO_INPUT=0` disables), and keepalive comments run until the stream truly ends without interleaving into data frames
 - Auth transport guard (zero config): missing Host answers `400`, non-loopback Host answers `403` (unless `OPENCODE_GO_PROXY_ALLOW_REMOTE=1`), browser-originated requests (Origin / Referer / Sec-Fetch-Site) answer `403`, non-JSON POSTs answer `415`, and OPTIONS preflight stays blocked
@@ -340,19 +340,13 @@ uv sync
 uv run opencode-go-proxy --help
 ```
 
-### macOS (launchd)
+### macOS (menu bar)
 
-A launchd plist is included at `contrib/launchd/com.opencode-go.proxy.plist`.
-Copy it to `~/Library/LaunchAgents/` and load:
-
-```bash
-mkdir -p ~/Library/LaunchAgents ~/.codex/logs
-cp contrib/launchd/com.opencode-go.proxy.plist ~/Library/LaunchAgents/
-launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.opencode-go.proxy.plist
-```
-
-The proxy is designed for launchd's `KeepAlive` — it restarts on crash and
-starts at login. Logs go to `~/.codex/logs/opencode-go-proxy.{log,err}`.
+The supported way to run the proxy on macOS is the menu bar app in
+`macos/MenuBarApp`. Build it in Xcode (or `swift build`), launch it, and it
+spawns the proxy itself and shows status, quota, and today's usage. There is
+no launchd agent anymore: `contrib/launchd/` was removed in 0.3.0, and the
+`install` ops command points at the menu bar app instead of a plist.
 
 ## Configuration
 
@@ -374,8 +368,8 @@ The upstream base URL resolves in this order: the `--chat-base-url` flag, then `
 **One HTTP port only.** The proxy binds a single listener: `OPENCODE_GO_PROXY_PORT`
 (default `8787`). There is no admin port, control channel, or secondary service. If
 something else already listens on the port, the proxy fails to bind — check with
-`lsof -nP -iTCP:8787 -sTCP:LISTEN` before starting a second instance (for example, do
-not run the menu bar app's proxy and the launchd agent at the same time).
+`lsof -nP -iTCP:8787 -sTCP:LISTEN` before starting a second instance. The menu bar
+app refuses Start when 8787 is already owned.
 
 **Short provider name.** The long "opencode go/" label in the Codex model picker comes
 from the provider config in `~/.codex/config.toml`, not from this proxy. Shorten it by
@@ -414,12 +408,14 @@ All commands run as subcommands of the console script, for example `opencode-go-
   (version, generatedAt, env summary, redacted config snapshot, meter tail, log
   tail, catalog model count, doctor checks) to a mode-600 file. Secret-shaped
   values are redacted.
-- `install` / `setup --yes` - copies the launchd plist into `~/Library/LaunchAgents`
-  and loads the agent (macOS). The `--yes` flag is the explicit confirmation
-  gate; running it against the live agent is a deploy step, not part of this
-  build. Uninstall, update, and rollback are documented but not implemented.
+- `install` - prints how to run the macOS menu bar app (there is no launchd
+  agent in 0.3.0).
+- `install-skills` - copies the checked-in `opencode-go-proxy` skill into
+  `~/.codex/skills/`.
+- `refresh-runtime [--force]` - re-runs native model capture and re-renders
+  the merged catalog; the menu bar's Refresh Catalog calls this.
 - `status [--json]` - reports whether the proxy is running, who owns the port,
-  launchd state, and where logs live.
+  and where logs live.
 
 ## Model catalog
 
@@ -453,6 +449,20 @@ The catalog ships with the `ModelsCache` wrapper (`fetched_at`/`etag`/`client_ve
 Codex 0.142+ desktop app requires all four top-level fields — a bare `{"models": [...]}` catalog
 causes the model picker to fall back to "Custom" instead of showing the full list. The CLI
 (`codex debug models`) tolerates the bare format, so this only surfaces in the desktop app.
+
+### Native models and merged catalog
+
+The proxy also captures the models your logged-in Codex account can use
+(`codex debug models`), filters out every `opencode-go/` slug, and merges
+them with the OpenCode Go catalog into `merged-models.json` in the state dir.
+`/v1/models` serves the merged catalog: the app's model picker shows official
+GPT models and custom models side by side, with official OAuth untouched.
+
+Routing is by model: a slug in the captured native set goes verbatim to
+`https://chatgpt.com/backend-api/codex` (override with
+`OPENCODE_GO_PROXY_NATIVE_BASE_URL`), anything else goes through the normal
+translation to OpenCode Go. Run `refresh-runtime` after logging in or out of
+an account to recapture.
 
 ### Local model overlay
 
