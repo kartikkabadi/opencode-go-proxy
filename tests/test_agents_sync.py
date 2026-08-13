@@ -56,7 +56,9 @@ class TestSyncAgents:
         assert parsed["name"] == "router_opencode_go_deepseek-v4-flash"
         assert parsed["model_provider"] == "opencode-go"
         assert parsed["model"] == "opencode-go/deepseek-v4-flash"
-        assert agents_sync.OWNERSHIP_MARKER in open(first, encoding="utf-8").read()
+        with open(first, encoding="utf-8") as handle:
+            text = handle.read()
+        assert agents_sync.OWNERSHIP_MARKER in text
 
     def test_second_sync_is_idempotent(self, agents_dir) -> None:
         _write_compact(_state_dir(), ["deepseek-v4-flash"])
