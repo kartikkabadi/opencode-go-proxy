@@ -10,6 +10,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var resetLabel: NSMenuItem!
     private var todayLabel: NSMenuItem!
     private var modelLabel: NSMenuItem!
+    private var catalogLabel: NSMenuItem!
+    private var refreshCatalogItem: NSMenuItem!
+    private var configLabel: NSMenuItem!
+    private var configToggleItem: NSMenuItem!
     private var usageBarItems: [NSMenuItem] = []
     private var toggleItem: NSMenuItem!
     private var timer: Timer?
@@ -48,9 +52,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         proxy.onStateChange = { [weak self] in self?.refresh() }
         refresh()
+        proxy.refreshConfigStatus()
         timer = Timer.scheduledTimer(withTimeInterval: 3.0, repeats: true) { [weak self] _ in
             self?.proxy.refreshHealth()
             self?.proxy.refreshState()
+            self?.proxy.refreshCatalogCount()
+            self?.proxy.refreshConfigStatus()
         }
         timer?.tolerance = 1.0
     }
@@ -111,6 +118,34 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         menu.addItem(.separator())
 
+        let catalogSection = NSMenuItem(title: "Catalog", action: nil, keyEquivalent: "")
+        catalogSection.isEnabled = false
+        menu.addItem(catalogSection)
+
+        catalogLabel = NSMenuItem(title: "", action: nil, keyEquivalent: "")
+        catalogLabel.isEnabled = false
+        menu.addItem(catalogLabel)
+
+        refreshCatalogItem = NSMenuItem(title: "Refresh Catalog", action: #selector(refreshCatalog), keyEquivalent: "")
+        refreshCatalogItem.target = self
+        menu.addItem(refreshCatalogItem)
+
+        menu.addItem(.separator())
+
+        let configSection = NSMenuItem(title: "Config", action: nil, keyEquivalent: "")
+        configSection.isEnabled = false
+        menu.addItem(configSection)
+
+        configLabel = NSMenuItem(title: "", action: nil, keyEquivalent: "")
+        configLabel.isEnabled = false
+        menu.addItem(configLabel)
+
+        configToggleItem = NSMenuItem(title: "Enable Config", action: #selector(toggleConfig), keyEquivalent: "")
+        configToggleItem.target = self
+        menu.addItem(configToggleItem)
+
+        menu.addItem(.separator())
+
         toggleItem = NSMenuItem(title: "Start Proxy", action: #selector(toggleProxy), keyEquivalent: "")
         toggleItem.target = self
         menu.addItem(toggleItem)
@@ -168,6 +203,30 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         if let modelLabel {
             modelLabel.title = "Model \(serverState?.model ?? "—")"
+        }
+        if let catalogLabel {
+            if let count = proxy.catalogCount {
+                catalogLabel.title = count == 1 ? "1 model" : "\(count) models"
+            } else {
+                catalogLabel.title = "—"
+            }
+        }
+        if let refreshCatalogItem {
+            refreshCatalogItem.isEnabled = state.isRunning && !proxy.isCLIRunning
+        }
+        if let configLabel {
+            switch proxy.configEnabled {
+            case .some(true):
+                configLabel.title = "Config enabled"
+            case .some(false):
+                configLabel.title = "Config disabled"
+            case .none:
+                configLabel.title = "Config —"
+            }
+        }
+        if let configToggleItem {
+            configToggleItem.title = proxy.configEnabled == true ? "Disable Config" : "Enable Config"
+            configToggleItem.isEnabled = proxy.configEnabled != nil && !proxy.isCLIRunning
         }
         updateUsageBars(serverState?.usage)
         if let toggleItem {
@@ -247,6 +306,28 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             proxy.start()
         }
         refresh()
+    }
+
+    @objc private func refreshCatalog() {
+        proxy.refreshCatalog { [weak self] result in
+            self?.refresh()
+            guard let message = result.message else { return }
+            if result.succeeded {
+                self?.proxy.presentError("Catalog refreshed, but \(message)")
+            } else {
+                self?.proxy.presentError(message)
+            }
+        }
+    }
+
+    @objc private func toggleConfig() {
+        let enabled = proxy.configEnabled != true
+        proxy.setConfigEnabled(enabled) { [weak self] result in
+            self?.refresh()
+            if !result.succeeded, let message = result.message {
+                self?.proxy.presentError(message)
+            }
+        }
     }
 
     @objc private func openLogs() {
