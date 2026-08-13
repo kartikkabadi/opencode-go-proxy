@@ -4,8 +4,7 @@ import json
 import os
 from unittest import mock
 
-from opencode_go_proxy import catalog
-from opencode_go_proxy import native_models
+from opencode_go_proxy import catalog, native_models
 from opencode_go_proxy.meter import state_dir
 
 NATIVE_FIXTURE = {
@@ -79,7 +78,8 @@ def test_capture_runs_fake_codex_and_writes_snapshot(tmp_path) -> None:
     assert snapshot["captured_with"] == "codex-cli 0.146.0-test"
     assert snapshot["captured_at"]
 
-    saved = json.load(open(native_models.native_models_path()))
+    with open(native_models.native_models_path(), encoding="utf-8") as fh:
+        saved = json.load(fh)
     luna = saved["models"][0]
     assert luna["slug"] == "gpt-5.6-luna"
     assert luna["multi_agent_version"] == "v1"

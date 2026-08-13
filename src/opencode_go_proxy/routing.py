@@ -50,6 +50,7 @@ def native_model_slugs() -> set[str]:
     # Prefixed slugs are never native; the filter also covers stale snapshots
     # captured before native_models._native_only() existed.
     slugs = frozenset(s for s in native_slugs(load_native_capture()) if "/" not in s) if mtime is not None else frozenset()
+    _NATIVE_SLUGS_CACHE = (path, mtime, slugs)
     return set(slugs)
 
 

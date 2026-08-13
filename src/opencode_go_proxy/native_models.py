@@ -15,6 +15,7 @@ import sys
 import tempfile
 from typing import Any
 
+from . import catalog
 from .meter import state_dir
 from .trace import trace
 
@@ -65,7 +66,7 @@ def resolve_codex_bin() -> str:
 def _run(bin_path: str, args: list[str]) -> str:
     try:
         completed = subprocess.run(
-            [bin_path, *args], capture_output=True, text=True, timeout=NATIVE_CAPTURE_TIMEOUT_SEC
+            [bin_path, *args], capture_output=True, text=True, timeout=NATIVE_CAPTURE_TIMEOUT_SEC, check=False
         )
     except (OSError, subprocess.SubprocessError) as exc:
         raise NativeCaptureError(f"failed to run {bin_path}: {exc}") from exc
@@ -107,11 +108,8 @@ def _parse_models(raw: str) -> list[Json]:
 
 def _exclude_opencode_go_slugs(slugs: set[str]) -> set[str]:
     """Drop every slug that belongs to the opencode-go catalog, prefixed or not."""
-    from opencode_go_proxy import catalog as _catalog  # safe: catalog never imports this module
-
-    known = set(_catalog.load_known_slugs())
+    known = set(catalog.load_known_slugs())
     return {s for s in slugs if "/" not in s and s not in known}
-
 
 def _native_only(models: list[Json]) -> list[Json]:
     """Drop provider-prefixed and opencode-go slugs from the capture.

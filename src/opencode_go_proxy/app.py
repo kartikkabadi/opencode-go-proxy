@@ -479,7 +479,7 @@ def main(argv: list[str] | None = None) -> None:
 
         sys.exit(native_models.native_capture_cmd(args_list[1:]))
     if args_list and args_list[0] == "refresh-runtime":
-        from . import native_models, catalog
+        from . import catalog, native_models
 
         # The menu bar's Refresh Catalog: re-capture the native set, then
         # force a runtime render under the state dir (the catalog the proxy

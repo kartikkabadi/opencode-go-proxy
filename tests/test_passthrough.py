@@ -8,22 +8,22 @@ import socket
 import threading
 from http.client import HTTPConnection
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from typing import ClassVar
 from unittest import mock
 
 import pytest
 
 from opencode_go_proxy import passthrough
-from opencode_go_proxy.app import ResponsesProxyHandler, ProxyConfig
+from opencode_go_proxy.app import ProxyConfig, ResponsesProxyHandler
 from opencode_go_proxy.meter import state_dir, usage_events_path
 from opencode_go_proxy.passthrough import relay_native_request
 
 
 class _FakeChatGpt(BaseHTTPRequestHandler):
     """Fake chatgpt.com backend: records requests, serves json/sse/error."""
-
+    captured: ClassVar[list[dict]] = []
     mode = "json"
     status = 200
-    captured: list[dict] = []
 
     def log_message(self, *args) -> None:
         pass
