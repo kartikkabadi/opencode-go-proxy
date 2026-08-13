@@ -71,6 +71,13 @@ class RouteTargetTests(unittest.TestCase):
         self.assertEqual(route_target("opencode-go/deepseek-v4-flash"), "opencode_go")
         self.assertEqual(route_target("deepseek-v4-flash"), "opencode_go")
 
+    def test_prefixed_slug_wins_over_bare_native_collision(self) -> None:
+        # A user-selected opencode-go/<slug> whose bare slug is a native model
+        # must stay on the translation path: its Authorization header must
+        # never reach the native backend.
+        _write_native_capture(["gpt-5.6-luna"])
+        self.assertEqual(route_target("opencode-go/gpt-5.6-luna"), "opencode_go")
+
     def test_capture_update_picked_up_by_mtime(self) -> None:
         path = _write_native_capture(["gpt-5.6-luna"])
         self.assertEqual(route_target("gpt-5.6-luna"), "native")

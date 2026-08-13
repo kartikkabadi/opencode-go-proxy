@@ -2,9 +2,9 @@
 
 Native membership comes from the state-dir native-models.json snapshot
 (native_models.capture_native_models); every other slug routes to the
-opencode-go translation path. The opencode-go/<slug> prefix is stripped
-before membership is tested so the app's own prefixed model references can
-never be hijacked into native routing.
+opencode-go translation path. An explicit ``opencode-go/<slug>`` prefix
+always wins, even when the bare slug matches a native model: the user chose
+the routed provider, and that request must never reach the native backend.
 """
 
 from __future__ import annotations
@@ -55,7 +55,9 @@ def native_model_slugs() -> set[str]:
 
 
 def route_target(slug: str, native_slugs: set[str] | None = None) -> RouteTarget:
-    """Route by native-set membership on the normalized slug; else opencode_go."""
+    """Prefixed slugs are always opencode_go; bare slugs test native membership."""
+    if slug.startswith(OPENCODE_GO_PREFIX):
+        return "opencode_go"
     if native_slugs is None:
         native_slugs = native_model_slugs()
-    return "native" if normalize_model_slug(slug) in native_slugs else "opencode_go"
+    return "native" if slug in native_slugs else "opencode_go"
