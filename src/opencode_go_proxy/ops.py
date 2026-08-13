@@ -6,10 +6,9 @@ upstream; `--fix` repairs only what is safe without writing config.toml (log
 and meter directories, catalog render). `smoke-test` sends one marker prompt
 through the local proxy and asserts the marker comes back. `support-bundle`
 writes the JSON schema v1 diagnostic bundle with secret-shaped values
-redacted. `install` copies the launchd plist and loads the agent (macOS only,
-requires --yes); `status` reports running/port/log paths. Uninstall, update,
-and rollback are documented, not implemented, because they touch the live
-agent and stay approval-gated.
+redacted. `install` points at the macOS menu bar app (no launchd agent);
+`install-skills` copies the checked-in skill into ~/.codex/skills; `status`
+reports running/port/log paths.
 """
 
 from __future__ import annotations
@@ -22,6 +21,7 @@ import re
 import socket
 import subprocess
 import sys
+import tempfile
 import time
 import urllib.error
 import urllib.parse
@@ -47,9 +47,10 @@ PROXY_BASE_URL_ENV = "OPENCODE_GO_PROXY_BASE_URL"
 DEFAULT_PROXY_BASE_URL = f"http://{DEFAULT_HOST}:{DEFAULT_PORT}"
 SMOKE_MARKER = "OPENCODE_GO_SMOKE_OK"
 
-LAUNCHD_LABEL = "com.opencode-go.proxy"
-LAUNCH_AGENTS_DIR_ENV = "OPENCODE_GO_PROXY_LAUNCH_AGENTS_DIR"
-PLIST_SOURCE_ENV = "OPENCODE_GO_PROXY_PLIST_SOURCE"
+SKILLS_DIR_ENV = "OPENCODE_GO_PROXY_SKILLS_DIR"
+DEFAULT_SKILLS_DIR = os.path.join(os.path.expanduser("~"), ".codex", "skills")
+SKILL_SOURCE_ENV = "OPENCODE_GO_PROXY_SKILL_SOURCE"
+SKILL_MARKER = "<!-- managed by opencode-go-proxy -->"
 
 _LOG_NAMES = ("opencode-go-proxy.log", "opencode-go-proxy.err")
 
@@ -148,7 +149,7 @@ def check_config() -> Check:
         parsed = urllib.parse.urlparse(base_url)
         if parsed.hostname in ("127.0.0.1", "localhost", "::1") and parsed.port == DEFAULT_PORT:
             return Check("config", "ok", f"openai_base_url points at {base_url}")
-    return Check("config", "fail", f"root openai_base_url must point at http://{DEFAULT_HOST}:{DEFAULT_PORT}", fix="Run the config-manager enable step (plan 012) once it ships.")
+    return Check("config", "fail", f"root openai_base_url must point at http://{DEFAULT_HOST}:{DEFAULT_PORT}", fix="Run `opencode-go-proxy config enable` to point Codex at the proxy.")
 
 
 def _catalog_models() -> tuple[str, list[Json]]:
@@ -223,7 +224,7 @@ def check_service(url: str = HEALTH_URL) -> Check:
         with urllib.request.urlopen(url, timeout=3) as resp:
             return Check("service", "ok", f"health {resp.status} on {url}")
     except (urllib.error.URLError, OSError, ValueError) as exc:
-        return Check("service", "fail", f"not reachable on {url}: {exc}", fix="Start the proxy (install/status), then rerun doctor.")
+        return Check("service", "fail", f"not reachable on {url}: {exc}", fix="Start the proxy from the menu bar app, then rerun doctor.")
 
 
 def check_meter() -> Check:
@@ -525,61 +526,77 @@ def support_bundle(argv: list[str] | None = None) -> int:
     return 0
 
 
-def _launch_agents_dir() -> str:
-    return os.environ.get(LAUNCH_AGENTS_DIR_ENV) or os.path.join(os.path.expanduser("~"), "Library", "LaunchAgents")
+def install(argv: list[str] | None = None) -> int:
+    """Point at the menu bar app; macOS no longer uses a launchd agent."""
+    sys.stdout.write("install: run the proxy from the macOS menu bar app (no launchd agent); Linux uses contrib/systemd/opencode-go-proxy.service.\n")
+    return 0
 
 
-def _plist_source() -> str:
-    env = os.environ.get(PLIST_SOURCE_ENV)
+def _skills_dir() -> str:
+    return os.environ.get(SKILLS_DIR_ENV) or DEFAULT_SKILLS_DIR
+
+
+def _skill_source() -> str:
+    env = os.environ.get(SKILL_SOURCE_ENV)
     if env:
         return env
-    return os.path.join(_repo_root(), "contrib", "launchd", "com.opencode-go.proxy.plist")
+    return os.path.join(_repo_root(), "skills", "opencode-go-proxy", "SKILL.md")
 
 
-def _launchd_loaded() -> bool:
+def _with_skill_marker(text: str) -> str:
+    """Insert the ownership marker after the YAML frontmatter, if any."""
+    lines = text.splitlines()
+    if lines and lines[0].strip() == "---":
+        for index in range(1, len(lines)):
+            if lines[index].strip() == "---":
+                lines.insert(index + 1, SKILL_MARKER)
+                return "\n".join(lines) + "\n"
+    return SKILL_MARKER + "\n" + text
+
+
+def _atomic_write_text(path: str, contents: str) -> None:
+    directory = os.path.dirname(path) or "."
+    os.makedirs(directory, exist_ok=True)
+    fd, temporary = tempfile.mkstemp(prefix=f".{os.path.basename(path)}.", suffix=".tmp", dir=directory)
     try:
-        completed = subprocess.run(["launchctl", "list", LAUNCHD_LABEL], capture_output=True, text=True, timeout=10, check=False)
-        return completed.returncode == 0
-    except (OSError, subprocess.TimeoutExpired):
-        return False
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(contents)
+        os.replace(temporary, path)
+    except BaseException:
+        try:
+            os.unlink(temporary)
+        except OSError:
+            pass
+        raise
 
 
-def install(argv: list[str] | None = None) -> int:
-    """Install the launchd agent (macOS only). Requires --yes; loads via launchctl."""
+def install_skills(argv: list[str] | None = None) -> int:
+    """Copy skills/opencode-go-proxy/SKILL.md into ~/.codex/skills with the ownership marker."""
     argv = argv or []
-    if platform.system() != "Darwin":
-        sys.stdout.write("install is macOS-only (launchd); Linux uses contrib/systemd/opencode-go-proxy.service.\n")
-        return 1
-    if "--yes" not in argv:
-        sys.stdout.write("install would copy the launchd plist into ~/Library/LaunchAgents and load the agent; re-run with --yes to confirm.\n")
-        return 2
-    source = _plist_source()
+    dry_run = "--dry-run" in argv
+    source = _skill_source()
+    target = os.path.join(_skills_dir(), "opencode-go-proxy", "SKILL.md")
+    if dry_run:
+        sys.stdout.write(target + "\n")
+        return 0
     if not os.path.exists(source):
-        sys.stdout.write(f"install FAIL: plist not found at {source} (set {PLIST_SOURCE_ENV} to point at one)\n")
+        sys.stdout.write(f"install-skills FAIL: SKILL.md not found at {source}\n")
         return 1
-    agents_dir = _launch_agents_dir()
-    target = os.path.join(agents_dir, os.path.basename(source))
     try:
-        os.makedirs(agents_dir, exist_ok=True)
-        with open(source, encoding="utf-8") as f:
-            plist_text = f.read()
-        # launchd does not expand %h; render the real home directory so the
-        # installed agent's HOME/PATH/log/catalog paths are valid.
-        with open(target, "w", encoding="utf-8") as f:
-            f.write(plist_text.replace("%h", os.path.expanduser("~")))
-        os.chmod(target, 0o644)
+        with open(source, encoding="utf-8") as handle:
+            text = handle.read()
     except OSError as exc:
-        sys.stdout.write(f"install FAIL: could not write {target}: {exc}\n")
+        sys.stdout.write(f"install-skills FAIL: cannot read {source}: {exc}\n")
         return 1
-    if _launchd_loaded():
-        sys.stdout.write(f"install OK: {target} copied; agent already loaded\n")
-        return 0
-    completed = subprocess.run(["launchctl", "bootstrap", f"gui/{os.getuid()}", target], capture_output=True, text=True, timeout=30, check=False)
-    if completed.returncode == 0:
-        sys.stdout.write(f"install OK: {target} copied and loaded\n")
-        return 0
-    sys.stdout.write(f"install FAIL: launchctl bootstrap exited {completed.returncode}: {(completed.stderr or completed.stdout or '').strip()}\n")
-    return 1
+    if SKILL_MARKER not in text:
+        text = _with_skill_marker(text)
+    try:
+        _atomic_write_text(target, text)
+    except OSError as exc:
+        sys.stdout.write(f"install-skills FAIL: cannot write {target}: {exc}\n")
+        return 1
+    sys.stdout.write(f"install-skills OK: {target}\n")
+    return 0
 
 
 def status(argv: list[str] | None = None) -> int:
@@ -588,13 +605,11 @@ def status(argv: list[str] | None = None) -> int:
     service = check_service()
     port = check_port()
     log_files = [n for n in _LOG_NAMES if os.path.exists(os.path.join(LOG_DIR, n))]
-    loaded = _launchd_loaded()
     state: Json = {
         "running": service.ok,
         "port": DEFAULT_PORT,
         "service": service.detail,
         "portState": port.detail,
-        "launchd": {"label": LAUNCHD_LABEL, "loaded": loaded},
         "logs": {"dir": LOG_DIR, "files": log_files},
     }
     if "--json" in argv:
@@ -602,7 +617,6 @@ def status(argv: list[str] | None = None) -> int:
     else:
         sys.stdout.write(f"proxy: {'running' if service.ok else 'stopped'} ({service.detail})\n")
         sys.stdout.write(f"port: {port.detail}\n")
-        sys.stdout.write(f"launchd: {'loaded' if loaded else 'not loaded'} ({LAUNCHD_LABEL})\n")
         sys.stdout.write(f"logs: {LOG_DIR}\n")
         for name in log_files:
             sys.stdout.write(f"  {name}\n")

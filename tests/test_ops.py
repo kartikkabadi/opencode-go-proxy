@@ -327,57 +327,41 @@ class TestSupportBundle:
 
 
 class TestInstall:
-    def test_non_macos(self, capsys) -> None:
-        with mock.patch("opencode_go_proxy.ops.platform.system", return_value="Linux"):
-            assert ops.install([]) == 1
-        assert "macOS-only" in capsys.readouterr().out
+    def test_points_at_menu_bar_app(self, capsys) -> None:
+        assert ops.install([]) == 0
+        assert "menu bar" in capsys.readouterr().out
 
-    def test_requires_confirmation(self, capsys) -> None:
-        with mock.patch("opencode_go_proxy.ops.subprocess.run") as run, mock.patch(
-            "opencode_go_proxy.ops.platform.system", return_value="Darwin"
-        ):
-            assert ops.install([]) == 2
-        run.assert_not_called()
-        assert "--yes" in capsys.readouterr().out
 
-    def test_copies_and_loads(self, tmp_path) -> None:
-        agents = tmp_path / "LaunchAgents"
-        plist = tmp_path / "com.opencode-go.proxy.plist"
-        plist.write_text("<plist/>")
-        loaded = False
+class TestInstallSkills:
+    def test_dry_run_prints_target(self, tmp_path, capsys) -> None:
+        with mock.patch.dict(os.environ, {"OPENCODE_GO_PROXY_SKILLS_DIR": str(tmp_path / "skills")}):
+            assert ops.install_skills(["--dry-run"]) == 0
+        out = capsys.readouterr().out
+        assert out == str(tmp_path / "skills" / "opencode-go-proxy" / "SKILL.md") + "\n"
+        assert not (tmp_path / "skills").exists()
 
-        def fake_run(cmd, *a, **kw):
-            if cmd[:2] == ["launchctl", "list"]:
-                return mock.Mock(returncode=1)
-            assert cmd[:2] == ["launchctl", "bootstrap"]
-            return mock.Mock(returncode=0, stdout="", stderr="")
-
+    def test_installs_with_marker(self, tmp_path) -> None:
+        source = tmp_path / "SKILL.md"
+        source.write_text("---\nname: opencode-go-proxy\n---\n\nBody text.\n")
+        target = tmp_path / "skills" / "opencode-go-proxy" / "SKILL.md"
         with mock.patch.dict(os.environ, {
-            "OPENCODE_GO_PROXY_LAUNCH_AGENTS_DIR": str(agents),
-            "OPENCODE_GO_PROXY_PLIST_SOURCE": str(plist),
-        }), mock.patch("opencode_go_proxy.ops.subprocess.run", side_effect=fake_run), mock.patch(
-            "opencode_go_proxy.ops.platform.system", return_value="Darwin"
-        ):
-            assert ops.install(["--yes"]) == 0
-        assert (agents / "com.opencode-go.proxy.plist").exists()
-        assert loaded is False
+            "OPENCODE_GO_PROXY_SKILLS_DIR": str(tmp_path / "skills"),
+            "OPENCODE_GO_PROXY_SKILL_SOURCE": str(source),
+        }):
+            assert ops.install_skills([]) == 0
+            assert ops.install_skills([]) == 0
+        text = target.read_text()
+        assert text.count(ops.SKILL_MARKER) == 1
+        assert text.startswith("---\nname: opencode-go-proxy\n---\n")
+        assert "Body text." in text
 
-    def test_already_loaded(self, tmp_path) -> None:
-        agents = tmp_path / "LaunchAgents"
-        plist = tmp_path / "com.opencode-go.proxy.plist"
-        plist.write_text("<plist/>")
-
-        def fake_run(cmd, *a, **kw):
-            return mock.Mock(returncode=0, stdout="", stderr="")
-
+    def test_missing_source_fails(self, tmp_path, capsys) -> None:
         with mock.patch.dict(os.environ, {
-            "OPENCODE_GO_PROXY_LAUNCH_AGENTS_DIR": str(agents),
-            "OPENCODE_GO_PROXY_PLIST_SOURCE": str(plist),
-        }), mock.patch("opencode_go_proxy.ops.subprocess.run", side_effect=fake_run), mock.patch(
-            "opencode_go_proxy.ops.platform.system", return_value="Darwin"
-        ):
-            assert ops.install(["--yes"]) == 0
-        assert (agents / "com.opencode-go.proxy.plist").exists()
+            "OPENCODE_GO_PROXY_SKILLS_DIR": str(tmp_path / "skills"),
+            "OPENCODE_GO_PROXY_SKILL_SOURCE": str(tmp_path / "missing.md"),
+        }):
+            assert ops.install_skills([]) == 1
+        assert "not found" in capsys.readouterr().out
 
 
 class TestStatus:
@@ -387,33 +371,16 @@ class TestStatus:
         (log_dir / "opencode-go-proxy.log").write_text("x\n")
         with mock.patch.object(ops, "LOG_DIR", str(log_dir)), \
              mock.patch.object(ops, "check_service", return_value=ops.Check("service", "ok", "health 200 on http://127.0.0.1:8787/health")), \
-             mock.patch.object(ops, "check_port", return_value=ops.Check("port", "ok", "owned by proxy")), \
-             mock.patch.object(ops, "_launchd_loaded", return_value=True):
+             mock.patch.object(ops, "check_port", return_value=ops.Check("port", "ok", "owned by proxy")):
             assert ops.status(["--json"]) == 0
         state = json.loads(capsys.readouterr().out)
         assert state["running"] is True
         assert state["port"] == 8787
-        assert state["launchd"]["loaded"] is True
+        assert "launchd" not in state
         assert state["logs"]["files"] == ["opencode-go-proxy.log"]
 
 
 class TestReviewFixups:
-    def test_install_renders_home_not_percent_h(self, tmp_path) -> None:
-        agents = tmp_path / "LaunchAgents"
-        plist = tmp_path / "com.opencode-go.proxy.plist"
-        plist.write_text("<plist/>\n<key>HOME</key><string>%h</string>\n")
-        with mock.patch.dict(os.environ, {
-            "OPENCODE_GO_PROXY_LAUNCH_AGENTS_DIR": str(agents),
-            "OPENCODE_GO_PROXY_PLIST_SOURCE": str(plist),
-            "HOME": str(tmp_path),
-        }), mock.patch("opencode_go_proxy.ops.platform.system", return_value="Darwin"), mock.patch(
-            "opencode_go_proxy.ops.subprocess.run", return_value=mock.Mock(returncode=0, stdout="", stderr="")
-        ):
-            assert ops.install(["--yes"]) == 0
-        rendered = (agents / "com.opencode-go.proxy.plist").read_text()
-        assert "%h" not in rendered
-        assert str(tmp_path) in rendered
-
     def test_support_bundle_redacts_bearer_under_generic_key(self, tmp_path) -> None:
         # config values shaped like bearer credentials must not survive the bundle
         config = tmp_path / "config.toml"

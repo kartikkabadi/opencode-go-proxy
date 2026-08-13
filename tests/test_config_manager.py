@@ -20,6 +20,18 @@ def cfg_path(tmp_path, monkeypatch) -> str:
     return path
 
 
+@pytest.fixture(autouse=True)
+def fake_codex_bin(tmp_path, monkeypatch) -> str:
+    """Point OPENCODE_GO_PROXY_CODEX_BIN at a script that accepts multi_agent_v2."""
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    codex = bin_dir / "codex"
+    codex.write_text("#!/bin/sh\nexit 0\n")
+    codex.chmod(0o755)
+    monkeypatch.setenv("OPENCODE_GO_PROXY_CODEX_BIN", str(codex))
+    return str(codex)
+
+
 def _read(path: str) -> str:
     with open(path, encoding="utf-8") as handle:
         return handle.read()
@@ -37,6 +49,47 @@ class TestEnable:
         assert config_manager.REALTIME_CALL_KEY in text
         assert config_manager.REALTIME_WS_KEY in text
         assert text.strip().endswith(config_manager.END_MARKER)
+
+    def test_writes_multi_agent_v2_and_provider_block(self, cfg_path) -> None:
+        report = config_manager.enable()
+        assert report["multi_agent_v2"] is True
+        text = _read(cfg_path)
+        assert "[features.multi_agent_v2]" in text
+        assert "enabled = true" in text
+        assert "[model_providers.opencode-go]" in text
+        assert f"base_url = {json.dumps(config_manager.managed_base_url())}" in text
+        assert 'wire_api = "responses"' in text
+
+    def test_omits_feature_block_when_probe_fails(self, cfg_path, tmp_path, monkeypatch) -> None:
+        bin_dir = tmp_path / "bin-fail"
+        bin_dir.mkdir()
+        codex = bin_dir / "codex"
+        codex.write_text("#!/bin/sh\nexit 1\n")
+        codex.chmod(0o755)
+        monkeypatch.setenv("OPENCODE_GO_PROXY_CODEX_BIN", str(codex))
+        report = config_manager.enable()
+        assert report["multi_agent_v2"] is False
+        text = _read(cfg_path)
+        assert "[features.multi_agent_v2]" not in text
+        assert "[model_providers.opencode-go]" in text
+
+    def test_skips_feature_block_when_user_configures_it(self, cfg_path) -> None:
+        with open(cfg_path, "w", encoding="utf-8") as handle:
+            handle.write("multi_agent_v2 = { enabled = true }\n")
+        config_manager.enable()
+        text = _read(cfg_path)
+        assert "[features.multi_agent_v2]" not in text
+
+    def test_omits_provider_keys_user_owns(self, cfg_path) -> None:
+        user = '[model_providers.opencode-go]\nbase_url = "https://user.example/v1"\nwire_api = "responses"\n'
+        with open(cfg_path, "w", encoding="utf-8") as handle:
+            handle.write(user)
+        config_manager.enable()
+        text = _read(cfg_path)
+        assert text.count("[model_providers.opencode-go]") == 1
+        provider_section = text.split("[model_providers.opencode-go]", 1)[1]
+        assert 'base_url = "https://user.example/v1"' in provider_section
+        assert "8787" not in provider_section
 
     def test_creates_parent_dir_and_mode_600(self, tmp_path, monkeypatch) -> None:
         nested = tmp_path / "codex" / "config.toml"
@@ -172,6 +225,8 @@ class TestStatus:
         assert report["managed"] is True
         assert report["openai_base_url"] == config_manager.managed_base_url()
         assert report["model_catalog_json"] == config_manager.managed_catalog_path()
+        assert report["multi_agent_v2"] is True
+        assert report["provider_block"] is True
         assert config_manager.REALTIME_CALL_KEY in report["voice_keys_managed"]
         assert report["voice_keys_user_owned"] == []
 
@@ -211,12 +266,16 @@ class TestCli:
 
 
 class TestNoDuplicateKeys:
-    def test_enable_with_matching_user_values_has_no_duplicate_keys(self, tmp_path) -> None:
+    def test_enable_with_matching_user_values_has_no_duplicate_keys(self, tmp_path, fake_codex_bin) -> None:
         path = tmp_path / "config.toml"
         state = tmp_path / "state"
         with mock.patch.dict(
             os.environ,
-            {"OPENCODE_GO_PROXY_CONFIG_PATH": str(path), "OPENCODE_GO_PROXY_STATE_DIR": str(state)},
+            {
+                "OPENCODE_GO_PROXY_CONFIG_PATH": str(path),
+                "OPENCODE_GO_PROXY_STATE_DIR": str(state),
+                "OPENCODE_GO_PROXY_CODEX_BIN": fake_codex_bin,
+            },
             clear=True,
         ):
             base_url = config_manager.managed_base_url()
