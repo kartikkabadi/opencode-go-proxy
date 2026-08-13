@@ -147,6 +147,8 @@ def capture_codex_app_tools() -> list[Json] | None:
     back to the last snapshot or the checked-in contrib file.
     """
     binary = _resolve_codex_bin()
+    if not binary:
+        return None
     try:
         completed = subprocess.run(
             [binary, "debug", "prompt-input"],
