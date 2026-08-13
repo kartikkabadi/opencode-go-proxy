@@ -470,10 +470,15 @@ class TestGracefulShutdown:
                 proc.wait(timeout=5)
 
 
-class TestAliasMap:
-    def test_gpt_alias_maps_to_deepseek(self, server):
+class TestUnknownSlugFallback:
+    def test_native_slug_without_capture_falls_back_to_default_model(self, server):
+        # The old gpt-* -> deepseek alias hijack is gone. Without a native
+        # capture the native set is empty, so the slug routes to OpenCode Go
+        # and the unknown-slug fallback picks DEFAULT_MODEL. With a native
+        # capture this request would never reach translation (native
+        # pass-through); test_passthrough.py covers that path.
         port, _ = server
-        mock_resp = mock_chat_response("ok", model="deepseek-v4-pro")
+        mock_resp = mock_chat_response("ok", model="deepseek-v4-flash")
 
         with mock.patch.dict(os.environ, {"OPENCODE_GO_API_KEY": "test-key"}), mock.patch("urllib.request.urlopen", return_value=MockUpstreamResponse(json.dumps(mock_resp).encode())) as mock_urlopen:
             conn = HTTPConnection("127.0.0.1", port, timeout=5)
@@ -486,7 +491,7 @@ class TestAliasMap:
 
         assert resp.status == 200
         sent_payload = json.loads(mock_urlopen.call_args[0][0].data)
-        assert sent_payload["model"] == "deepseek-v4-pro"
+        assert sent_payload["model"] == "deepseek-v4-flash"
 
 
 class TestToolCallRoundTrip:

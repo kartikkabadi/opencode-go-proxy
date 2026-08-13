@@ -5,14 +5,27 @@ config.toml:
 
     # BEGIN opencode-go-proxy-managed
     openai_base_url = "http://127.0.0.1:8787/v1"
-    model_catalog_json = "~/.codex/opencode-go-proxy/opencode-go-catalog.json"
+    model_catalog_json = "~/.codex/opencode-go-proxy/merged-models.json"
+    experimental_realtime_webrtc_call_base_url = "https://chatgpt.com/backend-api/codex"
+    experimental_realtime_ws_base_url = "https://api.openai.com/v1"
+
+    [features.multi_agent_v2]
+    enabled = true
+
+    [model_providers.opencode-go]
+    base_url = "http://127.0.0.1:8787/v1"
+    wire_api = "responses"
     # END opencode-go-proxy-managed
 
-Semantics mirror codex-router's config-manager: enable never replaces a
-user-owned openai_base_url or model_catalog_json, disable removes only the
-managed block (and the file when the block was its only content), and the
-Codex Voice realtime keys are added only when the user has not set them, so
-Voice keeps talking to Codex's native endpoints.
+The multi_agent_v2 feature block is written only when the installed codex
+binary accepts the flag (probed via `codex debug prompt-input --enable
+multi_agent_v2`); the provider block omits keys the user already sets in
+their own [model_providers.opencode-go] table. Semantics mirror codex-router's
+config-manager: enable never replaces a user-owned openai_base_url or
+model_catalog_json, disable removes only the managed block (and the file when
+the block was its only content), and the Codex Voice realtime keys are added
+only when the user has not set them, so Voice keeps talking to Codex's native
+endpoints.
 
 Tests must target a temp config via OPENCODE_GO_PROXY_CONFIG_PATH; this
 module never touches the real ~/.codex/config.toml on its own.
@@ -24,10 +37,10 @@ import json
 import os
 import re
 import stat
+import subprocess
 import sys
 import tempfile
 
-from .catalog import STATE_CATALOG_NAME
 from .meter import state_dir
 
 CONFIG_PATH_ENV = "OPENCODE_GO_PROXY_CONFIG_PATH"
@@ -37,6 +50,11 @@ MANAGED_BASE_URL_ENV = "OPENCODE_GO_PROXY_MANAGED_BASE_URL"
 DEFAULT_BASE_URL = "http://127.0.0.1:8787/v1"
 
 MANAGED_CATALOG_ENV = "OPENCODE_GO_PROXY_MANAGED_CATALOG"
+STATE_MERGED_CATALOG_NAME = "merged-models.json"
+
+# Codex binary resolution for the multi_agent_v2 probe delegates to
+# native_models.resolve_codex_bin(): same env override and fallback order.
+PROBE_TIMEOUT_SEC = 30
 
 START_MARKER = "# BEGIN opencode-go-proxy-managed"
 END_MARKER = "# END opencode-go-proxy-managed"
@@ -62,11 +80,39 @@ def managed_base_url() -> str:
 
 
 def managed_catalog_path() -> str:
-    """The state-dir catalog the managed block points Codex at."""
+    """The state-dir merged catalog the managed block points Codex at."""
     override = os.environ.get(MANAGED_CATALOG_ENV)
     if override:
         return override
-    return os.path.join(state_dir(), STATE_CATALOG_NAME)
+    return os.path.join(state_dir(), STATE_MERGED_CATALOG_NAME)
+
+
+def codex_bin_path() -> str | None:
+    """Resolve the codex binary via native_models; None when it cannot be found."""
+    from opencode_go_proxy import native_models as _native_models
+
+    try:
+        return _native_models.resolve_codex_bin()
+    except _native_models.NativeCaptureError:
+        return None
+
+
+def multi_agent_v2_supported() -> bool:
+    """True when the installed codex binary accepts the multi_agent_v2 feature."""
+    binary = codex_bin_path()
+    if not binary:
+        return False
+    try:
+        completed = subprocess.run(
+            [binary, "debug", "prompt-input", "--enable", "multi_agent_v2"],
+            capture_output=True,
+            text=True,
+            timeout=PROBE_TIMEOUT_SEC,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return completed.returncode == 0
 
 
 def native_realtime_call_base_url(contents: str) -> str:
@@ -128,7 +174,31 @@ def _toml_string(value: str) -> str:
     return json.dumps(value)
 
 
-def _block_lines(base_url: str, catalog_path: str, root_lines: list[str]) -> list[str]:
+def _provider_keys_owned(table_lines: list[str]) -> set[str]:
+    """Keys a user's own [model_providers.opencode-go] table already sets."""
+    in_section = False
+    keys: set[str] = set()
+    for line in table_lines:
+        stripped = line.strip()
+        if stripped.startswith("["):
+            in_section = stripped == "[model_providers.opencode-go]"
+            continue
+        if in_section and "=" in stripped and not stripped.startswith("#"):
+            keys.add(stripped.split("=", 1)[0].strip())
+    return keys
+
+
+def _user_configures_multi_agent_v2(root_lines: list[str], table_lines: list[str]) -> bool:
+    """True when the user configures the feature outside the managed block."""
+    pattern = re.compile(r"^\s*multi_agent_v2\s*=")
+    return any(pattern.match(line) for line in root_lines + table_lines) or any(
+        line.strip() == "[features.multi_agent_v2]" for line in table_lines
+    )
+
+
+def _block_lines(
+    base_url: str, catalog_path: str, root_lines: list[str], table_lines: list[str], multi_agent_v2: bool
+) -> list[str]:
     # A root assignment that already matches is preserved, not duplicated:
     # repeating the key inside the block would produce invalid TOML.
     lines = [START_MARKER]
@@ -141,6 +211,16 @@ def _block_lines(base_url: str, catalog_path: str, root_lines: list[str]) -> lis
         lines.append(f"{REALTIME_CALL_KEY} = {_toml_string(call_url)}")
     if not _root_has_value(root_lines, REALTIME_WS_KEY):
         lines.append(f"{REALTIME_WS_KEY} = {_toml_string(DEFAULT_REALTIME_WS_BASE_URL)}")
+    if multi_agent_v2 and not _user_configures_multi_agent_v2(root_lines, table_lines):
+        lines.extend(["", "[features.multi_agent_v2]", "enabled = true"])
+    provider_keys = _provider_keys_owned(table_lines)
+    provider_lines = []
+    if "base_url" not in provider_keys:
+        provider_lines.append(f"base_url = {_toml_string(base_url)}")
+    if "wire_api" not in provider_keys:
+        provider_lines.append("wire_api = \"responses\"")
+    if provider_lines:
+        lines.extend(["", "[model_providers.opencode-go]", *provider_lines])
     lines.append(END_MARKER)
     return lines
 
@@ -226,7 +306,22 @@ def enable() -> dict[str, object]:
     existing_catalog = _root_value(root_lines, "model_catalog_json")
     if existing_catalog and existing_catalog != catalog_path:
         raise ConfigError(f"refusing to replace user-owned model_catalog_json = {existing_catalog!r}")
-    next_root = [*_trim_blank_edges(root_lines), "", *_block_lines(base_url, catalog_path, root_lines)]
+    # The managed block points Codex at merged-models.json, so make sure that
+    # file exists (with a fresh native capture, best-effort) before writing.
+    try:
+        from opencode_go_proxy import catalog as _catalog
+        from opencode_go_proxy import native_models
+
+        native_models.capture_native_models()
+    except Exception:  # noqa: BLE001, S110 - capture is best-effort; the render below still runs
+        pass
+    _catalog.render_merged_catalog()
+    supported = multi_agent_v2_supported()
+    next_root = [
+        *_trim_blank_edges(root_lines),
+        "",
+        *_block_lines(base_url, catalog_path, root_lines, table_lines, supported),
+    ]
     rendered = _render(next_root, table_lines)
     changed = rendered != contents
     if changed:
@@ -237,6 +332,7 @@ def enable() -> dict[str, object]:
         "changed": changed,
         "openai_base_url": base_url,
         "model_catalog_json": catalog_path,
+        "multi_agent_v2": supported,
     }
 
 
@@ -280,6 +376,7 @@ def status() -> dict[str, object]:
     block_present = bounds is not None
     user_owned: list[str] = []
     managed_owned: list[str] = []
+    block_lines: list[str] = []
     if block_present:
         assert bounds is not None
         start, end = bounds
@@ -298,6 +395,8 @@ def status() -> dict[str, object]:
             "managed": block_present,
             "openai_base_url": _root_value(root_lines, "openai_base_url"),
             "model_catalog_json": _root_value(root_lines, "model_catalog_json"),
+            "multi_agent_v2": any(line.strip() == "[features.multi_agent_v2]" for line in block_lines),
+            "provider_block": any(line.strip() == "[model_providers.opencode-go]" for line in block_lines),
             "voice_keys_user_owned": user_owned,
             "voice_keys_managed": managed_owned,
         }
@@ -336,6 +435,7 @@ def config_cmd(argv: list[str] | None = None) -> int:
                 sys.stdout.write(f"config: {report['path']} ({'present' if report['exists'] else 'missing'})\n")
                 sys.stdout.write(f"openai_base_url: {report['openai_base_url'] or '(unset)'}\n")
                 sys.stdout.write(f"model_catalog_json: {report['model_catalog_json'] or '(unset)'}\n")
+                sys.stdout.write(f"multi_agent_v2: {'enabled' if report['multi_agent_v2'] else 'not enabled'}\n")
                 if report["voice_keys_user_owned"]:
                     sys.stdout.write(f"user voice keys: {', '.join(sorted(report['voice_keys_user_owned']))}\n")
                 if report["voice_keys_managed"]:

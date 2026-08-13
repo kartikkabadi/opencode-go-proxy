@@ -1,8 +1,32 @@
 # Changelog
 
-## [Unreleased]
+## [0.3.0] - 2026-08-13
+
+### Added
+
+- Native model coexistence: models from your logged-in Codex account
+  (`codex debug models`, filtered of every `opencode-go/` slug) are merged
+  with the OpenCode Go catalog and served by `/v1/models`. Native slugs route
+  verbatim to `https://chatgpt.com/backend-api/codex`
+  (`OPENCODE_GO_PROXY_NATIVE_BASE_URL` overrides); everything else translates
+  to OpenCode Go as before. Official OAuth and API setups are untouched.
+- App tool capture: `codex_app` tool definitions are snapshotted via
+  `codex debug prompt-input` and merged into session-spawn requests
+  (`contrib/codex-app-tools.json` fallback); `web_search_preview` translates
+  to a chat function instead of being dropped.
+- Compaction requests with query strings now route correctly (404 fixed).
+- Multi-agent config v2 (`multi_agent_version: "v2"`) with agent sync, an
+  `install-skills` ops command, and a `refresh-runtime` command (native
+  recapture + merged re-render) that the menu bar's Refresh Catalog calls.
+- macOS launchd agent removed (`contrib/launchd/`); the menu bar app owns the
+  proxy process on macOS.
 
 ### Changed
+
+- `MODEL_ALIASES` is gone: unknown non-native slugs fall back to the default
+  model, same as before.
+- Meter events carry a `provider` tag (`native` vs `opencode-go`).
+
 
 - Ops contracts match the codex-router reference (plan 010): `smoke-test` posts
   a marker prompt through the local proxy at `http://127.0.0.1:8787/v1/responses`

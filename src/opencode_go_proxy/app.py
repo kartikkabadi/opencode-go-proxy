@@ -30,6 +30,7 @@ from .meter import (
     estimate_input_tokens,
     record_usage_event,
 )
+from .passthrough import relay_native_request
 from .protocol import (
     DEFAULT_MODEL,
     cache_stats_from_usage,
@@ -40,6 +41,7 @@ from .protocol import (
     responses_payload_to_chat_payload,
 )
 from .quota import read_quota_state
+from .routing import route_target
 from .state import build_state
 from .streaming import handle_chat_stream_passthrough, handle_streaming_request
 from .trace import trace
@@ -189,9 +191,12 @@ class ResponsesProxyHandler(BaseHTTPRequestHandler):
             self._send_json(config.cache_tracker.snapshot())
             return
         if self.path in {"/models", "/v1/models"}:
+            from opencode_go_proxy import catalog as _catalog
+
+            slugs = _catalog.merged_model_slugs() or sorted(known_models())
             self._send_json({
                 "object": "list",
-                "data": [{"id": slug, "object": "model"} for slug in sorted(known_models())],
+                "data": [{"id": slug, "object": "model"} for slug in slugs],
             })
             return
         if self.path in MESSAGES_PATHS:
@@ -201,13 +206,13 @@ class ResponsesProxyHandler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:
         request_id = uuid.uuid4().hex[:12]
+        # The Codex app may send ?compact=true on the responses path; the query
+        # string must not turn a known path into a 404. The payload translates
+        # through the normal path either way (compact is just a hint).
+        path = self.path.split("?", 1)[0]
 
         try:
             self._guard_request()
-            # The Codex app may send ?compact=true on the responses path; the query
-            # string must not turn a known path into a 404. The payload translates
-            # through the normal path either way (compact is just a hint).
-            path = self.path.split("?", 1)[0]
             if path not in RESPONSES_PATHS | CHAT_COMPLETIONS_PATHS:
                 if path in MESSAGES_PATHS:
                     self._send_json(MESSAGES_UNSUPPORTED, status=HTTPStatus.BAD_REQUEST)
@@ -226,6 +231,11 @@ class ResponsesProxyHandler(BaseHTTPRequestHandler):
             )
             if path in CHAT_COMPLETIONS_PATHS:
                 handle_chat_completions_request(self, payload, config, request_id)
+            elif path in RESPONSES_PATHS and route_target(payload.get("model") or DEFAULT_MODEL) == "native":
+                # Native models relay whole to the ChatGPT backend: the body,
+                # the client's own auth, and the stream are forwarded verbatim
+                # and never touch the OpenCode Go key or alias logic.
+                relay_native_request(self, payload, config, request_id)
             elif payload.get("stream") is True:
                 # Real streaming: send SSE headers, then stream from upstream in real-time.
                 self.send_response(HTTPStatus.OK)
@@ -413,6 +423,7 @@ def _refresh_catalog_in_background() -> None:
         from opencode_go_proxy import catalog as _catalog
 
         _catalog.refresh_runtime_catalog()
+        _catalog.render_merged_catalog()
     except Exception as exc:  # noqa: BLE001 - background refresh is best-effort
         trace("catalog.refresh.skipped", error=str(exc))
 
@@ -439,6 +450,14 @@ def main(argv: list[str] | None = None) -> None:
         from . import ops
 
         sys.exit(ops.install(args_list[1:]))
+    if args_list and args_list[0] == "install-skills":
+        from . import ops
+
+        sys.exit(ops.install_skills(args_list[1:]))
+    if args_list and args_list[0] == "agents-sync":
+        from . import agents_sync
+
+        sys.exit(agents_sync.agents_sync_cmd(args_list[1:]))
     if args_list and args_list[0] == "status":
         from . import ops
 
@@ -455,13 +474,38 @@ def main(argv: list[str] | None = None) -> None:
         from . import models_cmd
 
         sys.exit(models_cmd.models_cmd(args_list[1:]))
+    if args_list and args_list[0] == "native-capture":
+        from . import native_models
+
+        sys.exit(native_models.native_capture_cmd(args_list[1:]))
+    if args_list and args_list[0] == "refresh-runtime":
+        from . import catalog, native_models
+
+        # The menu bar's Refresh Catalog: re-capture the native set, then
+        # force a runtime render under the state dir (the catalog the proxy
+        # actually serves and the config block points Codex at).
+        try:
+            native_models.capture_native_models()
+        except native_models.NativeCaptureError as exc:
+            print(f"warning: native capture skipped: {exc}")
+        rendered = catalog.refresh_runtime_catalog(force=True)
+        print(f"runtime catalog refreshed: {len(rendered.get('models', []))} models")
+        catalog.render_merged_catalog()
+        sys.exit(0)
     args = build_parser().parse_args(args_list)
     try:
         from opencode_go_proxy import catalog as _catalog
+        from opencode_go_proxy import native_models
 
         # Startup fast path: render the state-dir compact (or the seed) with
-        # no network. The full refresh below runs in the background.
+        # no network, capture the native catalog so a fresh install serves
+        # official GPT models immediately (best-effort: a missing or logged-
+        # out codex binary keeps the last snapshot), then render the merged
+        # native + opencode-go catalog. The full refresh below runs in the
+        # background.
         _catalog.prepare_runtime_catalog()
+        native_models.capture_native_models()
+        _catalog.render_merged_catalog()
     except Exception as exc:  # noqa: BLE001 - startup catalog render is best-effort
         trace("catalog.refresh.skipped", error=str(exc))
     # The full refresh may fetch models.dev (up to a 10s timeout); run it in

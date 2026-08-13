@@ -7,6 +7,7 @@ import uuid
 from typing import Any
 
 from .codex_tools import merge_codex_app_tools
+from .routing import normalize_model_slug, route_target
 
 Json = dict[str, Any]
 
@@ -132,17 +133,6 @@ def inject_session_model(payload: Json, session_model: str) -> Json:
 
 DEFAULT_MODEL = "deepseek-v4-flash"
 IMAGE_MODEL_DEFAULT = "mimo-v2.5"
-
-MODEL_ALIASES: dict[str, str] = {
-    "gpt-5.5": "deepseek-v4-pro",
-    "gpt-5.4-mini": "deepseek-v4-flash",
-    "gpt-5": "deepseek-v4-pro",
-    "o3": "deepseek-v4-pro",
-    "o4-mini": "deepseek-v4-flash",
-    "codex-auto-review": "deepseek-v4-flash",
-}
-
-
 
 
 def _catalog_mtime() -> tuple[str, int | None]:
@@ -679,26 +669,22 @@ def responses_payload_to_chat_payload(payload: Json) -> tuple[Json, str, Json]:
     # form, and the upstream chat payload addresses the provider with the
     # bare slug (the reference router's upstreamModel). Unknown non-native
     # slugs fall back to DEFAULT_MODEL, exactly as before the alias map died.
-    if incoming_model in MODEL_ALIASES:
-        incoming_model = MODEL_ALIASES[incoming_model]
-    elif incoming_model not in known_models():
-        incoming_model = DEFAULT_MODEL
-    # Detect images by scanning for actual image_url parts (not just list-shaped content).
-    has_image = any(
-        isinstance(m.get("content"), list)
-        and any(isinstance(p, dict) and p.get("type") == "image_url" for p in m["content"])
-        for m in messages
-    )
-    if has_image:
-        if incoming_model in image_capable_models():
-            upstream_model = incoming_model
-        else:
-            image_model = (
-                os.environ.get("CODEX_IMAGE_MODEL", IMAGE_MODEL_DEFAULT) or IMAGE_MODEL_DEFAULT
-            )
-            upstream_model = image_model
-    else:
+    if route_target(incoming_model) == "native":
         upstream_model = incoming_model
+    else:
+        bare = normalize_model_slug(incoming_model)
+        if bare not in known_models():
+            incoming_model = DEFAULT_MODEL
+            bare = incoming_model
+        if has_image:
+            if bare in image_capable_models():
+                upstream_model = bare
+            else:
+                upstream_model = (
+                    os.environ.get("CODEX_IMAGE_MODEL", IMAGE_MODEL_DEFAULT) or IMAGE_MODEL_DEFAULT
+                )
+        else:
+            upstream_model = bare
 
     chat_payload: Json = {
         "model": upstream_model,

@@ -9,6 +9,14 @@ struct ProxyState: Equatable {
     var port: Int
 }
 
+/// Outcome of a one-shot proxy CLI run (native-capture, refresh-catalog,
+/// config enable/disable). `message` carries the CLI log tail on failure so
+/// the menu can surface why the command failed.
+struct CLIResult {
+    var succeeded: Bool
+    var message: String?
+}
+
 final class ProxyController {
     var onStateChange: (() -> Void)?
 
@@ -16,11 +24,19 @@ final class ProxyController {
         didSet { onStateChange?() }
     }
     private(set) var serverState: ServerState?
+    private(set) var isCLIRunning = false
+    private(set) var catalogCount: Int?
+    private(set) var configEnabled: Bool?
 
     private var childPID: pid_t = -1
     private var healthURL: URL {
         URL(string: "http://127.0.0.1:\(state.port)/health")!
     }
+
+    private static let proxySource = "git+https://github.com/kartikkabadi/opencode-go-proxy@v0.3.0"
+    private static let cliLogName = "opencode-go-proxy-cli.log"
+    private static let cliLogTailLimit = 600
+    private static let configMarker = "# BEGIN opencode-go-proxy-managed"
 
     private var logDir: URL {
         let base = FileManager.default.homeDirectoryForCurrentUser
@@ -31,13 +47,18 @@ final class ProxyController {
         guard childPID < 0, !state.isStarting else { return }
         state = ProxyState(isRunning: false, isStarting: true, isHealthy: false, port: state.port)
 
-        // Single-port guard: if another process already owns the port (the
-        // launchd service, another proxy, anything else), refuse to spawn a
-        // second one. One proxy per port; the menu bar is the control surface,
-        // but it must not fight an existing process for the socket.
+        // Single-port guard: if another process already owns the port, refuse
+        // to spawn a second one — except the legacy launchd agent this app
+        // replaced, which is migrated (unloaded) automatically once.
         if portIsInUse() {
-            failStart("Port \(state.port) is already in use by another process. Stop the launchd service or the other proxy first (one proxy per port).")
-            return
+            if oldLaunchdJobLoaded() {
+                unloadOldLaunchdJob()
+                Thread.sleep(forTimeInterval: 0.5)
+            }
+            if portIsInUse() {
+                failStart("Port \(state.port) is already in use by another process (one proxy per port).")
+                return
+            }
         }
 
         do {
@@ -70,7 +91,7 @@ final class ProxyController {
 
         let argv: [String] = [
             uvx,
-            "--from", "git+https://github.com/kartikkabadi/opencode-go-proxy",
+            "--from", Self.proxySource,
             "opencode-go-proxy",
             "--bind", "127.0.0.1",
             "--port", "\(state.port)",
@@ -88,6 +109,7 @@ final class ProxyController {
         monitorChild(pid)
         refreshHealth()
         refreshState()
+        refreshCatalogCount()
     }
 
     func stop() {
@@ -103,6 +125,7 @@ final class ProxyController {
         }
         state = ProxyState(isRunning: false, isStarting: false, isHealthy: false, port: state.port)
         serverState = nil
+        catalogCount = nil
     }
 
     /// Fetch the /state contract (quota card, usage bars, provider row). Only
@@ -142,6 +165,69 @@ final class ProxyController {
         }.resume()
     }
 
+    /// GET /v1/models and count the entries; nil keeps the last good count.
+    func refreshCatalogCount() {
+        let pid = childPID
+        guard pid > 0 else { return }
+        CatalogFetcher.fetchCount(port: state.port) { [weak self] count in
+            DispatchQueue.main.async {
+                guard let self, self.childPID == pid, let count else { return }
+                if self.catalogCount != count {
+                    self.catalogCount = count
+                    self.onStateChange?()
+                }
+            }
+        }
+    }
+
+    /// Scan ~/.codex/config.toml for the managed-block marker; nil when the
+    /// file is unreadable so the menu can show "n/a" instead of guessing.
+    func refreshConfigStatus() {
+        DispatchQueue.global().async { [weak self] in
+            let enabled = Self.readConfigMarker()
+            DispatchQueue.main.async {
+                guard let self, enabled != self.configEnabled else { return }
+                self.configEnabled = enabled
+                self.onStateChange?()
+            }
+        }
+    }
+
+    /// Run `opencode-go-proxy config enable|disable` through the uvx child.
+    func setConfigEnabled(_ enabled: Bool, completion: @escaping (CLIResult) -> Void) {
+        guard !isCLIRunning else {
+            completion(CLIResult(succeeded: false, message: "Another CLI action is still running."))
+            return
+        }
+        isCLIRunning = true
+        onStateChange?()
+        runCLIOnce(arguments: ["config", enabled ? "enable" : "disable"]) { [weak self] result in
+            guard let self else { return }
+            self.isCLIRunning = false
+            self.onStateChange?()
+            self.refreshConfigStatus()
+            completion(result)
+        }
+    }
+
+    /// Refresh the runtime catalog the proxy serves: one CLI run that
+    /// re-captures native models and force-renders the state-dir catalogs.
+    func refreshCatalog(completion: @escaping (CLIResult) -> Void) {
+        guard !isCLIRunning else {
+            completion(CLIResult(succeeded: false, message: "Another CLI action is still running."))
+            return
+        }
+        isCLIRunning = true
+        onStateChange?()
+        runCLIOnce(arguments: ["refresh-runtime"]) { [weak self] result in
+            guard let self else { return }
+            self.isCLIRunning = false
+            self.onStateChange?()
+            self.refreshCatalogCount()
+            completion(result)
+        }
+    }
+
     func openLogs() {
         NSWorkspace.shared.open(logDir)
     }
@@ -178,9 +264,119 @@ final class ProxyController {
         return rc == 0
     }
 
+    /// True when the legacy launchd agent (pre-0.3.0) is still loaded.
+    private func oldLaunchdJobLoaded() -> Bool {
+        launchctl(["print", "gui/\(getuid())/com.opencode.go.proxy"]) == 0
+    }
+
+    /// Unload the legacy launchd agent so the menu bar can own the port.
+    private func unloadOldLaunchdJob() {
+        _ = launchctl(["bootout", "gui/\(getuid())/com.opencode.go.proxy"])
+    }
+
+    /// Run launchctl; returns its exit status, or -1 when it cannot run.
+    private func launchctl(_ arguments: [String]) -> Int32 {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/bin/launchctl")
+        process.arguments = arguments
+        let sink = Pipe()
+        process.standardOutput = sink
+        process.standardError = sink
+        do {
+            try process.run()
+            process.waitUntilExit()
+            return process.terminationStatus
+        } catch {
+            return -1
+        }
+    }
+
     private func failStart(_ message: String) {
         state = ProxyState(isRunning: false, isStarting: false, isHealthy: false, port: state.port)
         presentError(message)
+    }
+
+    /// Spawn one short-lived proxy CLI command (uvx child, same pattern as the
+    /// long-lived proxy) and report success plus the CLI log tail on failure.
+    /// Does not touch isCLIRunning; callers own the busy flag for a sequence.
+    private func runCLIOnce(arguments: [String], completion: @escaping (CLIResult) -> Void) {
+        guard let uvx = findUVX() else {
+            completion(CLIResult(succeeded: false,
+                                 message: "uvx not found. Install uv (https://docs.astral.sh/uv) or set uvx in PATH."))
+            return
+        }
+        do {
+            try FileManager.default.createDirectory(at: logDir, withIntermediateDirectories: true)
+        } catch {
+            completion(CLIResult(succeeded: false, message: "Could not create log directory: \(error.localizedDescription)"))
+            return
+        }
+
+        let logPath = logDir.appendingPathComponent(Self.cliLogName).path
+        let logFD = open(logPath, O_WRONLY | O_CREAT | O_APPEND, 0o644)
+        guard logFD >= 0 else {
+            completion(CLIResult(succeeded: false, message: "Could not open CLI log at \(logPath)"))
+            return
+        }
+        defer { close(logFD) }
+
+        let argv = [uvx, "--from", Self.proxySource, "opencode-go-proxy"] + arguments
+        let pid = spawnInGroup(argv: argv, stdoutFD: logFD, stderrFD: logFD,
+                               env: childEnvironment(), cwd: stateDirectoryIfPresent())
+        guard pid > 0 else {
+            completion(CLIResult(succeeded: false, message: "Could not start the proxy CLI (posix_spawn failed)."))
+            return
+        }
+
+        DispatchQueue.global().async {
+            let succeeded = Self.waitForExit(pid)
+            let tail = Self.tailOfFile(at: logPath, limit: Self.cliLogTailLimit)
+            DispatchQueue.main.async {
+                completion(CLIResult(succeeded: succeeded, message: tail))
+            }
+        }
+    }
+
+    private static func waitForExit(_ pid: pid_t) -> Bool {
+        var status: Int32 = 0
+        guard waitpid(pid, &status, 0) >= 0 else { return false }
+        // wait(2) macros (WIFEXITED/WEXITSTATUS) are not importable into Swift;
+        // decode the raw status: low 7 bits signal termination, high 8 exit code.
+        return status & 0x7f == 0 && (status >> 8) & 0xff == 0
+    }
+
+    private static func tailOfFile(at path: String, limit: Int) -> String? {
+        guard let handle = try? FileHandle(forReadingFrom: URL(fileURLWithPath: path)) else { return nil }
+        defer { try? handle.close() }
+        let size = Int64((try? handle.seekToEnd()) ?? 0)
+        let offset = max(0, size - Int64(limit))
+        try? handle.seek(toOffset: UInt64(offset))
+        guard let data = try? handle.readToEnd(),
+              let text = String(data: data, encoding: .utf8) else { return nil }
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? nil : trimmed
+    }
+
+    /// Run CLI one-shots from the proxy state dir when it exists; the CLI
+    /// resolves its own state dir either way, so a missing dir just means no
+    /// explicit cwd.
+    private func stateDirectoryIfPresent() -> String? {
+        let environment = ProcessInfo.processInfo.environment
+        let path: String
+        if let override = environment["OPENCODE_GO_PROXY_STATE_DIR"], !override.isEmpty {
+            path = override
+        } else {
+            path = FileManager.default.homeDirectoryForCurrentUser
+                .appendingPathComponent(".codex/opencode-go-proxy").path
+        }
+        return FileManager.default.fileExists(atPath: path) ? path : nil
+    }
+
+    private static func readConfigMarker() -> Bool? {
+        let configPath = FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent(".codex/config.toml")
+        guard let contents = try? String(contentsOf: configPath, encoding: .utf8) else { return nil }
+        return contents.contains(configMarker)
     }
 
     private func monitorChild(_ pid: pid_t) {
@@ -191,13 +387,14 @@ final class ProxyController {
                 guard self.childPID == pid else { return }
                 self.childPID = -1
                 self.serverState = nil
+                self.catalogCount = nil
                 self.state = ProxyState(isRunning: false, isStarting: false,
                                         isHealthy: false, port: self.state.port)
             }
         }
     }
 
-    private func spawnInGroup(argv: [String], stdoutFD: Int32, stderrFD: Int32, env: [String]) -> pid_t {
+    private func spawnInGroup(argv: [String], stdoutFD: Int32, stderrFD: Int32, env: [String], cwd: String? = nil) -> pid_t {
         var cArgs = argv.map { strdup($0) }
         cArgs.append(nil)
         defer { cArgs.forEach { free($0) } }
@@ -207,6 +404,9 @@ final class ProxyController {
         defer { posix_spawn_file_actions_destroy(&fileActions) }
         posix_spawn_file_actions_adddup2(&fileActions, stdoutFD, STDOUT_FILENO)
         posix_spawn_file_actions_adddup2(&fileActions, stderrFD, STDERR_FILENO)
+        if let cwd, posix_spawn_file_actions_addchdir_np(&fileActions, cwd) != 0 {
+            return -1
+        }
 
         var attributes: posix_spawnattr_t?
         guard posix_spawnattr_init(&attributes) == 0 else { return -1 }
@@ -245,7 +445,7 @@ final class ProxyController {
         return nil
     }
 
-    private func presentError(_ message: String) {
+    func presentError(_ message: String) {
         let alert = NSAlert()
         alert.messageText = "OpenCode Go Proxy"
         alert.informativeText = message

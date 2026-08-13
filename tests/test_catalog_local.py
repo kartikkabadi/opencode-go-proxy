@@ -71,7 +71,7 @@ class TestApplyUserModels:
         assert by_slug["curated-flash"]["display_name"] == "Curated Flash"
         assert by_slug["curated-flash"]["context_window"] == 200000
         assert by_slug["curated-flash"]["max_context_window"] == 1000000  # default
-        assert by_slug["curated-flash"]["multi_agent_version"] == "v1"  # default
+        assert by_slug["curated-flash"]["multi_agent_version"] == "v2"  # default
         assert len(models) == 3
 
     def test_edits_display_fields_on_existing_model(self) -> None:

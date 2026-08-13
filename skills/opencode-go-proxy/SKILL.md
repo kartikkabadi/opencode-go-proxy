@@ -13,19 +13,28 @@ Codex app -> POST /v1/responses -> opencode-go-proxy (127.0.0.1:8787) -> POST /v
 
 ## Start and stop
 
-- The proxy is controlled by a native macOS menu bar app (branch icon). It shows live status, Start/Stop, logs, and copy-port, and it stops the child proxy on Quit. It refuses to Start if port 8787 is already owned (single-port guard).
+- The proxy is controlled by a native macOS menu bar app (branch icon). It shows live status, Start/Stop, logs, and copy-port, and it stops the child proxy on Quit. It refuses to Start if port 8787 is already owned (single-port guard). No launchd agent on macOS; `opencode-go-proxy install` points at the menu bar app.
 - CLI: `uvx --from git+https://github.com/kartikkabadi/opencode-go-proxy opencode-go-proxy --port 8787`.
-- One proxy per port. Do not run the menu bar app and a launchd agent at the same time; stop the launchd agent first (`launchctl bootout gui/$(id -u) ~/Library/LaunchAgents/com.opencode.go.proxy.plist`).
+- One proxy per port. Stop any older launchd agent before starting the menu bar app (`launchctl bootout gui/$(id -u) ~/Library/LaunchAgents/com.opencode-go.proxy.plist`).
 
 ## Operational commands
 
 - `opencode-go-proxy doctor` - read-only self-check (API key present, /health 200, meter writable, logs present, Codex config points at the proxy). `--json` for machine output; non-zero exit on any failure.
 - `opencode-go-proxy smoke-test` - one tiny real chat-completion to upstream; non-zero on failure.
 - `opencode-go-proxy support-bundle [--output FILE]` - tarball of version, logs, meter, and redacted config (secret values masked, never bundled raw).
+- `opencode-go-proxy agents-sync` - writes one Codex agent TOML per opencode-go model into ~/.codex/agents (`router_opencode_go_<slug>`) so subagents use the same models; removes agent files this proxy wrote whose model left the catalog.
+- `opencode-go-proxy install-skills [--dry-run]` - copies this skill into ~/.codex/skills/opencode-go-proxy/.
 - `opencode-go-proxy --refresh-catalog` - refresh the model catalog from models.dev.
 
-## Prefix caching
+## Models: native and opencode-go
 
+The merged model catalog lists both kinds. Models like `gpt-*` and `o*` are native: the proxy passes those requests straight through to the ChatGPT backend (your Codex login), never aliasing them to an OpenCode Go model. `opencode-go/*` models route through the proxy to OpenCode Go. An unknown slug falls back to the default opencode-go model.
+
+## Threads and automations
+
+The app's codex_app tools (threads, automations, spawn_agent, handoff, fork) are available in chat sessions: the proxy snapshots the app's tool list and merges the missing thread/automation tools into requests that did not carry them. No extra config.
+
+## Prefix caching
 OpenCode Go bills cached reads cheaply, so request prefixes are kept byte-stable: the system prompt is always first, history is appended in order, and streaming sets `stream_options.include_usage` so the upstream reports its cache accounting. First request of a new context always misses (cold); later requests in a session typically hit 99%+.
 
 Check the ratio: `curl http://127.0.0.1:8787/cache` (per-model and totals). Per-request: grep for `"cache"` in the stderr log.
@@ -42,5 +51,5 @@ Resolved in order: `OPENCODE_GO_API_KEY`, `OPENCODE_API_KEY`, then macOS keychai
 
 ## Config
 
-- `~/.codex/config.toml`: the provider block points `base_url` at `http://127.0.0.1:8787/v1`; the `[model_providers.opencode-go] name` knob controls the label in the Codex model picker.
+- `opencode-go-proxy config enable` writes one managed block into `~/.codex/config.toml`: `openai_base_url` (the proxy), `model_catalog_json` (the merged native + opencode-go catalog in the state dir), the `multi_agent_v2` feature (only when the installed codex binary accepts it), and an inert `[model_providers.opencode-go]` block (`base_url` 8787, `wire_api` "responses"). User-owned keys are never replaced; `config disable` removes the block.
 - Bind is guarded: the proxy emits a trace-log warning when bound outside localhost (e.g. `--bind 0.0.0.0`). It does not refuse to start.
