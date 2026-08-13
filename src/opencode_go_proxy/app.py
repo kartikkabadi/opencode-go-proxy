@@ -495,11 +495,16 @@ def main(argv: list[str] | None = None) -> None:
     args = build_parser().parse_args(args_list)
     try:
         from opencode_go_proxy import catalog as _catalog
+        from opencode_go_proxy import native_models
 
         # Startup fast path: render the state-dir compact (or the seed) with
-        # no network, plus the merged native + opencode-go catalog. The full
-        # refresh below runs in the background.
+        # no network, capture the native catalog so a fresh install serves
+        # official GPT models immediately (best-effort: a missing or logged-
+        # out codex binary keeps the last snapshot), then render the merged
+        # native + opencode-go catalog. The full refresh below runs in the
+        # background.
         _catalog.prepare_runtime_catalog()
+        native_models.capture_native_models()
         _catalog.render_merged_catalog()
     except Exception as exc:  # noqa: BLE001 - startup catalog render is best-effort
         trace("catalog.refresh.skipped", error=str(exc))

@@ -15,18 +15,27 @@ import pytest
 
 from opencode_go_proxy import passthrough
 from opencode_go_proxy.app import ProxyConfig, ResponsesProxyHandler
+from opencode_go_proxy.errors import ProxyError
 from opencode_go_proxy.meter import state_dir, usage_events_path
 from opencode_go_proxy.passthrough import relay_native_request
 
 
 class _FakeChatGpt(BaseHTTPRequestHandler):
     """Fake chatgpt.com backend: records requests, serves json/sse/error."""
-    captured: ClassVar[list[dict]] = []
+
     mode = "json"
     status = 200
+    captured: ClassVar[list[dict]] = []
+    extra_headers: ClassVar[dict[str, str]] = {}
 
-    def log_message(self, *args) -> None:
-        pass
+    def _emit(self, status: int, content_type: str, payload: bytes) -> None:
+        self.send_response(status)
+        self.send_header("content-type", content_type)
+        for name, value in type(self).extra_headers.items():
+            self.send_header(name, value)
+        self.send_header("content-length", str(len(payload)))
+        self.end_headers()
+        self.wfile.write(payload)
 
     def do_POST(self) -> None:
         length = int(self.headers.get("content-length", "0"))
@@ -43,19 +52,25 @@ class _FakeChatGpt(BaseHTTPRequestHandler):
                 b'data: {"type":"response.output_text.delta","delta":"hi"}\n\n'
                 b"data: [DONE]\n\n"
             )
+            self._emit(200, "text/event-stream", payload)
+            return
+        if type(self).mode == "sse-abort":
+            # Advertise a body much larger than what is sent: the reader hits
+            # EOF mid-body and raises IncompleteRead, like a real upstream
+            # dying after the 200 head.
             self.send_response(200)
             self.send_header("content-type", "text/event-stream")
-            self.send_header("content-length", str(len(payload)))
+            self.send_header("content-length", "999999")
             self.end_headers()
-            self.wfile.write(payload)
+            self.wfile.write(b'data: {"type":"response.output_text.delta","delta":"partial"}\n\n')
+            self.wfile.flush()
+            # Return mid-body: the handler closes the connection after us and
+            # the client hits EOF with bytes still promised.
+            self.close_connection = True
             return
         if type(self).status != 200:
             error_body = json.dumps({"error": {"message": "boom"}}).encode()
-            self.send_response(type(self).status)
-            self.send_header("content-type", "application/json")
-            self.send_header("content-length", str(len(error_body)))
-            self.end_headers()
-            self.wfile.write(error_body)
+            self._emit(type(self).status, "application/json", error_body)
             return
         payload = json.dumps(
             {
@@ -72,11 +87,7 @@ class _FakeChatGpt(BaseHTTPRequestHandler):
                 ],
             }
         ).encode()
-        self.send_response(200)
-        self.send_header("content-type", "application/json")
-        self.send_header("content-length", str(len(payload)))
-        self.end_headers()
-        self.wfile.write(payload)
+        self._emit(200, "application/json", payload)
 
 
 @pytest.fixture()
@@ -84,6 +95,7 @@ def native_upstream():
     _FakeChatGpt.captured = []
     _FakeChatGpt.mode = "json"
     _FakeChatGpt.status = 200
+    _FakeChatGpt.extra_headers = {}
     sock = socket.socket()
     sock.bind(("127.0.0.1", 0))
     port = sock.getsockname()[1]
@@ -128,6 +140,12 @@ def make_config() -> ProxyConfig:
         max_body_bytes=20 * 1024 * 1024,
     )
 
+
+@pytest.fixture(autouse=True)
+def _allow_insecure_native_backend():
+    """All tests here talk to a local http fake backend — the escape hatch applies."""
+    with mock.patch.dict(os.environ, {passthrough.NATIVE_INSECURE_ENV: "1"}):
+        yield
 
 def _meter_events() -> list[dict]:
     with open(usage_events_path()) as handle:
@@ -239,6 +257,52 @@ def test_upstream_error_relayed_verbatim(native_upstream) -> None:
     events = _meter_events()
     assert events[0]["status"] == 429
     assert events[0]["provider"] == "native"
+
+def test_plain_http_native_backend_is_rejected(native_upstream) -> None:
+    handler = _FakeHandler({"authorization": "Bearer t", "content-type": "application/json"})
+    with mock.patch.dict(
+        os.environ,
+        {passthrough.NATIVE_BASE_URL_ENV: native_upstream, passthrough.NATIVE_INSECURE_ENV: "0"},
+    ):
+        try:
+            relay_native_request(
+                handler, {"model": "gpt-5.6-luna", "input": "hi"}, make_config(), "req"
+            )
+        except ProxyError as exc:
+            assert "must use https" in str(exc)
+        else:
+            pytest.fail("expected ProxyError for plain-http native backend")
+    assert not _FakeChatGpt.captured
+
+
+def test_upstream_response_headers_forwarded(native_upstream) -> None:
+    _FakeChatGpt.extra_headers = {"x-request-id": "abc123", "retry-after": "7", "connection": "close"}
+    handler = _FakeHandler({"authorization": "Bearer t", "content-type": "application/json"})
+    with mock.patch.dict(os.environ, {passthrough.NATIVE_BASE_URL_ENV: native_upstream}):
+        relay_native_request(
+            handler, {"model": "gpt-5.6-luna", "input": "hi"}, make_config(), "req"
+        )
+    assert handler.response_headers["x-request-id"] == "abc123"
+    assert handler.response_headers["retry-after"] == "7"
+    assert "connection" not in handler.response_headers
+
+
+def test_stream_abort_meters_502_with_marker(native_upstream) -> None:
+    _FakeChatGpt.mode = "sse-abort"
+    handler = _FakeHandler(
+        {"authorization": "Bearer t", "content-type": "application/json", "accept": "text/event-stream"}
+    )
+    with mock.patch.dict(os.environ, {passthrough.NATIVE_BASE_URL_ENV: native_upstream}):
+        relay_native_request(
+            handler,
+            {"model": "gpt-5.6-luna", "input": "hi", "stream": True},
+            make_config(),
+            "req-abort",
+        )
+    events = _meter_events()
+    assert events[-1]["status"] == 502
+    assert events[-1].get("streamAborted") is True
+    assert events[-1]["provider"] == "native"
 
 
 def _seed_native_capture() -> None:
