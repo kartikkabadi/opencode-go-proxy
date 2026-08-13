@@ -165,19 +165,23 @@ class RefreshCatalogTests(unittest.TestCase):
 
     def test_offline_without_compact_renders_seed(self) -> None:
         # A fresh install that cannot reach models.dev must render the seed
-        # instead of failing the first startup refresh.
+        # instead of failing the first startup refresh, and must persist it.
+        seed_path = os.path.join(self.tmp, "seed.json")
+        seed = make_compact(self.now.isoformat())
+        with open(seed_path, "w") as f:
+            json.dump(seed, f)
         with mock.patch(
             "opencode_go_proxy.catalog.discover_models",
             side_effect=CatalogDiscoveryError("offline"),
-        ), mock.patch(
-            "opencode_go_proxy.catalog.load_seed_compact", return_value=make_compact(self.now.isoformat())
         ):
             rendered = refresh_catalog(
                 compact_path=self.compact_path,
                 catalog_path=self.catalog_path,
+                seed_path=seed_path,
                 now=self.now,
             )
-        assert rendered.get("models")
+        self.assertEqual(rendered["models"][0]["slug"], "existing-model")
+        self.assertTrue(os.path.exists(self.catalog_path))
 
     def test_model_from_discovery_maps_fields(self) -> None:
         record = _model_from_discovery(

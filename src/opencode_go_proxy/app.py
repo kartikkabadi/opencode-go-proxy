@@ -25,13 +25,18 @@ from . import __version__
 from .config import ProxyConfig, resolve_chat_base_url
 from .errors import ProxyError
 from .guards import check_browser_origin, check_content_type, check_host
-from .meter import record_usage_event
+from .meter import (
+    DEFAULT_ESTIMATE_CONTEXT_WINDOW,
+    estimate_input_tokens,
+    record_usage_event,
+)
 from .protocol import (
     DEFAULT_MODEL,
     cache_stats_from_usage,
     chat_completion_to_response,
     inject_session_model,
     known_models,
+    model_context_window,
     responses_payload_to_chat_payload,
 )
 from .quota import read_quota_state
@@ -334,7 +339,10 @@ def handle_responses_request(payload: Json, config: ProxyConfig, request_id: str
             )
             raise
     record_cache(config.cache_tracker, chat_payload.get("model"), chat.get("usage"))
-    response = chat_completion_to_response(chat, request_model=request_model)
+    context_cap = model_context_window(request_model) or DEFAULT_ESTIMATE_CONTEXT_WINDOW
+    prompt_bytes = len(json.dumps(chat_payload, separators=(",", ":")).encode("utf-8"))
+    estimated = estimate_input_tokens(request_model, prompt_bytes, chat.get("usage"), context_window=context_cap)
+    response = chat_completion_to_response(chat, request_model=request_model, estimated_input_tokens=estimated)
     trace(
         "response.converted",
         request_id=request_id,
@@ -347,6 +355,7 @@ def handle_responses_request(payload: Json, config: ProxyConfig, request_id: str
     record_usage_event(
         model=request_model, status=200, duration_ms=int((time.time() - started) * 1000),
         input_tokens=inp, output_tokens=outp, total_tokens=total,
+        estimated_input_tokens=estimated,
         retries=retries + (1 if fell_back else 0),
     )
     return response
@@ -364,7 +373,12 @@ def handle_chat_completions_request(handler: ResponsesProxyHandler, payload: Jso
     if payload.get("stream") is True:
         handle_chat_stream_passthrough(payload, config, request_id, handler)
         return
-    status, body, _retries, content_type = call_upstream_chat_verbatim(payload, config, request_id)
+    started = time.time()
+    status, body, retries, content_type = call_upstream_chat_verbatim(payload, config, request_id)
+    record_usage_event(
+        model=payload.get("model") or DEFAULT_MODEL, status=status,
+        duration_ms=int((time.time() - started) * 1000), retries=retries or None,
+    )
     handler.send_response(status)
     handler.send_header("content-type", content_type or "application/json")
     handler.send_header("content-length", str(len(body)))

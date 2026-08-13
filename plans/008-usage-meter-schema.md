@@ -26,10 +26,10 @@ file.
    "opencode-go-proxy/1", "provider": "opencode-go"}.
 2. Backward compat: keep the legacy snake_case/epoch fields in the same
    event for one release (additive), OR add a migration note. Decide in the
-   plan: write BOTH spellings so the live proxy's existing consumers keep
-   working, and record the decision in the changelog. Do not double-write
-   unless consumers need it; the proxy's own menu bar is the only known
-   consumer and it is reworked in a later plan.
+   plan: write the canonical camelCase/ISO schema only (single spelling).
+   No in-repo consumer reads the legacy snake_case/epoch fields (verified:
+   the menu bar reads the /state contract, not the meter file), so no
+   double-write is needed; the decision is recorded in the changelog.
 3. Update all call sites (streaming.py, vision.py, upstream.py paths) and
    tests that assert the old shape.
 

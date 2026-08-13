@@ -438,14 +438,53 @@ class TestReviewFixups:
 
     def test_check_port_detects_occupied_non_http_listener(self) -> None:
         import socket as sock_mod
+        import threading
 
         listener = sock_mod.socket()
         listener.bind(("127.0.0.1", 0))
         listener.listen(1)
         port = listener.getsockname()[1]
+
+        def answer() -> None:
+            conn, _ = listener.accept()
+            conn.close()
+
+        threading.Thread(target=answer, daemon=True).start()
         try:
             check = ops.check_port(f"http://127.0.0.1:{port}/health")
             assert check.ok is False
             assert "occupied" in check.detail
         finally:
             listener.close()
+
+
+class TestReviewFixups2:
+    def test_pem_private_key_fully_redacted(self, tmp_path) -> None:
+        pem = (
+            "-----BEGIN RSA PRIVATE KEY-----\nMIIEpQIBAAKCAQEA\nfakeline\n"
+            "-----END RSA PRIVATE KEY-----\n"
+        )
+        config = tmp_path / "config.toml"
+        config.write_text(f'custom = "{pem}"\n')
+        with mock.patch("opencode_go_proxy.ops.CONFIG_PATH", str(config)):
+            snapshot = ops._config_snapshot()
+        assert "PRIVATE KEY" not in snapshot["redacted"]
+        assert "REDACTED" in snapshot["redacted"]
+
+    def test_check_config_single_quoted_root(self, tmp_path) -> None:
+        config = tmp_path / "config.toml"
+        config.write_text("openai_base_url = 'http://127.0.0.1:8787/v1'\n")
+        with mock.patch("opencode_go_proxy.ops.CONFIG_PATH", str(config)):
+            assert ops.check_config().ok is True
+
+    def test_check_config_ignores_table_section_value(self, tmp_path) -> None:
+        config = tmp_path / "config.toml"
+        config.write_text('[model_providers.opencode-go]\nopenai_base_url = "http://127.0.0.1:8787/v1"\n')
+        with mock.patch("opencode_go_proxy.ops.CONFIG_PATH", str(config)):
+            assert ops.check_config().ok is False
+
+    def test_check_config_requires_exact_port(self, tmp_path) -> None:
+        config = tmp_path / "config.toml"
+        config.write_text('openai_base_url = "http://127.0.0.1:9999/v1"\n')
+        with mock.patch("opencode_go_proxy.ops.CONFIG_PATH", str(config)):
+            assert ops.check_config().ok is False

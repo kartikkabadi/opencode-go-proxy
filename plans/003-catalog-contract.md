@@ -26,9 +26,10 @@ process, and refresh writes a CWD-relative contrib path.
 ### 1. Canonical model contract
 
 - Define the canonical model object shape in catalog.py as a documented
-  dict with the exact merged key set (model top level: multi_agent_version,
-  comp_hash, token_budget, approvals, collaboration_modes, auto_review,
-  permissions, availability_nux, visibility, input_modalities, ...).
+  dict with the exact merged key set. multi_agent_version and comp_hash live
+  at model top level; token_budget, approvals, collaboration_modes,
+  auto_review, and permissions live inside model_messages (MODEL_MESSAGES_KEYS),
+  matching the shipped catalog.py contract and codex-router's merged shape.
 - Rebuild `render_full_catalog` as a projection FROM this canonical shape,
   with no hand-copied drop list.
 

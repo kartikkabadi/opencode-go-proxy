@@ -117,14 +117,20 @@ def check_config_file() -> Check:
 
 
 def _root_openai_base_url(text: str) -> str | None:
-    """Value of the root openai_base_url assignment, ignoring comments and sections."""
+    """Value of the root openai_base_url assignment (double- or single-quoted).
+
+    Stops at the first TOML table header: an openai_base_url inside a section
+    is not the root Codex setting.
+    """
     for raw_line in text.splitlines():
         line = raw_line.strip()
-        if not line or line.startswith(("#", "[")):
+        if line.startswith("["):
+            break
+        if not line or line.startswith("#"):
             continue
-        match = re.match(r'openai_base_url\s*=\s*"([^"]+)"', line)
+        match = re.match(r"""openai_base_url\s*=\s*(?:"([^"]+)"|'([^']+)')""", line)
         if match:
-            return match.group(1)
+            return match.group(1) or match.group(2)
     return None
 
 
@@ -138,9 +144,11 @@ def check_config() -> Check:
     except OSError as exc:
         return Check("config", "fail", str(exc))
     base_url = _root_openai_base_url(text)
-    if base_url and f"{DEFAULT_HOST}:{DEFAULT_PORT}" in base_url:
-        return Check("config", "ok", f"openai_base_url points at {base_url}")
-    return Check("config", "fail", f"root openai_base_url does not point at {DEFAULT_HOST}:{DEFAULT_PORT}", fix="Run the config-manager enable step (plan 012) once it ships.")
+    if base_url:
+        parsed = urllib.parse.urlparse(base_url)
+        if parsed.hostname in ("127.0.0.1", "localhost", "::1") and parsed.port == DEFAULT_PORT:
+            return Check("config", "ok", f"openai_base_url points at {base_url}")
+    return Check("config", "fail", f"root openai_base_url must point at http://{DEFAULT_HOST}:{DEFAULT_PORT}", fix="Run the config-manager enable step (plan 012) once it ships.")
 
 
 def _catalog_models() -> tuple[str, list[Json]]:
@@ -379,9 +387,18 @@ def _mask_secret_values(text: str) -> str:
     return _SECRET_KEY.sub(lambda m: f"{m.group(1)}= ***redacted***", text)
 
 
+_PEM_PRIVATE_KEY = re.compile(
+    r"-----BEGIN [A-Z ]*PRIVATE KEY-----.*?-----END [A-Z ]*PRIVATE KEY-----", re.DOTALL
+)
+
+
 def _redact_text(text: str) -> str:
-    """Redact secret-shaped values plus bearer/sk-/private-key patterns in log text."""
-    return _SECRET_VALUE.sub(lambda m: m.group(1) + "[REDACTED]" if m.group(1) else "[REDACTED]", _mask_secret_values(text))
+    """Redact secret-shaped values plus bearer/sk-/full PEM private-key blocks."""
+    redacted = _PEM_PRIVATE_KEY.sub("[REDACTED PEM BLOCK]", text)
+    return _SECRET_VALUE.sub(
+        lambda m: m.group(1) + "[REDACTED]" if m.group(1) else "[REDACTED]",
+        _mask_secret_values(redacted),
+    )
 
 
 def _ensure_meter() -> None:

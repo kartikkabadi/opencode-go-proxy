@@ -67,19 +67,21 @@ class TestCaptionCache:
         assert cache.get(vision.image_bytes_for_cache(data_url(png))) == "same"
 
     def test_expiry(self) -> None:
-        cache = vision.CaptionCache(ttl_sec=0.05)
+        # Deterministic: drive the cache clock with time.monotonic instead of
+        # sleeping real sub-second margins that flake under CI load.
+        cache = vision.CaptionCache(ttl_sec=5)
         cache.put(b"x", "soon-gone")
         assert cache.get(b"x") == "soon-gone"
-        time.sleep(0.08)
-        assert cache.get(b"x") is None
+        with mock.patch("opencode_go_proxy.vision.time.time", return_value=time.time() + 10):
+            assert cache.get(b"x") is None
 
     def test_evicts_oldest_when_full(self) -> None:
         cache = vision.CaptionCache(max_entries=2)
-        cache.put(b"1", "one")
-        time.sleep(0.01)
-        cache.put(b"2", "two")
-        time.sleep(0.01)
-        cache.put(b"3", "three")
+        base = time.time()
+        with mock.patch("opencode_go_proxy.vision.time.time", side_effect=[base, base + 1, base + 2]):
+            cache.put(b"1", "one")
+            cache.put(b"2", "two")
+            cache.put(b"3", "three")
         assert len(cache) == 2
         assert cache.get(b"1") is None
         assert cache.get(b"2") == "two"

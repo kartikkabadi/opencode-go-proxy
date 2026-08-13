@@ -699,8 +699,9 @@ def refresh_catalog(
         discovered = discover_models()
     except CatalogDiscoveryError:
         # Offline first run: fall back to the seed so a fresh install that
-        # cannot reach models.dev still renders a valid catalog.
-        fallback = _load_if_readable(compact_path) or load_seed_compact()
+        # cannot reach models.dev still renders a valid catalog. Honor an
+        # explicit seed_path, not just the default seed.
+        fallback = _load_if_readable(compact_path) or _load_if_readable(seed_path)
         if fallback is not None:
             return _render_and_write(fallback, catalog_path, overlay=overlay)
         raise

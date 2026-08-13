@@ -681,7 +681,9 @@ def responses_payload_to_chat_payload(payload: Json) -> tuple[Json, str, Json]:
     return chat_payload, incoming_model, stats
 
 
-def chat_completion_to_response(chat: Json, request_model: str | None = None) -> Json:
+def chat_completion_to_response(
+    chat: Json, request_model: str | None = None, *, estimated_input_tokens: int | None = None
+) -> Json:
     response_id = new_response_id()
     model = request_model or DEFAULT_MODEL
     choice = _first_choice(chat)
@@ -695,7 +697,7 @@ def chat_completion_to_response(chat: Json, request_model: str | None = None) ->
         "model": model,
         "output": output,
         "output_text": output_text_from_items(output),
-        "usage": normalize_usage(chat.get("usage")),
+        "usage": normalize_usage(chat.get("usage"), estimated_input_tokens=estimated_input_tokens),
     }
 
 

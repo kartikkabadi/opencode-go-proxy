@@ -30,8 +30,8 @@ on native endpoints), and exposes enable/disable/status.
    untouched; remove the file if the block was the only content.
 4. config status: show managed state (enabled/disabled, block present, user
    keys untouched).
-5. Tests use a temp config file via env (CONFIG_PATH override or a
-   config-manager test hook); never touch the real config.toml.
+5. Tests use a temp config file via the OPENCODE_GO_PROXY_CONFIG_PATH env
+   override; never touch the real config.toml.
 6. CLI: opencode-go-proxy config enable|disable|status.
 
 ## Out of scope

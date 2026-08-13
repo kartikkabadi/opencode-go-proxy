@@ -50,7 +50,7 @@ rejection, and verify the 426 copy in place with a test.
 
 ## Verification gates
 
-- uv run python -m pytest tests -q green (expect 258 + new tests).
+- uv run python -m pytest tests -q green (current baseline: 454 tests).
 - uvx ruff check src tests clean.
 - The passthrough is byte-identical: assert relayed body equals the mocked
   upstream body.

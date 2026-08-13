@@ -21,7 +21,9 @@ and OPTIONS stays unhandled so browser preflight is blocked.
 
 1. Host validation on every request: missing Host -> 400
    {"error":{"type":"invalid_host","message":"missing Host header"}}.
-   Host not in {127.0.0.1, localhost, ::1, [::1]} -> 403
+   Host must be normalized first (strip the port and IPv6 brackets; e.g.
+   `127.0.0.1:8787` -> `127.0.0.1`) and then checked against
+   {127.0.0.1, localhost, ::1}; anything else -> 403
    {"error":{"type":"invalid_host","message":"request host is not allowed"}},
    unless OPENCODE_GO_PROXY_ALLOW_REMOTE=1 (explicit opt-in for deliberate
    non-loopback binds).

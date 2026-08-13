@@ -8,6 +8,7 @@ recording.
 
 from __future__ import annotations
 
+import http.client
 import json
 import os
 import threading
@@ -275,6 +276,7 @@ def handle_streaming_request(payload: Json, config: ProxyConfig, request_id: str
             reasoning_open = False
             reasoning_emitted = False
             got_data = False
+            usage = None
             # output_index is a monotonic counter assigned once per emitted
             # output_item.added and reused by every delta/done/completed for
             # that item, so mixed text and tool calls can never share an index.
@@ -437,10 +439,11 @@ def handle_streaming_request(payload: Json, config: ProxyConfig, request_id: str
                                     # Arguments only start after the final name chunk, so
                                     # the accumulated name is complete: emit added now.
                                     emit_tool_added(idx)
-            except (urllib.error.HTTPError, urllib.error.URLError, TimeoutError, OSError) as exc:
+            except (urllib.error.HTTPError, urllib.error.URLError, TimeoutError, OSError, http.client.HTTPException) as exc:
                 # The upstream stream died after its 200 head was already committed to
-                # the client. Surface an error and mark the turn as aborted so the
-                # meter never records a success the client never received.
+                # the client (including a truncated body: http.client.IncompleteRead).
+                # Surface an error and mark the turn as aborted so the meter never
+                # records a success the client never received.
                 code = exc.code if isinstance(exc, urllib.error.HTTPError) else None
                 trace("upstream.stream_aborted", request_id=request_id,
                       status=code or getattr(exc, "reason", str(exc)))
@@ -518,7 +521,14 @@ def handle_streaming_request(payload: Json, config: ProxyConfig, request_id: str
         for item in output:
             if item.get("type") != "function_call":
                 continue
-            idx = tool_indices.get(tc_count, 0)
+            idx = tool_indices.get(tc_count)
+            if idx is None:
+                # Final-only call (name or arguments never arrived during
+                # streaming): allocate a fresh index so it never collides with
+                # reasoning, text, or an earlier tool call.
+                idx = next_output_index
+                next_output_index += 1
+                tool_indices[tc_count] = idx
             if tc_count in tool_call_open:
                 # Already emitted added during streaming; close with the final
                 # name/arguments and keep the streamed item id.
@@ -588,6 +598,7 @@ def handle_chat_stream_passthrough(payload: Json, config: ProxyConfig, request_i
     inside a relayed frame, and the relay stops as soon as the client
     disconnects.
     """
+    started = time.time()
     api_key = resolve_api_key(config, request_id)
     url = f"{config.chat_base_url}/chat/completions"
     raw_payload = json.dumps(payload, separators=(",",":")).encode("utf-8")
@@ -614,7 +625,16 @@ def handle_chat_stream_passthrough(payload: Json, config: ProxyConfig, request_i
             handler.end_headers()
             handler.wfile.write(body)
             handler.wfile.flush()
+            record_usage_event(
+                model=payload.get("model") or DEFAULT_MODEL, status=exc.code,
+                duration_ms=int((time.time() - started) * 1000), retries=retries or None,
+            )
             return
+        record_usage_event(
+            model=payload.get("model") or DEFAULT_MODEL,
+            status=HTTPStatus.GATEWAY_TIMEOUT if isinstance(exc, TimeoutError) else HTTPStatus.BAD_GATEWAY,
+            duration_ms=int((time.time() - started) * 1000), retries=retries or None,
+        )
         if isinstance(exc, TimeoutError):
             raise ProxyError(HTTPStatus.GATEWAY_TIMEOUT, "upstream timeout", retries=retries) from exc
         raise ProxyError(HTTPStatus.BAD_GATEWAY, f"upstream network error: {getattr(exc, 'reason', exc)}", retries=retries) from exc
@@ -645,7 +665,6 @@ def handle_chat_stream_passthrough(payload: Json, config: ProxyConfig, request_i
     ka_thread = threading.Thread(target=keepalive, daemon=True)
     ka_thread.start()
 
-    started = time.time()
     try:
         with response as resp:
             for line in resp:
@@ -660,9 +679,10 @@ def handle_chat_stream_passthrough(payload: Json, config: ProxyConfig, request_i
                     trace("client.disconnected", request_id=request_id,
                           message="client closed connection during stream")
                     break
-    except (urllib.error.HTTPError, urllib.error.URLError, TimeoutError, OSError) as exc:
-        # The SSE head is already committed; terminate the relay without
-        # rendering a second HTTP response inside the stream.
+    except (urllib.error.HTTPError, urllib.error.URLError, TimeoutError, OSError, http.client.HTTPException) as exc:
+        # The SSE head is already committed (including a truncated upstream body:
+        # http.client.IncompleteRead); terminate the relay without rendering a
+        # second HTTP response inside the stream.
         trace("upstream.stream_aborted", request_id=request_id,
               status=getattr(exc, "code", None) or getattr(exc, "reason", str(exc)))
     finally:
@@ -670,3 +690,7 @@ def handle_chat_stream_passthrough(payload: Json, config: ProxyConfig, request_i
 
     elapsed_ms = int((time.time() - started) * 1000)
     trace("upstream.done", request_id=request_id, status=response.status, elapsed_ms=elapsed_ms, stream=True)
+    record_usage_event(
+        model=payload.get("model") or DEFAULT_MODEL, status=response.status,
+        duration_ms=elapsed_ms, retries=retries or None,
+    )

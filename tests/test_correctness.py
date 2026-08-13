@@ -5,6 +5,7 @@ import json
 import math
 import os
 import time
+from typing import ClassVar
 from unittest import mock
 
 from opencode_go_proxy.app import ProxyConfig
@@ -289,3 +290,45 @@ class TestKeepaliveToTrueEnd:
         frozen = len(raw)
         time.sleep(0.3)
         assert len(wfile.getvalue()) - frozen <= len(b": keepalive\n\n")
+
+
+class TestNonStreamZeroInputEstimate:
+    def test_non_stream_response_uses_estimate(self) -> None:
+        # Regression (review): the non-stream /v1/responses path must apply the
+        # same zero-input estimate as streaming so compaction accounting holds.
+        from opencode_go_proxy.app import handle_responses_request
+
+        usage = {"prompt_tokens": 0, "completion_tokens": 5, "total_tokens": 5}
+        chat = {
+            "id": "cmpl-x", "object": "chat.completion", "model": "deepseek-v4-flash",
+            "choices": [{"index": 0, "finish_reason": "stop",
+                         "message": {"role": "assistant", "content": "hi"}}],
+            "usage": usage,
+        }
+        captured: dict = {}
+
+        class FakeResp:
+            status = 200
+            headers: ClassVar[dict] = {}
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return False
+
+            def read(self):
+                return json.dumps(chat).encode()
+
+        def fake_urlopen(req, **kw):
+            captured["raw"] = req.data
+            return FakeResp()
+
+        cfg = make_config()
+        with mock.patch.dict(os.environ, {"OPENCODE_GO_API_KEY": "test-key"}, clear=True), mock.patch(
+            "urllib.request.urlopen", side_effect=fake_urlopen
+        ):
+            resp = handle_responses_request({"model": "deepseek-v4-flash", "input": "hi"}, cfg, "req")
+        expected = min(272000, max(1000, math.ceil(len(captured["raw"]) / 3.3)))
+        assert resp["usage"]["input_tokens"] == expected
+        assert resp["usage"]["estimatedInputTokens"] == expected

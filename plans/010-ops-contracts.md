@@ -33,8 +33,10 @@ check set with --fix; setup/install/status ship; base-URL overrides
    ~/Library/LaunchAgents + load it (macOS) with explicit confirmation flag;
    status = report running/port/log paths; uninstall/update/rollback are
    documented, not implemented (no approval to touch the live agent).
-5. Base-URL overrides: config.chat_base_url honors OPENCODE_GO_BASE_URL,
-   then OPENCODE_ZEN_BASE_URL, then the default.
+5. Base-URL overrides: config.chat_base_url honors --chat-base-url, then
+   OPENCODE_GO_BASE_URL, then OPENCODE_ZEN_BASE_URL, then the legacy
+   CHAT_COMPLETIONS_BASE_URL, then the built-in default (see
+   config.resolve_chat_base_url).
 
 ## Out of scope
 

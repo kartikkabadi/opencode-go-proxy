@@ -348,14 +348,6 @@ DEFAULT_LOCAL_VISION_MODEL = "qwen2.5vl:3b"
 LOCAL_PROBE_TIMEOUT_SEC = 1.5
 _LOCAL_PROBE_TTL_SEC = 30.0
 
-# Vision model names a local runtime must expose before auto will nominate it;
-# a runtime that is up but only serves text models is "not enabled".
-_LOCAL_VISION_KEYWORDS = re.compile(
-    r"(qwen2\.?5?-?vl|qwen2-vl|llama3\.2-vision|llava|moondream|gemma3|"
-    r"minicpm-v|internvl|phi-4-vision|phi-3-vision|bakllava|cogvlm|glm-4v)",
-    re.IGNORECASE,
-)
-
 _LOCAL_PROBE_CACHE: dict[tuple[str, str], tuple[float, bool]] = {}
 
 

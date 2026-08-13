@@ -311,3 +311,75 @@ class TestWebSocketUpgradeRejection:
             b"Connection: close\r\n"
             b"Content-Length: 0\r\n\r\n"
         )
+
+
+class TestPassthroughMetering:
+    def test_non_stream_passthrough_records_usage(self, tmp_path) -> None:
+        state = tmp_path / "state"
+        state.mkdir(exist_ok=True)
+        raw = json.dumps({"choices": [{"message": {"content": "hi"}}]}).encode()
+
+        class FakeResp:
+            status = 200
+            headers: ClassVar[dict] = {"content-type": "application/json"}
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return False
+
+            def read(self):
+                return raw
+
+        with mock.patch.dict(
+            os.environ,
+            {"OPENCODE_GO_API_KEY": "test-key", "OPENCODE_GO_PROXY_STATE_DIR": str(state)},
+            clear=True,
+        ), mock.patch("urllib.request.urlopen", return_value=FakeResp()):
+            from opencode_go_proxy.app import handle_chat_completions_request
+            from opencode_go_proxy.meter import usage_events_path
+
+            handler = mock.Mock(wfile=mock.Mock())
+            handle_chat_completions_request(handler, {"model": "deepseek-v4-flash", "messages": [{"role": "user", "content": "hi"}]}, make_config(8790), "req")
+            with open(usage_events_path()) as fh:
+                events = [json.loads(line) for line in fh if line.strip()]
+        assert events, "passthrough must be metered"
+        assert events[-1]["status"] == 200
+        assert events[-1]["model"] == "deepseek-v4-flash"
+
+
+class TestRelayIncompleteRead:
+    def test_truncated_upstream_body_terminates_without_second_json(self) -> None:
+        # Regression (review): http.client.IncompleteRead mid-relay must not
+        # let do_POST append a JSON error inside the committed SSE stream.
+        import http.client
+
+        from opencode_go_proxy.streaming import handle_chat_stream_passthrough
+
+        class Truncated:
+            status = 200
+            headers: ClassVar[dict] = {"content-type": "text/event-stream"}
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return False
+
+            def __iter__(self):
+                yield b"data: {}\n\n"
+                raise http.client.IncompleteRead(b"partial")
+
+        handler = mock.Mock()
+        handler.wfile = io.BytesIO()
+        with mock.patch.dict(os.environ, {"OPENCODE_GO_API_KEY": "test-key"}, clear=True), mock.patch(
+            "urllib.request.urlopen", return_value=Truncated()
+        ):
+            handle_chat_stream_passthrough(
+                {"model": "deepseek-v4-flash", "messages": [{"role": "user", "content": "hi"}], "stream": True},
+                make_config(8790), "req", handler,
+            )
+        body = handler.wfile.getvalue().decode()
+        assert '"error"' not in body
+        assert "data: {}" in body

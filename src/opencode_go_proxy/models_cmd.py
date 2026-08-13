@@ -18,7 +18,7 @@ from . import catalog
 
 # --set values are typed so numeric model fields survive the overlay.
 _INT_KEYS = frozenset(
-    {"context_window", "max_context_window", "context_window_override", "comp_hash"}
+    {"context_window", "max_context_window", "context_window_override", "effective_context_window_percent"}
 )
 _FLOAT_KEYS = frozenset({"priority"})
 

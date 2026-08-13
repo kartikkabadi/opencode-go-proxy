@@ -108,7 +108,7 @@ def call_upstream_chat(chat_payload: Json, config: ProxyConfig, request_id: str,
         trace("upstream.start", request_id=request_id, url=url, bytes=len(raw_payload), attempt=retries + 1)
         started = time.time()
         try:
-            with urllib.request.urlopen(request, timeout=timeout_sec or config.timeout_sec) as response:
+            with urllib.request.urlopen(request, timeout=timeout_sec if timeout_sec is not None else config.timeout_sec) as response:
                 body = response.read()
                 record_quota_from_headers(getattr(response, "headers", None))
                 elapsed_ms = int((time.time() - started) * 1000)
@@ -145,7 +145,7 @@ def call_upstream_chat(chat_payload: Json, config: ProxyConfig, request_id: str,
                 continue
             raise ProxyError(HTTPStatus.BAD_GATEWAY, f"upstream network error: {getattr(exc, 'reason', exc)}", retries=retries) from exc
         except TimeoutError:
-            trace("upstream.timeout", request_id=request_id, timeout=timeout_sec or config.timeout_sec)
+            trace("upstream.timeout", request_id=request_id, timeout=timeout_sec if timeout_sec is not None else config.timeout_sec)
             if retries < max_retries:
                 retries += 1
                 trace("upstream.retry", request_id=request_id, attempt=retries, reason="timeout")
@@ -178,7 +178,7 @@ def call_upstream_chat_verbatim(
         trace("upstream.start", request_id=request_id, url=url, bytes=len(raw_payload), attempt=retries + 1)
         started = time.time()
         try:
-            with urllib.request.urlopen(request, timeout=timeout_sec or config.timeout_sec) as response:
+            with urllib.request.urlopen(request, timeout=timeout_sec if timeout_sec is not None else config.timeout_sec) as response:
                 body = response.read()
                 record_quota_from_headers(getattr(response, "headers", None))
                 elapsed_ms = int((time.time() - started) * 1000)
@@ -202,7 +202,7 @@ def call_upstream_chat_verbatim(
                 continue
             raise ProxyError(HTTPStatus.BAD_GATEWAY, f"upstream network error: {getattr(exc, 'reason', exc)}", retries=retries) from exc
         except TimeoutError:
-            trace("upstream.timeout", request_id=request_id, timeout=timeout_sec or config.timeout_sec)
+            trace("upstream.timeout", request_id=request_id, timeout=timeout_sec if timeout_sec is not None else config.timeout_sec)
             if retries < max_retries:
                 retries += 1
                 trace("upstream.retry", request_id=request_id, attempt=retries, reason="timeout")

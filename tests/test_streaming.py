@@ -45,8 +45,14 @@ def _stream(lines: list[bytes], *, env: dict[str, str] | None = None, state_dir:
     cfg = make_config()
     payload = {"model": "deepseek-v4-flash", "input": "hi", "stream": True}
     wfile = io.BytesIO()
+    meter: list[dict] = []
     with mock.patch.dict(os.environ, merged):
         handle_streaming_request(payload, cfg, "req", wfile)
+        try:
+            with open(usage_events_path(), encoding="utf-8") as f:
+                meter = [json.loads(line) for line in f if line.strip()]
+        except FileNotFoundError:
+            meter = []
     events: list[dict] = []
     for block in wfile.getvalue().decode("utf-8").split("\n\n"):
         block = block.strip()
@@ -56,11 +62,7 @@ def _stream(lines: list[bytes], *, env: dict[str, str] | None = None, state_dir:
         if data == "[DONE]":
             continue
         events.append(json.loads(data))
-    try:
-        with open(usage_events_path(), encoding="utf-8") as f:
-            meter = [json.loads(line) for line in f if line.strip()]
-    except FileNotFoundError:
-        meter = []
+
     return events, wfile, meter
 
 
@@ -149,3 +151,21 @@ class TestOutputIndexes:
         done = [e for e in events if e["type"] == "response.output_item.done"]
         done_indices = [e["output_index"] for e in done]
         assert len(set(done_indices)) == len(done_indices), f"done collision: {done_indices}"
+
+
+class TestFinalOnlyToolIndex:
+    def test_name_only_tool_call_gets_unique_index(self) -> None:
+        # A tool call that never streams arguments (final-only) must not reuse
+        # output_index 0 or collide with any other item.
+        lines = [
+            b'data: {"choices":[{"delta":{"content":"reading "}}]}\n',
+            b'data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","function":{"name":"read_file"}}]}}]}\n',
+            b'data: {"id":"1","choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}\n',
+            b"data: [DONE]\n",
+        ]
+        with mock.patch("urllib.request.urlopen", return_value=_UpstreamStream(lines)):
+            events, _wfile, _meter = _stream(lines)
+        added = [e for e in events if e["type"] == "response.output_item.added"]
+        assert len(added) >= 2
+        indices = [e["output_index"] for e in added]
+        assert len(set(indices)) == len(indices), f"collision: {indices}"
