@@ -1,5 +1,38 @@
 # Changelog
 
+## [0.4.0] - 2026-08-14
+
+### Added
+
+- OpenCode Zen support: the proxy now serves both OpenCode Go and OpenCode Zen.
+  Zen models are auto-discovered from `https://opencode.ai/zen/v1/models` (no
+  auth), merged with models.dev metadata, and appear in the catalog and
+  `/v1/models` as `zen/<id>` slugs. Requests route per family — claude/qwen to
+  Anthropic Messages (`/zen/v1/messages`, `x-api-key`), gemini to the Gemini API
+  (`/zen/v1/models/<id>`, `x-goog-api-key`), gpt/grok to the Responses API
+  (`/zen/v1/responses`, relayed verbatim), everything else to
+  chat/completions — with each family's stream translated back to one uniform
+  Responses stream. Auth uses the same key as Go
+  (`OPENCODE_GO_API_KEY` / `opencode-go-api-key` keychain) with the header
+  mapped per family. Zen turns meter with `provider="zen"` so they never count
+  against the Go quota. Free models (`deepseek-v4-flash-free`, `mimo-v2.5-free`,
+  `big-pickle`) need no credits.
+- Usage in the menu bar: `GET /state` gains `usage.go` (OpenCode Go usage
+  polled from `https://opencode.ai/zen/go/v1/usage` with a 60s TTL, `null` on
+  fetch failure), `usage.goLimits` (fixed Go dollar budgets: $60/month,
+  $30/week, $12 per rolling 5 hours), and `usage.zen` (today's turns/tokens and
+  a seven-entry last-7-day token rollup from the local meter), alongside the
+  existing all-provider keys.
+
+## [0.3.1] - 2026-08-14
+
+### Fixed
+
+- Catalog `availability_nux` is emitted in the `{message: string} | null`
+  object form the Codex app schema expects instead of a bare string;
+  string-form nux arriving from upstream records is normalized, with empty
+  strings mapped to `null`.
+
 ## [0.3.0] - 2026-08-13
 
 ### Added

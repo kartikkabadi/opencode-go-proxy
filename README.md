@@ -5,10 +5,12 @@
 [![Python 3.11+](https://img.shields.io/badge/python-3.11+-blue.svg)](https://www.python.org/downloads/)
 [![Dependencies: zstandard](https://img.shields.io/badge/dependencies-zstandard-blue.svg)](#)
 
-Use your [OpenCode Go](https://opencode.ai/docs/go) subscription in the [Codex app](https://github.com/openai/codex).
+Use your [OpenCode Go](https://opencode.ai/docs/go) and [OpenCode Zen](https://opencode.ai/zen) access in the [Codex app](https://github.com/openai/codex).
 
 Codex expects a Responses API (`/v1/responses`). OpenCode Go exposes an OpenAI-compatible
-Chat Completions API (`/v1/chat/completions`). This proxy bridges that gap in one local process:
+Chat Completions API (`/v1/chat/completions`), and OpenCode Zen serves GPT, Claude, Gemini,
+Grok, DeepSeek, GLM, Kimi, and Qwen models over four different API surfaces. This proxy
+bridges both in one local process:
 
 ```text
 Codex app
@@ -17,16 +19,18 @@ Codex app
     ▼
 opencode-go-proxy  ←── localhost:8787, one runtime dep (zstandard)
     │
-    │  POST /v1/chat/completions (Chat Completions API)
+    │  POST per family: chat/completions · responses · messages · models/<id>
     ▼
-OpenCode Go  ────── 13 models: DeepSeek, GLM, Kimi, MiMo, MiniMax, Qwen
+OpenCode Go / OpenCode Zen  ── 13 open Go models · GPT, Claude, Gemini, Grok, DeepSeek, GLM, Kimi, Qwen
 ```
 
 ## Why
 
 OpenCode Go is $5 for the first month, then $10/month. You get access to 13 open coding models
-hosted in the US, EU, and Singapore. Codex is a great agent but doesn't speak Chat Completions
-natively — it requires Responses-shaped providers. This proxy fixes that.
+hosted in the US, EU, and Singapore. OpenCode Zen is the pay-as-you-go gateway on the same
+account, with frontier models — GPT, Claude, Gemini, Grok — alongside the open ones. Codex is a
+great agent but doesn't speak Chat Completions natively — it requires Responses-shaped providers.
+This proxy fixes that for both.
 
 ## Quick start
 
@@ -126,10 +130,12 @@ codex -p kimi-k2.7-code
 
 The proxy picks the upstream model based on what Codex sends:
 
-1. If the model slug is in the [alias map](src/opencode_go_proxy/protocol.py), it's mapped
+1. If the model slug is `zen/`-prefixed, it routes to the OpenCode Zen gateway
+   instead (see [OpenCode Zen](#opencode-zen)); the prefix wins over everything below.
+2. If the model slug is in the [alias map](src/opencode_go_proxy/protocol.py), it's mapped
    (e.g. `gpt-5.5` → `deepseek-v4-pro`).
-2. If the model slug is a known OpenCode Go model (from the catalog), it's used as-is.
-3. Otherwise, it falls back to `deepseek-v4-flash`.
+3. If the model slug is a known OpenCode Go model (from the catalog), it's used as-is.
+4. Otherwise, it falls back to `deepseek-v4-flash`.
 
 When images are present in a turn with tools, the proxy captions the latest image
 (older ones are stubbed) and routes the main turn to your configured model. Image
@@ -149,6 +155,47 @@ engine with `CODEX_IMAGE_MODEL` or `OPENCODE_GO_PROXY_CAPTION_MODEL` (a model sl
 `OPENCODE_GO_PROXY_VISION_LOCAL_BASE_URL` / `OPENCODE_GO_PROXY_VISION_LOCAL_MODEL`.
 Disable `detail: low` with `OPENCODE_GO_PROXY_CAPTION_DETAIL=none` (a rejected detail
 value also falls back to a `sips`-downscaled image with no detail).
+
+## OpenCode Zen
+
+Since 0.4.0 the proxy also serves [OpenCode Zen](https://opencode.ai/zen), the
+pay-as-you-go gateway with GPT, Claude, Gemini, Grok, DeepSeek, GLM, Kimi, and Qwen
+models. Zen models are auto-discovered from `https://opencode.ai/zen/v1/models` (no
+auth), merged with models.dev metadata, and appear in the catalog and `/v1/models`
+as `zen/<id>` slugs (e.g. `zen/claude-sonnet-4-5`). Point a Codex profile at one the
+same way you do Go models:
+
+```toml
+[profiles.claude-sonnet-4-5]
+model_provider = "opencode-go"
+model = "zen/claude-sonnet-4-5"
+model_context_window = 200000
+approval_policy = "untrusted"
+sandbox_mode = "workspace-write"
+features = { memories = false }
+```
+
+Requests route by model family, translated from the Responses API the proxy always
+speaks to the surface the gateway expects:
+
+| Model ids | Upstream surface | Auth header |
+|-----------|------------------|-------------|
+| `claude-*`, `qwen*` | `/zen/v1/messages` (Anthropic Messages) | `x-api-key` |
+| `gemini-*` | `/zen/v1/models/<id>` (Gemini API) | `x-goog-api-key` |
+| `gpt-*`, `grok-*` | `/zen/v1/responses` (Responses API, verbatim) | `Authorization: Bearer` |
+| everything else | `/zen/v1/chat/completions` | `Authorization: Bearer` |
+
+The proxy resolves the same key as Go — `$OPENCODE_GO_API_KEY` or the macOS keychain
+entry `opencode-go-api-key` — and maps the auth header per family. Zen turns meter
+with `provider="zen"`, so they never count against your Go quota.
+
+Free models need no credits: `deepseek-v4-flash-free`, `mimo-v2.5-free`, and
+`big-pickle` are always available.
+
+The menu bar app shows Go usage polled from `https://opencode.ai/zen/go/v1/usage`
+(60s cache) next to the fixed Go plan limits ($60/month, $30/week, $12 per rolling
+5 hours), and a Zen rollup of today's turns/tokens and the last 7 days from the
+local usage meter.
 
 ## API key
 
@@ -182,6 +229,7 @@ See the [lazycodex docs](https://github.com/code-yeongyu/oh-my-openagent) for se
 
 ## Features
 
+- OpenCode Zen support: auto-discovered `zen/<id>` catalog merged with models.dev metadata, per-family wire translation (Anthropic Messages / Gemini / Responses / chat-completions) with per-family auth header mapping, free models, and `provider="zen"` metering
 - Responses `input` to chat `messages` translation
 - `instructions` and `developer` roles mapped to system messages
 - Function tool schema passthrough
@@ -316,11 +364,34 @@ curl http://127.0.0.1:8787/state
       { "date": "2026-08-09", "tokens": 1800 },
       { "date": "2026-08-10", "tokens": 2700 },
       { "date": "2026-08-11", "tokens": 3456 }
-    ]
+    ],
+    "go": {
+      "rolling": { "...": "..." },
+      "weekly": { "...": "..." },
+      "monthly": { "...": "..." }
+    },
+    "goLimits": {
+      "monthlyDollars": 60,
+      "weeklyDollars": 30,
+      "rolling5hDollars": 12
+    },
+    "zen": {
+      "todayTurns": 3,
+      "todayTokens": 812,
+      "last7d": [0, 0, 0, 0, 1200, 400, 812]
+    }
   },
   "model": "deepseek-v4-flash"
 }
 ```
+
+`usage.go` is the raw response of `GET https://opencode.ai/zen/go/v1/usage`
+(`rolling` / `weekly` / `monthly` windows), TTL-cached for 60s and `null` when
+the fetch fails. `usage.goLimits` holds the fixed Go dollar budgets the menu bar
+renders next to it. `usage.zen` is the Zen-only rollup — turns and tokens for
+today plus a seven-entry daily token list — from the local usage meter; the
+legacy `todayTurns` / `todayTokens` / `last7d` keys stay as the all-provider
+totals.
 
 Missing or corrupt meter/quota files degrade to zeros or `null`; the endpoint
 always returns this shape.
