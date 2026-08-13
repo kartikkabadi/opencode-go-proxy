@@ -77,10 +77,11 @@ def _model_from_discovery(m: dict) -> dict:
             "slug": m.get("id", ""),
             "display_name": m.get("name", ""),
             "description": m.get("description", ""),
-            "context_window": context,
-            "max_context_window": context,
         }
     )
+    if isinstance(context, int) and context > 0:
+        record["context_window"] = context
+        record["max_context_window"] = context
     if isinstance(modalities, list) and modalities:
         record["input_modalities"] = modalities
     if isinstance(reasoning, dict):
@@ -193,11 +194,11 @@ IDENTITY_LINE = (
 
 def model_messages(shared_instructions: str, display_name: str, context_window: int) -> dict[str, Any]:
     """Build the model_messages dict Codex requires for a rendered model."""
-    instructions_template = shared_instructions.replace(
-        shared_instructions.splitlines()[0],
-        IDENTITY_LINE.format(display_name=display_name),
-        1,
-    )
+    identity = IDENTITY_LINE.format(display_name=display_name)
+    if not shared_instructions:
+        instructions_template = identity
+    else:
+        instructions_template = shared_instructions.replace(shared_instructions.splitlines()[0], identity, 1)
     return {
         "instructions_template": instructions_template,
         "supports_reasoning_summaries": True,

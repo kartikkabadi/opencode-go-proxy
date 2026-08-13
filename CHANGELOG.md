@@ -1,6 +1,6 @@
 # Changelog
 
-## [Unreleased]
+## [0.2.0] - 2026-08-10
 
 ### Added
 
@@ -12,23 +12,31 @@
 - `CacheTracker` in `src/cache.py`: thread-safe per-model hit/miss/ratio accounting.
 - Key resolution falls back to `OPENCODE_API_KEY` and the `codex-router-opencode-go`
   keychain service, in addition to `OPENCODE_GO_API_KEY` / `opencode-go-api-key`.
+- Spawned threads inherit the session model: `create_thread` and
+  `send_message_to_thread` function calls get the parent thread's model injected
+  when the caller omits one.
+- Honest usage meter in `src/meter.py`: append-only `usage-events.jsonl` in the state
+  dir with per-turn status, duration, tokens and retries. Truncated streams record
+  `streamAborted` and never count as success; empty completions record
+  `emptyCompletion`. Metering failures never break a live request.
+- Upstream retry with bounded exponential backoff on transient failures
+  (429/5xx/network/timeout), configured via `OPENCODE_GO_PROXY_MAX_RETRIES`
+  (default 2) and `OPENCODE_GO_PROXY_RETRY_BASE_MS`.
+- Ops CLI commands: `opencode-go-proxy doctor` (self-check), `smoke-test` (real
+  upstream probe) and `support-bundle` (namespaced tarball of logs, config and
+  meter, with secret values redacted).
+- Agent skill `skills/opencode-go-proxy/SKILL.md`: orientation for operating the
+  proxy (start/stop, ops commands, prefix caching, config, reliability).
 - Tests: cache parsing (both DeepSeek and OpenAI usage shapes), tracker accounting,
-  `/cache` endpoint, streaming `stream_options`, and cache passthrough to Codex.
+  `/cache` endpoint, streaming `stream_options`, cache passthrough to Codex,
+  meter recording, upstream retry behavior, and the ops commands.
 
 ### Changed
 
 - Native macOS menu bar app in `macos/MenuBarApp` (Swift/AppKit, SwiftPM): short status
   icon, live health check, start/stop of the proxy as a child process, open logs,
-  reveal log file, copy port. Build with `swift build` in `macos/MenuBarApp` (macOS 13+).
-
-### Changed
-
-- README: document that the proxy exposes a single HTTP port (`OPENCODE_GO_PROXY_PORT`,
-  default 8787) with no admin/control channel, how to verify what is listening
-  (`lsof -nP -iTCP:8787 -sTCP:LISTEN`), and how to shorten the Codex provider label
-  (edit `[model_providers.opencode-go] name` in `~/.codex/config.toml`).
-### Changed
-
+  reveal log file, copy port. It refuses to Start when port 8787 is already owned
+  (single-port guard). Build with `swift build` in `macos/MenuBarApp` (macOS 13+).
 - README: document that the proxy exposes a single HTTP port (`OPENCODE_GO_PROXY_PORT`,
   default 8787) with no admin/control channel, how to verify what is listening
   (`lsof -nP -iTCP:8787 -sTCP:LISTEN`), and how to shorten the Codex provider label
@@ -36,6 +44,10 @@
 
 ### Fixed
 
+- zstd request bodies: the Codex desktop app sends `/v1/responses` bodies
+  zstd-compressed whenever it is authenticated; the proxy now decompresses
+  `Content-Encoding: zstd` (and gzip) so the desktop app works. Unsupported
+  encodings return an explicit 400 instead of crashing on a magic byte.
 - Reference catalog `contrib/opencode-go-catalog.json` now ships with the `ModelsCache` wrapper
   (`fetched_at`/`etag`/`client_version`/`models`). Codex 0.142+ desktop app requires all four
   top-level fields — the previous bare `{"models": [...]}` caused the model picker to fall back
@@ -44,6 +56,10 @@
 - SIGTERM graceful shutdown: `serve_forever` now runs on a background thread so the signal
   handler's `server.shutdown()` no longer deadlocks on the main thread, leaving the process
   unkillable via SIGTERM (launchd/systemd stop, menu bar Stop).
+- WebSocket upgrade requests (Codex desktop app realtime) are answered with an explicit
+  `HTTP/1.1 426 Upgrade Required` instead of the previous HTTP/1.0 404, which surfaced as
+  "WebSocket protocol error: HTTP version must be 1.1 or higher" before the app fell back
+  to HTTP streaming.
 
 ## [0.1.2] - 2026-06-21
 
