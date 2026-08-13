@@ -1,11 +1,65 @@
 from __future__ import annotations
 
+import json
 import os
 import time
 import uuid
 from typing import Any
 
 Json = dict[str, Any]
+
+SESSION_SPAWN_TOOLS = {"create_thread", "send_message_to_thread"}
+
+
+def _session_spawn_name(item: Json) -> str | None:
+    """Return the bare tool name of a function_call item, if it is a session-spawn call."""
+    name = item.get("name")
+    if isinstance(name, str) and "__" in name:
+        # Flat namespace form: codex_app__create_thread.
+        name = name.rsplit("__", 1)[1]
+    if not isinstance(name, str) or name not in SESSION_SPAWN_TOOLS:
+        return None
+    return name
+
+
+def inject_session_model(payload: Json, session_model: str) -> Json:
+    """Inject the session's model into create_thread / send_message_to_thread calls.
+
+    Spawned threads inherit the routed session's model instead of falling back
+    to the native Codex model (which is quota-blocked for this account). Only
+    applies when the call omits an explicit model; other tools are untouched.
+    """
+    if not isinstance(payload, dict):
+        return payload
+    input_value = payload.get("input")
+    if not isinstance(input_value, list):
+        return payload
+
+    changed = False
+    for item in input_value:
+        if not isinstance(item, dict) or item.get("type") != "function_call":
+            continue
+        if _session_spawn_name(item) is None:
+            continue
+        arguments = item.get("arguments")
+        if not isinstance(arguments, str):
+            continue
+        try:
+            parsed = json.loads(arguments)
+        except (ValueError, TypeError):
+            continue
+        if not isinstance(parsed, dict):
+            continue
+        model = parsed.get("model")
+        if model is not None and model != "":
+            continue
+        parsed["model"] = session_model
+        item["arguments"] = json.dumps(parsed, sort_keys=True)
+        changed = True
+
+    if not changed:
+        return payload
+    return dict(payload)
 
 DEFAULT_MODEL = "deepseek-v4-flash"
 IMAGE_MODEL_DEFAULT = "mimo-v2.5"
