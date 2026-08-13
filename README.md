@@ -178,6 +178,55 @@ See the [lazycodex docs](https://github.com/code-yeongyu/oh-my-openagent) for se
 - Configurable body cap, bind address guard, keychain credential resolution
 - Local health and model-list endpoints
 
+## Prefix caching
+
+OpenCode Go bills cached reads at a fraction of normal input (`Cached Read` in the
+pricing table), and its usage estimates assume most tokens per request are served from
+cache. For that to happen the request prefix must be byte-stable: the same system
+prompt, tools, and earlier conversation, in the same order, on every request.
+
+The proxy is built for exactly that:
+
+- The system prompt (`instructions` / `developer` roles) is always the first message.
+- Conversation history is appended in order; translation is deterministic, so the
+  serialized prefix is identical across requests in a session — and across sessions
+  that share the same system prompt and tools.
+- Streaming requests set `stream_options: { "include_usage": true }` so the upstream
+  reports its cache accounting (`prompt_cache_hit_tokens` / `cached_tokens`) in the
+  stream; without this most OpenAI-compatible endpoints omit usage entirely.
+- Cache hits are surfaced to Codex in the standard Responses shape
+  (`usage.input_tokens_details.cached_tokens`), so the app shows them in its token
+  display.
+
+### Checking the hit ratio
+
+Every request with cache accounting is logged (look for `"cache": {...}` on
+`response.converted` trace lines). The aggregate is also exposed on a metrics
+endpoint:
+
+```bash
+curl http://127.0.0.1:8787/cache
+```
+
+```json
+{
+  "models": [
+    {
+      "model": "deepseek-v4-flash",
+      "cache_hit_tokens": 100000,
+      "cache_miss_tokens": 1000,
+      "requests": 50,
+      "hit_ratio": 0.990099
+    }
+  ],
+  "totals": { "...": "..." }
+}
+```
+
+Within a session, every request after the first shares the full previous prefix, so
+cache-eligible requests typically run at 99%+ hit ratio; only the genuinely new delta
+misses. The first request of a brand-new context always misses (nothing is cached yet).
+
 ## Install
 
 ### From source (no package manager)

@@ -6,7 +6,7 @@ readme = "README.md"
 authors = [{ name = "Kartik Kabadi", email = "1kartikkabadi1@gmail.com" }]
 license = "MIT"
 requires-python = ">=3.11"
-dependencies = []
+dependencies = ["zstandard>=0.22"]
 keywords = ["codex", "opencode", "responses-api", "chat-completions", "agent", "proxy"]
 classifiers = [
     "Development Status :: 3 - Alpha",

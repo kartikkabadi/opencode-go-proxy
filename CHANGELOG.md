@@ -4,6 +4,19 @@
 
 ### Added
 
+- Prefix-cache support for OpenCode Go models: streaming requests now set
+  `stream_options.include_usage`, the proxy parses the upstream's cache accounting
+  (`prompt_cache_hit_tokens` / `prompt_tokens_details.cached_tokens`), surfaces it to
+  Codex in `usage.input_tokens_details.cached_tokens`, logs it per request, and
+  exposes aggregate hit/miss/ratio on a `/cache` (and `/metrics`) endpoint.
+- `CacheTracker` in `src/cache.py`: thread-safe per-model hit/miss/ratio accounting.
+- Key resolution falls back to `OPENCODE_API_KEY` and the `codex-router-opencode-go`
+  keychain service, in addition to `OPENCODE_GO_API_KEY` / `opencode-go-api-key`.
+- Tests: cache parsing (both DeepSeek and OpenAI usage shapes), tracker accounting,
+  `/cache` endpoint, streaming `stream_options`, and cache passthrough to Codex.
+
+### Changed
+
 - Native macOS menu bar app in `macos/MenuBarApp` (Swift/AppKit, SwiftPM): short status
   icon, live health check, start/stop of the proxy as a child process, open logs,
   reveal log file, copy port. Build with `swift build` in `macos/MenuBarApp` (macOS 13+).
