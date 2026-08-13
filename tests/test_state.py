@@ -188,7 +188,9 @@ class TestStateEndpoint:
         assert status == 200
 
     def test_state_reflects_meter_and_quota(self, server) -> None:
-        record_at(datetime.datetime(2026, 8, 11, 2, 0, tzinfo=UTC), model="deepseek-v4-pro",
+        # /state aggregates with the real clock, so the event must be "now":
+        # a hardcoded past date lands outside today's bucket.
+        record_at(datetime.datetime.now(UTC), model="deepseek-v4-pro",
                   status=200, duration_ms=100, total_tokens=42)
         record_quota_from_headers({"x-ratelimit-limit-requests": "500", "x-ratelimit-remaining-requests": "99"})
         status, state = get(server, "/state")

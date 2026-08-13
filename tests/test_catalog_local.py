@@ -4,6 +4,7 @@ Covers the user-models overlay (add / hide / edit display), hidden-model flags,
 announcements, the mtime-cached known_models() reload without restart, and the
 rule that runtime refresh never writes the checked-in contrib files.
 """
+import datetime
 import json
 import os
 import socket
@@ -47,8 +48,11 @@ def base_models() -> list[dict]:
 
 
 def minimal_compact() -> dict:
+    # Fresh relative to the real clock: a hardcoded fetched_at ages past the
+    # 24h TTL and flips freshness-gated tests into discovery unexpectedly.
+    fetched_at = (datetime.datetime.now(datetime.UTC) - datetime.timedelta(hours=1)).isoformat()
     return {
-        "fetched_at": "2026-08-10T12:00:00.000000Z",
+        "fetched_at": fetched_at,
         "etag": 'W/"opencode-go-models-test"',
         "shared_instructions": "Line one\nLine two\n",
         "client_version": "0.147.0",
