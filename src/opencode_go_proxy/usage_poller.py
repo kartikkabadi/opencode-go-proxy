@@ -94,15 +94,27 @@ def _fetch_usage(config: ProxyConfig) -> Json | None:
     except ProxyError:
         # No resolvable key: usage is unknowable, degrade to null.
         return None
-    request = urllib.request.Request(
-        usage_url(),
-        headers={"Authorization": f"Bearer {api_key}", "Accept": "application/json"},
-    )
-    try:
-        with urllib.request.urlopen(request, timeout=POLL_TIMEOUT_SEC) as response:
-            body = response.read()
-    except OSError:
-        # URLError (incl. HTTPError) and socket.timeout are OSError subclasses.
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Accept": "application/json",
+        # Cloudflare intermittently challenges non-browser UAs on the gateway;
+        # a browser UA keeps the poll stable.
+        "User-Agent": (
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+        ),
+    }
+
+    for _attempt in range(2):
+        request = urllib.request.Request(usage_url(), headers=headers)
+        try:
+            with urllib.request.urlopen(request, timeout=POLL_TIMEOUT_SEC) as response:
+                body = response.read()
+                break
+        except OSError:
+            # URLError (incl. HTTPError) and socket.timeout are OSError subclasses.
+            pass
+    else:
         return None
     try:
         payload = json.loads(body)
