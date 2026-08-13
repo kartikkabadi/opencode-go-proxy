@@ -1,6 +1,6 @@
 [project]
 name = "opencode-go-proxy"
-version = "0.3.0"
+version = "0.3.1"
 description = "Use your OpenCode Go subscription in Codex — local Responses-to-Chat-Completions bridge"
 readme = "README.md"
 authors = [{ name = "Kartik Kabadi", email = "1kartikkabadi1@gmail.com" }]
