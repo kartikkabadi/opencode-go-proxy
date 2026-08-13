@@ -20,7 +20,7 @@ from __future__ import annotations
 import json
 import os
 import subprocess
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import Any
 
 from .meter import state_dir
@@ -172,7 +172,7 @@ def capture_codex_app_tools() -> list[Json] | None:
         return None
     tools = [collected[key] for key in sorted(collected)]
     snapshot = {
-        "captured_at": datetime.now(timezone.utc).isoformat(),
+        "captured_at": datetime.now(UTC).isoformat(),
         "captured_with": _codex_version(binary) or binary,
         "tools": tools,
     }

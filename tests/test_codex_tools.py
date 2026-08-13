@@ -54,7 +54,7 @@ FAKE_PROMPT_INPUT = {
     ]
 }
 
-FAKE_BIN = """#!/usr/bin/env python3
+FAKE_BIN = f"""#!/usr/bin/env python3
 import json
 import os
 import sys
@@ -64,12 +64,12 @@ if sys.argv[1] == "--version":
     print("codex-cli 0.test.0")
     raise SystemExit(0)
 if mode == "messages":
-    print(json.dumps([{"type": "message", "role": "user", "content": []}]))
+    print(json.dumps([{{"type": "message", "role": "user", "content": []}}]))
 elif mode == "invalid":
     print("not json")
 else:
-    print(json.dumps(json.loads(sys.stdin.read()) if os.environ.get("FAKE_PROMPT_FROM_STDIN") else %s))
-""" % json.dumps(FAKE_PROMPT_INPUT)
+    print(json.dumps(json.loads(sys.stdin.read()) if os.environ.get("FAKE_PROMPT_FROM_STDIN") else {json.dumps(FAKE_PROMPT_INPUT)}))
+"""
 
 
 @pytest.fixture
@@ -179,7 +179,8 @@ class TestCapture:
             "codex_app__list_threads",
             "plugin_management__uninstall_plugin",
         }
-        snapshot = json.loads(open(state_tools_path(), encoding="utf-8").read())
+        with open(state_tools_path(), encoding="utf-8") as fh:
+            snapshot = json.load(fh)
         assert snapshot["captured_with"] == "codex-cli 0.test.0"
         assert "captured_at" in snapshot
 
