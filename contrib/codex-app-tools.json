@@ -1141,26 +1141,6 @@
           ]
         }
       }
-    },
-    {
-      "type": "function",
-      "function": {
-        "name": "plugin_management__uninstall_plugin",
-        "description": "Uninstall an installed Codex plugin when the user explicitly asks to uninstall or remove it. The explicit request is authorization; do not ask for another confirmation. If the result is ambiguous, ask the user to choose an exact plugin ID before retrying. Do not use this tool for ChatGPT apps, status, or permission questions.",
-        "parameters": {
-          "type": "object",
-          "properties": {
-            "plugin": {
-              "type": "string",
-              "description": "The plugin's user-facing name or exact plugin ID."
-            }
-          },
-          "required": [
-            "plugin"
-          ],
-          "additionalProperties": false
-        }
-      }
     }
   ]
 }

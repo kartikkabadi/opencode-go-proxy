@@ -9,6 +9,7 @@ from unittest import mock
 
 import pytest
 
+from opencode_go_proxy import codex_tools
 from opencode_go_proxy.app import ProxyConfig, ResponsesProxyHandler
 from opencode_go_proxy.codex_tools import (
     capture_codex_app_tools,
@@ -46,10 +47,16 @@ FAKE_PROMPT_INPUT = {
             ],
         },
         {
-            "type": "function",
-            "name": "plugin_management__uninstall_plugin",
-            "description": "Uninstall a plugin.",
-            "parameters": {"type": "object", "properties": {"pluginId": {"type": "string"}}},
+            "type": "namespace",
+            "name": "plugin_management",
+            "tools": [
+                {
+                    "type": "function",
+                    "name": "uninstall_plugin",
+                    "description": "Uninstall a plugin.",
+                    "inputSchema": {"type": "object", "properties": {"pluginId": {"type": "string"}}},
+                },
+            ],
         },
     ]
 }
@@ -61,7 +68,7 @@ import sys
 
 mode = os.environ.get("FAKE_PROMPT_INPUT_MODE", "tools")
 if sys.argv[1] == "--version":
-    print("codex-cli 0.test.0")
+    print(os.environ.get("FAKE_VERSION", "codex-cli 0.test.0"))
     raise SystemExit(0)
 if mode == "messages":
     print(json.dumps([{{"type": "message", "role": "user", "content": []}}]))
@@ -177,7 +184,6 @@ class TestCapture:
         assert snapshot_names(tools) == {
             "codex_app__create_thread",
             "codex_app__list_threads",
-            "plugin_management__uninstall_plugin",
         }
         with open(state_tools_path(), encoding="utf-8") as fh:
             snapshot = json.load(fh)
@@ -191,7 +197,6 @@ class TestCapture:
         assert snapshot_names(loaded) == {
             "codex_app__create_thread",
             "codex_app__list_threads",
-            "plugin_management__uninstall_plugin",
         }
 
     def test_capture_messages_only_returns_none(self, fake_codex_bin) -> None:
@@ -216,6 +221,36 @@ class TestCapture:
             tools = capture_codex_app_tools()
         assert tools is None
 
+    def test_capture_excludes_plugin_management(self, fake_codex_bin) -> None:
+        with mock.patch.dict(os.environ, {"OPENCODE_GO_PROXY_CODEX_BIN": fake_codex_bin}):
+            tools = capture_codex_app_tools()
+        assert tools is not None
+        assert snapshot_names(tools) == {"codex_app__create_thread", "codex_app__list_threads"}
+    def test_stale_snapshot_recaptures_on_version_change(self, fake_codex_bin) -> None:
+        env = {"OPENCODE_GO_PROXY_CODEX_BIN": fake_codex_bin, "FAKE_VERSION": "codex-cli 1.0.0"}
+        with mock.patch.dict(os.environ, env):
+            first = capture_codex_app_tools()
+            assert first is not None
+            codex_tools._snapshot_cache = None  # process restart equivalent
+            os.environ["FAKE_VERSION"] = "codex-cli 2.0.0"
+            refreshed = load_snapshot_tools()
+        assert refreshed is not None
+        assert snapshot_names(refreshed) == {"codex_app__create_thread", "codex_app__list_threads"}
+        with open(state_tools_path(), encoding="utf-8") as fh:
+            snapshot = json.load(fh)
+        assert snapshot["captured_with"] == "codex-cli 2.0.0"
+
+    def test_newer_binary_mtime_triggers_recapture(self, fake_codex_bin) -> None:
+        with mock.patch.dict(os.environ, {"OPENCODE_GO_PROXY_CODEX_BIN": fake_codex_bin}):
+            capture_codex_app_tools()
+            before = os.stat(state_tools_path()).st_mtime_ns
+            newer = before + 10_000_000_000
+            os.utime(fake_codex_bin, ns=(newer, newer))
+            loaded = load_snapshot_tools()
+            after = os.stat(state_tools_path()).st_mtime_ns
+        assert loaded is not None
+        assert after > before
+
 
 class TestSnapshotLoad:
     def test_fallback_loads_when_no_capture(self) -> None:
@@ -230,7 +265,7 @@ class TestSnapshotLoad:
         for tool in load_snapshot_tools():
             function = tool["function"]
             assert tool["type"] == "function"
-            assert function["name"].startswith(("codex_app__", "plugin_management__"))
+            assert function["name"].startswith("codex_app__")
             assert isinstance(function["description"], str)
             assert "parameters" in function
 

@@ -29,9 +29,10 @@ Json = dict[str, Any]
 
 STATE_TOOLS_NAME = "codex-app-tools.json"
 
-# The two app-native namespaces the app sends in session tool lists (verified
-# against live captures); everything else in the rendered input is left alone.
-CAPTURED_NAMESPACES = ("codex_app", "plugin_management")
+# The one app-native namespace merged into custom-model sessions. The
+# plugin_management namespace is deliberately excluded: exposing plugin
+# management as callable tools to routed models was never the feature.
+CAPTURED_NAMESPACES = ("codex_app",)
 
 PROMPT_INPUT_TIMEOUT_SEC = 30
 VERSION_TIMEOUT_SEC = 10
@@ -189,9 +190,15 @@ def capture_codex_app_tools() -> list[Json] | None:
     _snapshot_cache = (path, os.stat(path).st_mtime_ns, list(tools))
     return tools
 
-
 def load_snapshot_tools() -> list[Json]:
-    """The codex_app tool list: state-dir capture first, then the contrib fallback."""
+    """The codex_app tool list: state-dir capture first, then the contrib fallback.
+
+    Revalidation keeps the snapshot honest as the app updates: a cache hit
+    re-captures when the codex binary is newer than the snapshot file (cheap
+    stat, no subprocess), and a file re-read probes the binary version against
+    ``captured_with``. Recapture is best-effort — a failure keeps the last
+    known-good snapshot.
+    """
     global _snapshot_cache
     path = state_tools_path()
     if os.path.exists(path):
@@ -200,6 +207,11 @@ def load_snapshot_tools() -> list[Json]:
         except OSError:
             mtime = -1
         if _snapshot_cache is not None and _snapshot_cache[0] == path and _snapshot_cache[1] == mtime:
+            binary = _resolve_codex_bin()
+            if binary and _binary_newer_than(binary, mtime):
+                refreshed = capture_codex_app_tools()
+                if refreshed:
+                    return list(refreshed)
             return list(_snapshot_cache[2])
         try:
             with open(path, encoding="utf-8") as fh:
@@ -207,9 +219,33 @@ def load_snapshot_tools() -> list[Json]:
             tools = [t for t in snapshot.get("tools", []) if isinstance(t, dict)]
         except (OSError, ValueError, TypeError):
             tools = []
+        binary = _resolve_codex_bin()
+        if tools and binary:
+            captured_with = snapshot.get("captured_with") if isinstance(snapshot, dict) else None
+            if captured_with != _codex_version(binary):
+                refreshed = capture_codex_app_tools()
+                if refreshed:
+                    return list(refreshed)
         if tools:
             _snapshot_cache = (path, mtime, list(tools))
             return list(tools)
+
+    if os.path.exists(_REPO_CONTRIB_PATH):
+        try:
+            with open(_REPO_CONTRIB_PATH, encoding="utf-8") as fh:
+                snapshot = json.load(fh)
+            return [t for t in snapshot.get("tools", []) if isinstance(t, dict)]
+        except (OSError, ValueError, TypeError):
+            return []
+    return []
+
+
+def _binary_newer_than(binary: str, mtime_ns: int) -> bool:
+    """True when the codex binary was modified after the snapshot (mtime_ns)."""
+    try:
+        return os.stat(binary).st_mtime_ns > mtime_ns
+    except OSError:
+        return False
 
     if os.path.exists(_REPO_CONTRIB_PATH):
         try:
