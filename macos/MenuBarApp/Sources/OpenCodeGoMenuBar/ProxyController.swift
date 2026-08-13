@@ -51,6 +51,9 @@ final class ProxyController {
         let logFD = open(logPath, O_WRONLY | O_CREAT | O_APPEND, 0o644)
         let errFD = open(errPath, O_WRONLY | O_CREAT | O_APPEND, 0o644)
         guard logFD >= 0, errFD >= 0 else {
+            // Close whatever opened successfully so the failure path leaks no fd.
+            if logFD >= 0 { close(logFD) }
+            if errFD >= 0 { close(errFD) }
             failStart("Could not open log files under \(logDir.path)")
             return
         }

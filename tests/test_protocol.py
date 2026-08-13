@@ -362,6 +362,39 @@ class CacheAccountingTests(unittest.TestCase):
         normalized = normalize_usage({"prompt_tokens": 3, "completion_tokens": 2, "total_tokens": 5})
         self.assertEqual(normalized, {"input_tokens": 3, "output_tokens": 2, "total_tokens": 5})
 
+    def test_normalize_usage_tolerates_malformed_token_values(self) -> None:
+        # Non-numeric upstream token fields must never crash a billed request.
+        normalized = normalize_usage({
+            "prompt_tokens": "abc",
+            "completion_tokens": None,
+            "total_tokens": "nope",
+            "prompt_cache_hit_tokens": 0,
+            "prompt_cache_miss_tokens": 0,
+        })
+        self.assertEqual(normalized["input_tokens"], 0)
+        self.assertEqual(normalized["output_tokens"], 0)
+        self.assertEqual(normalized["total_tokens"], 0)
+
+    def test_tool_choice_function_shape_translated_to_chat(self) -> None:
+        chat_payload, _, _ = responses_payload_to_chat_payload({
+            "model": "opencode-go/deepseek-v4-flash",
+            "input": "hi",
+            "tools": [{"type": "function", "name": "read_file"}],
+            "tool_choice": {"type": "function", "name": "read_file"},
+        })
+        self.assertEqual(
+            chat_payload["tool_choice"], {"type": "function", "function": {"name": "read_file"}}
+        )
+
+    def test_tool_choice_auto_translated_to_string(self) -> None:
+        chat_payload, _, _ = responses_payload_to_chat_payload({
+            "model": "opencode-go/deepseek-v4-flash",
+            "input": "hi",
+            "tools": [{"type": "function", "name": "read_file"}],
+            "tool_choice": {"type": "auto"},
+        })
+        self.assertEqual(chat_payload["tool_choice"], "auto")
+
     def test_chat_completion_response_carries_cache_usage_through(self) -> None:
         response = chat_completion_to_response(
             {

@@ -1,5 +1,6 @@
 """Session-model inheritance for spawned threads (create_thread / send_message_to_thread)."""
 
+import copy
 import json
 import unittest
 
@@ -76,17 +77,44 @@ class SessionModelInjectionTests(unittest.TestCase):
         payload = payload_with(
             {"type": "function_call", "call_id": "call_1", "name": "exec_command", "arguments": "{}"}
         )
+        expected = copy.deepcopy(payload)
         result = inject_session_model(payload, SESSION_MODEL)
-        self.assertEqual(result, payload)
+        self.assertEqual(result, expected)
+        self.assertEqual(result["input"][0]["arguments"], "{}")
+
+    def test_mcp_namespaced_thread_tool_untouched(self) -> None:
+        payload = payload_with(
+            thread_call(name="mcp__slack__create_thread", arguments='{"channel":"general"}')
+        )
+        expected = copy.deepcopy(payload)
+        result = inject_session_model(payload, SESSION_MODEL)
+        self.assertEqual(result, expected)
+        self.assertEqual(result["input"][0]["arguments"], '{"channel":"general"}')
+
+    def test_bare_name_foreign_namespace_untouched(self) -> None:
+        payload = payload_with(thread_call(namespace="mcp_other", arguments="{}"))
+        expected = copy.deepcopy(payload)
+        result = inject_session_model(payload, SESSION_MODEL)
+        self.assertEqual(result, expected)
+        self.assertEqual(result["input"][0]["arguments"], "{}")
+
+    def test_null_model_is_present_and_untouched(self) -> None:
+        payload = payload_with(thread_call(arguments='{"model":null}'))
+        expected = copy.deepcopy(payload)
+        result = inject_session_model(payload, SESSION_MODEL)
+        self.assertEqual(result, expected)
+        self.assertEqual(result["input"][0]["arguments"], '{"model":null}')
 
     def test_malformed_arguments_untouched(self) -> None:
         payload = payload_with(
             thread_call(arguments="not-json{"),
             thread_call(arguments='{"model":null,"x":1}'),
         )
+        expected = copy.deepcopy(payload)
         result = inject_session_model(payload, SESSION_MODEL)
-        self.assertEqual(result, payload)
+        self.assertEqual(result, expected)
         self.assertEqual(result["input"][0]["arguments"], "not-json{")
+        self.assertEqual(result["input"][1]["arguments"], '{"model":null,"x":1}')
 
     def test_end_to_end_chat_payload_model_in_tool_call_args(self) -> None:
         payload = payload_with(

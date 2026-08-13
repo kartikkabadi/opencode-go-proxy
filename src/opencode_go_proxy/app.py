@@ -5,6 +5,7 @@ import gzip
 import io
 import json
 import os
+import re
 import signal
 import subprocess
 import sys
@@ -36,6 +37,25 @@ from .protocol import (
 )
 
 Json = dict[str, Any]
+
+# Secret-looking content masked out of upstream error bodies before they are
+# traced to stderr (and later shipped in a support bundle). An upstream that
+# echoes the request Authorization header back in its error body would
+# otherwise leak the API key into logs verbatim.
+_MASK_RE = re.compile(
+    r"(?i)(authorization[\s\"']*[:=][\s\"']*)[^\"'\r\n,;]+|(\bsk-[A-Za-z0-9_\-]{8,}\b)"
+)
+
+
+def _mask_trace_body(body: str, limit: int = 2000) -> str:
+    text = body[:limit]
+
+    def _repl(m: re.Match) -> str:
+        if m.group(1):
+            return f"{m.group(1)}<redacted>"
+        return "<redacted>"
+
+    return _MASK_RE.sub(_repl, text)
 
 
 class ProxyConfig:
@@ -69,6 +89,18 @@ def trace(event: str, **fields: Any) -> None:
 # would have completed. Tuned small: localhost proxy, latency-sensitive client.
 DEFAULT_MAX_RETRIES = 2
 DEFAULT_RETRY_BASE_SLEEP_MS = 150
+
+# Budget for the MiMo image-caption sub-call. Generous on purpose: a healthy
+# caption call routinely takes ~16s, and the sub-call degrades to a placeholder
+# on timeout rather than crashing the turn.
+DEFAULT_CAPTION_TIMEOUT_SEC = 60.0
+
+
+def _caption_timeout_sec() -> float:
+    try:
+        return max(1.0, float(os.environ.get("OPENCODE_GO_PROXY_CAPTION_TIMEOUT_SEC", str(DEFAULT_CAPTION_TIMEOUT_SEC))))
+    except ValueError:
+        return DEFAULT_CAPTION_TIMEOUT_SEC
 
 
 def _max_retries() -> int:
@@ -108,6 +140,29 @@ def record_cache(tracker: CacheTracker, model: str | None, usage: Any) -> None:
     tracker.record(model or "unknown", stats["hit"], stats["miss"])
 
 
+def _decompress_bounded(reader: Any, cap: int) -> bytes:
+    """Read `reader` in chunks, raising 413 once the output exceeds `cap`.
+
+    Both zstd and gzip frames can declare an output size that is only a hint,
+    so a zip bomb must be bounded by counting bytes as they come out, never by
+    trusting the frame header or decompressing the whole body at once.
+    """
+    chunks: list[bytes] = []
+    total = 0
+    while True:
+        chunk = reader.read(1 << 16)
+        if not chunk:
+            break
+        total += len(chunk)
+        if total > cap:
+            raise ProxyError(
+                HTTPStatus.REQUEST_ENTITY_TOO_LARGE,
+                "decompressed request body exceeds the size cap",
+            )
+        chunks.append(chunk)
+    return b"".join(chunks)
+
+
 def decode_request_body(raw: bytes, content_encoding: str, max_body_bytes: int) -> bytes:
     """Decode an HTTP request body according to its Content-Encoding header.
 
@@ -129,33 +184,23 @@ def decode_request_body(raw: bytes, content_encoding: str, max_body_bytes: int) 
             ) from exc
         cap = max(max_body_bytes * 4, 1 << 20)
         try:
-            # Stream-decompress with a hard output cap: zstandard's
-            # max_output_size is only a hint once the frame declares its size,
-            # so a zip bomb must be bounded by reading in chunks and counting.
-            chunks: list[bytes] = []
-            total = 0
             with zstd.ZstdDecompressor().stream_reader(io.BytesIO(raw)) as reader:
-                while True:
-                    chunk = reader.read(1 << 16)
-                    if not chunk:
-                        break
-                    total += len(chunk)
-                    if total > cap:
-                        raise ProxyError(
-                            HTTPStatus.REQUEST_ENTITY_TOO_LARGE,
-                            "decompressed request body exceeds the size cap",
-                        )
-                    chunks.append(chunk)
-            return b"".join(chunks)
+                return _decompress_bounded(reader, cap)
         except ProxyError:
             raise
         except Exception as exc:
             raise ProxyError(HTTPStatus.BAD_REQUEST, f"failed to decompress zstd request body: {exc}") from exc
     if encoding in {"gzip", "x-gzip"}:
+        # Same bounded decompression as zstd: a tiny gzip wire body must not be
+        # able to balloon into a multi-GB allocation (gzip.decompress has no cap).
+        cap = max(max_body_bytes * 4, 1 << 20)
         try:
-            return gzip.decompress(raw)
-        except OSError as exc:
-            raise ProxyError(HTTPStatus.BAD_REQUEST, "failed to decompress gzip request body") from exc
+            with gzip.GzipFile(fileobj=io.BytesIO(raw)) as reader:
+                return _decompress_bounded(reader, cap)
+        except ProxyError:
+            raise
+        except Exception as exc:
+            raise ProxyError(HTTPStatus.BAD_REQUEST, f"failed to decompress gzip request body: {exc}") from exc
     raise ProxyError(HTTPStatus.BAD_REQUEST, f"unsupported content-encoding: {content_encoding}")
 
 
@@ -282,10 +327,11 @@ class ResponsesProxyHandler(BaseHTTPRequestHandler):
 
 
 class ProxyError(Exception):
-    def __init__(self, status: HTTPStatus, message: str) -> None:
+    def __init__(self, status: HTTPStatus, message: str, *, retries: int = 0) -> None:
         super().__init__(message)
         self.status = status
         self.message = message
+        self.retries = retries
 
 
 def handle_responses_request(payload: Json, config: ProxyConfig, request_id: str) -> Json:
@@ -311,6 +357,7 @@ def handle_responses_request(payload: Json, config: ProxyConfig, request_id: str
     except ProxyError as exc:
         record_usage_event(
             model=request_model, status=int(exc.status), duration_ms=int((time.time() - started) * 1000),
+            retries=exc.retries or None,
         )
         raise
     record_cache(config.cache_tracker, chat_payload.get("model"), chat.get("usage"))
@@ -337,6 +384,27 @@ def handle_streaming_request(payload: Json, config: ProxyConfig, request_id: str
     payload = inject_session_model(payload, session_model)
     chat_payload, request_model, conversion_stats = responses_payload_to_chat_payload(payload)
 
+    client_alive = True
+
+    # Keepalive: send SSE comments every 15s while waiting for upstream first
+    # byte. Prevents Codex from timing out when the model thinks for 30+
+    # seconds before responding. Started before the image-caption sub-call so
+    # the client never sees a silent open stream while a caption is fetched.
+    keepalive_stop = threading.Event()
+
+    def keepalive() -> None:
+        while not keepalive_stop.wait(15):
+            if not client_alive:
+                return
+            try:
+                wfile.write(b": keepalive\n\n")
+                wfile.flush()
+            except BrokenPipeError:
+                return
+
+    ka_thread = threading.Thread(target=keepalive, daemon=True)
+    ka_thread.start()
+
     if conversion_stats.get("has_image") and conversion_stats.get("tools_present"):
         chat_payload = caption_images_in_messages(chat_payload, request_model, config, request_id)
         conversion_stats["upstream_model"] = chat_payload.get("model")
@@ -352,8 +420,6 @@ def handle_streaming_request(payload: Json, config: ProxyConfig, request_id: str
 
     response_id = new_response_id()
     model = request_model or DEFAULT_MODEL
-
-    client_alive = True
 
     def send_event(event: Json) -> None:
         nonlocal client_alive
@@ -403,25 +469,46 @@ def handle_streaming_request(payload: Json, config: ProxyConfig, request_id: str
     reasoning_id = f"rs_{uuid.uuid4().hex}"
     item_open = False
     reasoning_open = False
+    # reasoning_emitted is set the moment the reasoning item is opened and never
+    # cleared: every later item's output_index is computed from it, so a
+    # reasoning item that is already closed still occupies output_index 0 and
+    # text/tool calls cannot collide with it.
+    reasoning_emitted = False
     got_data = False
 
-    # Keepalive: send SSE comments every 15s while waiting for upstream first byte.
-    # Prevents Codex from timing out when the model thinks for 30+ seconds before responding.
-    keepalive_stop = threading.Event()
+    def emit_tool_added(idx: int) -> None:
+        """Emit output_item.added for tool call `idx` with its complete name.
 
-    def keepalive() -> None:
-        while not keepalive_stop.wait(15):
-            if not client_alive:
-                return
-            try:
-                wfile.write(b": keepalive\n\n")
-                wfile.flush()
-            except BrokenPipeError:
-                return
+        The upstream streams tool names in chunks (e.g. 'read_' then 'file'),
+        so added must be deferred until the name is complete. The stream moves
+        on to the arguments phase only after the final name chunk, so the first
+        arguments delta is the signal that the name is complete; tool calls
+        whose name is still growing when the stream ends are emitted in the
+        finalize phase below. A truncated name must never appear in added/done.
+        """
+        if idx in tool_call_open:
+            return
+        flat_name = tool_calls[idx]["function"]["name"]
+        ns, _, n = flat_name.rpartition("__")
+        if not ns or not n:
+            ns, n = None, flat_name
+        fc_id = f"fc_{uuid.uuid4().hex}"
+        call_id = tool_calls[idx]["id"] or f"call_{uuid.uuid4().hex}"
+        tc_item: Json = {
+            "type": "function_call", "id": fc_id, "call_id": call_id,
+            "name": n, "arguments": "", "status": "in_progress",
+        }
+        if ns:
+            tc_item["namespace"] = ns
+        tool_call_items[idx] = tc_item
+        send_event({"type": "response.output_item.added",
+                    "output_index": (1 if reasoning_emitted else 0) + idx, "item": tc_item})
+        tool_call_open.add(idx)
 
-    ka_thread = threading.Thread(target=keepalive, daemon=True)
-    ka_thread.start()
-
+    # Keepalive: send SSE comments every 15s while waiting for upstream first
+    # byte. Prevents Codex from timing out when the model thinks for 30+
+    # seconds before responding. Started before the image-caption sub-call so
+    # the client never sees a silent open stream while a caption is fetched.
     retries = 0
     max_retries = _max_retries()
 
@@ -436,7 +523,7 @@ def handle_streaming_request(payload: Json, config: ProxyConfig, request_id: str
             response = urllib.request.urlopen(req, timeout=config.timeout_sec)
         except urllib.error.HTTPError as exc:
             body = exc.read().decode("utf-8", errors="replace")
-            trace("upstream.error", request_id=request_id, status=exc.code, body=body[:2000])
+            trace("upstream.error", request_id=request_id, status=exc.code, body=_mask_trace_body(body))
             if _retriable_http_status(exc.code) and retries < max_retries:
                 retries += 1
                 trace("upstream.retry", request_id=request_id, attempt=retries, status=exc.code)
@@ -450,8 +537,10 @@ def handle_streaming_request(payload: Json, config: ProxyConfig, request_id: str
                 send_error(f"upstream unavailable (HTTP {exc.code})")
             else:
                 send_error(f"upstream HTTP {exc.code}")
-            record_usage_event(model=model, status=502, duration_ms=int((time.time() - started) * 1000),
-                               stream_aborted=True, retries=retries)
+            # No upstream bytes were ever streamed, so this is not a mid-stream
+            # abort: meter the real final upstream status, not a synthetic 502.
+            record_usage_event(model=model, status=exc.code, duration_ms=int((time.time() - started) * 1000),
+                               retries=retries)
             return
         except (urllib.error.URLError, TimeoutError) as exc:
             trace("upstream.network_error", request_id=request_id, reason=str(getattr(exc, "reason", exc)))
@@ -462,8 +551,10 @@ def handle_streaming_request(payload: Json, config: ProxyConfig, request_id: str
                 continue
             keepalive_stop.set()
             send_error(f"upstream network error: {getattr(exc, 'reason', exc)}")
+            # Network failure: no upstream status exists (502) and nothing was
+            # streamed, so no streamAborted marker.
             record_usage_event(model=model, status=502, duration_ms=int((time.time() - started) * 1000),
-                               stream_aborted=True, retries=retries)
+                               retries=retries)
             return
 
     try:
@@ -495,6 +586,7 @@ def handle_streaming_request(payload: Json, config: ProxyConfig, request_id: str
                             "type": "reasoning", "id": reasoning_id, "summary": [], "status": "in_progress",
                         }})
                         reasoning_open = True
+                        reasoning_emitted = True
                     reasoning += r
                     send_event({"type": "response.reasoning_summary_text.delta",
                                 "item_id": reasoning_id, "output_index": 0, "summary_index": 0, "delta": r})
@@ -502,14 +594,14 @@ def handle_streaming_request(payload: Json, config: ProxyConfig, request_id: str
                 d = delta.get("content")
                 if isinstance(d, str) and d:
                     if not item_open:
-                        idx = 1 if reasoning_open else 0
+                        idx = 1 if reasoning_emitted else 0
                         send_event({"type": "response.output_item.added", "output_index": idx, "item": {
                             "type": "message", "id": message_id, "role": "assistant",
                             "status": "in_progress", "content": [],
                         }})
                         item_open = True
                     text += d
-                    send_event({"type": "response.output_text.delta", "item_id": message_id, "output_index": 1 if reasoning_open else 0, "delta": d})
+                    send_event({"type": "response.output_text.delta", "item_id": message_id, "output_index": 1 if reasoning_emitted else 0, "delta": d})
                 tcs = delta.get("tool_calls")
                 if isinstance(tcs, list) and tcs and reasoning_open:
                     # Close reasoning item before tool calls so UI shows tool calls, not "thinking".
@@ -528,29 +620,12 @@ def handle_streaming_request(payload: Json, config: ProxyConfig, request_id: str
                         name_delta = fn.get("name")
                         if name_delta:
                             tool_calls[idx]["function"]["name"] += name_delta
-                            # Emit output_item.added as soon as we have the full tool name.
-                            # DeepSeek sends the name in one chunk, so first non-empty name = complete.
-                            if idx not in tool_call_open and tool_calls[idx]["function"]["name"]:
-                                flat_name = tool_calls[idx]["function"]["name"]
-                                ns, _, n = flat_name.rpartition("__")
-                                if not ns or not n:
-                                    ns, n = None, flat_name
-                                fc_id = f"fc_{uuid.uuid4().hex}"
-                                call_id = tool_calls[idx]["id"] or f"call_{uuid.uuid4().hex}"
-                                tc_item: Json = {
-                                    "type": "function_call", "id": fc_id,
-                                    "call_id": call_id, "name": n,
-                                    "arguments": "", "status": "in_progress",
-                                }
-                                if ns:
-                                    tc_item["namespace"] = ns
-                                tool_call_items[idx] = tc_item
-                                tc_base = 1 if reasoning_open else 0
-                                send_event({"type": "response.output_item.added",
-                                            "output_index": tc_base + idx, "item": tc_item})
-                                tool_call_open.add(idx)
-                        if fn.get("arguments"):
-                            tool_calls[idx]["function"]["arguments"] += fn["arguments"]
+                        args_delta = fn.get("arguments")
+                        if args_delta:
+                            tool_calls[idx]["function"]["arguments"] += args_delta
+                            # Arguments only start after the final name chunk, so
+                            # the accumulated name is complete: emit added now.
+                            emit_tool_added(idx)
     except (urllib.error.HTTPError, urllib.error.URLError, TimeoutError, OSError) as exc:
         # The upstream stream died after its 200 head was already committed to
         # the client. Surface an error and mark the turn as aborted so the
@@ -595,20 +670,30 @@ def handle_streaming_request(payload: Json, config: ProxyConfig, request_id: str
         send_event({"type": "response.output_item.done", "output_index": 0, "item": rs_done})
 
     # Emit output_item.done for tool calls that were opened during streaming,
-    # and added+done for any that weren't (e.g. name arrived in non-stream chunk).
-    tc_base = 1 if reasoning_open else 0
+    # and added+done for any that weren't (e.g. name only completed at stream
+    # end) — always with the complete name.
+    tc_base = 1 if reasoning_emitted else 0
     tc_count = 0
     for item in output:
         if item.get("type") != "function_call":
             continue
         idx = tc_base + tc_count
         if tc_count in tool_call_open:
-            # Already emitted added; update with final arguments and close.
+            # Already emitted added during streaming; close with the final
+            # name/arguments and keep the streamed item id.
             done_item = dict(tool_call_items[tc_count])
+            done_item["name"] = item["name"]
             done_item["arguments"] = item.get("arguments", "{}")
             done_item["status"] = "completed"
             send_event({"type": "response.output_item.done", "output_index": idx, "item": done_item})
+            # Completed must reuse the streamed ids so Codex reconciles items
+            # by id instead of creating ghost duplicates.
+            item["id"] = tool_call_items[tc_count]["id"]
+            item["call_id"] = tool_call_items[tc_count]["call_id"]
         else:
+            # Added was never emitted during streaming: emit added+done now
+            # with the complete name.
+            tool_call_items[tc_count] = item
             send_event({"type": "response.output_item.added", "output_index": idx, "item": item})
             send_event({"type": "response.output_item.done", "output_index": idx, "item": item})
         tc_count += 1
@@ -619,6 +704,13 @@ def handle_streaming_request(payload: Json, config: ProxyConfig, request_id: str
         msg_done = {"type": "message", "id": message_id, "role": "assistant", "status": "completed",
                      "content": [{"type": "output_text", "text": text, "annotations": []}]}
         send_event({"type": "response.output_item.done", "output_index": msg_idx, "item": msg_done})
+
+    # Reuse the ids already streamed in response.completed.
+    for out_item in output:
+        if out_item.get("type") == "reasoning":
+            out_item["id"] = reasoning_id
+        elif out_item.get("type") == "message":
+            out_item["id"] = message_id
 
     final: Json = {
         "id": response_id, "object": "response", "created_at": now_unix(),
@@ -711,7 +803,7 @@ def caption_image_via_mimo(image_url: str, image_model: str, config: ProxyConfig
         "max_tokens": 200,
     }
     try:
-        chat, _retries = call_upstream_chat(caption_payload, config, request_id, timeout_sec=15.0)
+        chat, _retries = call_upstream_chat(caption_payload, config, request_id, timeout_sec=_caption_timeout_sec())
         record_cache(config.cache_tracker, image_model, chat.get("usage"))
         choice = (chat.get("choices") or [{}])[0]
         text = (choice.get("message", {}) or {}).get("content", "")
@@ -756,7 +848,7 @@ def call_upstream_chat(chat_payload: Json, config: ProxyConfig, request_id: str,
                 return value, retries
         except urllib.error.HTTPError as exc:
             body = exc.read().decode("utf-8", errors="replace")
-            trace("upstream.error", request_id=request_id, status=exc.code, body=body[:2000])
+            trace("upstream.error", request_id=request_id, status=exc.code, body=_mask_trace_body(body))
             if _retriable_http_status(exc.code) and retries < max_retries:
                 retries += 1
                 trace("upstream.retry", request_id=request_id, attempt=retries, status=exc.code)
@@ -764,12 +856,12 @@ def call_upstream_chat(chat_payload: Json, config: ProxyConfig, request_id: str,
                 continue
             if exc.code == 429:
                 retry_after = exc.headers.get("retry-after", "5")
-                raise ProxyError(HTTPStatus.TOO_MANY_REQUESTS, f"rate limited (retry after {retry_after}s)") from exc
+                raise ProxyError(HTTPStatus.TOO_MANY_REQUESTS, f"rate limited (retry after {retry_after}s)", retries=retries) from exc
             if exc.code == 503:
-                raise ProxyError(HTTPStatus.SERVICE_UNAVAILABLE, "upstream unavailable") from exc
+                raise ProxyError(HTTPStatus.SERVICE_UNAVAILABLE, "upstream unavailable", retries=retries) from exc
             if exc.code == 504:
-                raise ProxyError(HTTPStatus.GATEWAY_TIMEOUT, "upstream timeout") from exc
-            raise ProxyError(HTTPStatus.BAD_GATEWAY, f"upstream HTTP {exc.code}") from exc
+                raise ProxyError(HTTPStatus.GATEWAY_TIMEOUT, "upstream timeout", retries=retries) from exc
+            raise ProxyError(HTTPStatus.BAD_GATEWAY, f"upstream HTTP {exc.code}", retries=retries) from exc
         except urllib.error.URLError as exc:
             trace("upstream.network_error", request_id=request_id, reason=str(getattr(exc, "reason", exc)))
             if retries < max_retries:
@@ -777,7 +869,7 @@ def call_upstream_chat(chat_payload: Json, config: ProxyConfig, request_id: str,
                 trace("upstream.retry", request_id=request_id, attempt=retries, reason=str(getattr(exc, "reason", exc)))
                 _retry_sleep(retries)
                 continue
-            raise ProxyError(HTTPStatus.BAD_GATEWAY, f"upstream network error: {getattr(exc, 'reason', exc)}") from exc
+            raise ProxyError(HTTPStatus.BAD_GATEWAY, f"upstream network error: {getattr(exc, 'reason', exc)}", retries=retries) from exc
         except TimeoutError:
             trace("upstream.timeout", request_id=request_id, timeout=timeout_sec or config.timeout_sec)
             if retries < max_retries:
@@ -785,7 +877,7 @@ def call_upstream_chat(chat_payload: Json, config: ProxyConfig, request_id: str,
                 trace("upstream.retry", request_id=request_id, attempt=retries, reason="timeout")
                 _retry_sleep(retries)
                 continue
-            raise ProxyError(HTTPStatus.GATEWAY_TIMEOUT, "upstream timeout") from None
+            raise ProxyError(HTTPStatus.GATEWAY_TIMEOUT, "upstream timeout", retries=retries) from None
 
 
 _api_key_cache: str | None = None
@@ -863,7 +955,28 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> None:
-    args = build_parser().parse_args(argv)
+    args_list = list(sys.argv[1:] if argv is None else argv)
+    # Operational subcommands must be reachable from the installed console
+    # script (entry point is app:main), not only via python -m. Dispatch them
+    # before any server startup.
+    if "--refresh-catalog" in args_list or os.environ.get("OPENCODE_GO_PROXY_REFRESH_CATALOG") == "1":
+        args_list = [a for a in args_list if a != "--refresh-catalog"]
+        from . import catalog
+
+        sys.exit(catalog.main_refresh(args_list))
+    if args_list and args_list[0] == "doctor":
+        from . import ops
+
+        sys.exit(ops.doctor(args_list[1:]))
+    if args_list and args_list[0] == "smoke-test":
+        from . import ops
+
+        sys.exit(ops.smoke_test())
+    if args_list and args_list[0] == "support-bundle":
+        from . import ops
+
+        sys.exit(ops.support_bundle(args_list[1:]))
+    args = build_parser().parse_args(args_list)
     try:
         from opencode_go_proxy import catalog as _catalog
 
