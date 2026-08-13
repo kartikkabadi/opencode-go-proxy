@@ -612,6 +612,10 @@ def annotate_announcements(
         slug = str(model.get("slug", ""))
         if slug not in next_announced:
             next_announced[slug] = 0.0 if first_run else now
+        nux = model.get("availability_nux")
+        if isinstance(nux, str):
+            # App schema: availability_nux is {message: str} | null (codex-router contract).
+            model = {**model, "availability_nux": {"message": nux} if nux.strip() else None}
         if model.get("availability_nux") or slug in curated_slugs:
             result.append(model)
             continue
@@ -619,7 +623,7 @@ def annotate_announcements(
         if seen == 0 or now - seen >= AUTO_ANNOUNCE_WINDOW_SECONDS:
             result.append(model)
         else:
-            result.append({**model, "availability_nux": auto_announcement_copy(model)})
+            result.append({**model, "availability_nux": {"message": auto_announcement_copy(model)}})
     return result, next_announced
 
 

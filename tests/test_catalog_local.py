@@ -165,10 +165,12 @@ class TestAnnouncements:
         )
 
         new = {m["slug"]: m for m in out}["brand-new"]
-        assert new["availability_nux"] == (
-            "Brand New just landed in your model picker. It comes with a 400K-token "
-            "context window, reasoning efforts from low to max, and image input."
-        )
+        assert new["availability_nux"] == {
+            "message": (
+                "Brand New just landed in your model picker. It comes with a 400K-token "
+                "context window, reasoning efforts from low to max, and image input."
+            )
+        }
         assert next_announced["brand-new"] == 1_000_100.0
 
     def test_curated_models_never_announce(self) -> None:
