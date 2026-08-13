@@ -267,15 +267,13 @@ class TestBackupGate:
         before = _read(cfg_path)
         config_manager.enable()
         directory = os.path.dirname(cfg_path)
-        candidates = [
+        prefix = os.path.basename(cfg_path) + ".bak-"
+        backups = sorted(
             name
             for name in os.listdir(directory)
-            if name != os.path.basename(cfg_path) and os.path.isfile(os.path.join(directory, name))
-        ]
-        assert candidates, (
-            "no backup file written before enable() modified config.toml "
-            "(GATE: backup written before edits)"
+            if name.startswith(prefix) and os.path.isfile(os.path.join(directory, name))
         )
-        assert any(
-            _read(os.path.join(directory, name)) == before for name in candidates
-        ), f"backup files {candidates!r} do not contain the pre-edit content"
+        assert len(backups) == 1, f"expected exactly one backup, got {backups!r}"
+        backup_path = os.path.join(directory, backups[0])
+        assert _read(backup_path) == before, "backup must hold the pre-edit content byte-for-byte"
+        assert (os.stat(backup_path).st_mode & 0o777) == 0o600, "backup must keep mode 0600"

@@ -339,3 +339,43 @@ class TestNoDuplicateKeys:
         assert text.count("openai_base_url") == 1
         assert text.count("model_catalog_json") == 1
         assert config_manager.START_MARKER in text
+
+
+def _backup_names(directory: str, cfg_path: str) -> list[str]:
+    prefix = os.path.basename(cfg_path) + ".bak-"
+    return sorted(name for name in os.listdir(directory) if name.startswith(prefix))
+
+
+class TestBackup:
+    def test_second_enable_without_change_writes_no_second_backup(self, cfg_path) -> None:
+        """A no-op enable() (already enabled) must not write another backup."""
+        with open(cfg_path, "w", encoding="utf-8") as handle:
+            handle.write('model = "gpt-5.6-luna"\n')
+        config_manager.enable()
+        directory = os.path.dirname(cfg_path)
+        backups = _backup_names(directory, cfg_path)
+        assert len(backups) == 1
+        assert config_manager.enable()["changed"] is False
+        assert _backup_names(directory, cfg_path) == backups
+
+    def test_disable_writes_backup_before_removing_block(self, cfg_path) -> None:
+        """disable() snapshots the managed config before rewriting it."""
+        with open(cfg_path, "w", encoding="utf-8") as handle:
+            handle.write('model = "gpt-5.6-luna"\n')
+        config_manager.enable()
+        enabled_text = _read(cfg_path)
+        assert config_manager.disable()["changed"] is True
+        directory = os.path.dirname(cfg_path)
+        backups = _backup_names(directory, cfg_path)
+        assert len(backups) == 2
+        assert _read(os.path.join(directory, backups[-1])) == enabled_text
+
+    def test_disable_file_removal_still_backs_up(self, cfg_path) -> None:
+        """Removing the file (block was its only content) still snapshots it."""
+        config_manager.enable()  # file was absent, so enable writes no backup
+        enabled_text = _read(cfg_path)
+        assert config_manager.disable()["file_removed"] is True
+        directory = os.path.dirname(cfg_path)
+        backups = _backup_names(directory, cfg_path)
+        assert len(backups) == 1
+        assert _read(os.path.join(directory, backups[-1])) == enabled_text

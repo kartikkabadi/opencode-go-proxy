@@ -40,6 +40,7 @@ module never touches the real ~/.codex/config.toml on its own.
 
 from __future__ import annotations
 
+import datetime
 import json
 import os
 import re
@@ -313,6 +314,24 @@ def _atomic_write(path: str, contents: str) -> None:
         raise
 
 
+def _backup_config(path: str, contents: str) -> str | None:
+    """Snapshot the pre-edit config to config.toml.bak-<UTC timestamp>.
+
+    Called immediately before an actual modification (enable/disable where
+    the new content differs). The microsecond-precision UTC timestamp means
+    every change gets a fresh backup file and earlier snapshots are never
+    overwritten; the write reuses _atomic_write, so the backup lands with
+    mode 0600 and holds the pre-edit content byte-for-byte. Returns the
+    backup path, or None when the file did not exist (nothing to snapshot).
+    """
+    if not os.path.exists(path):
+        return None
+    timestamp = datetime.datetime.now(datetime.UTC).strftime("%Y%m%d-%H%M%S-%f")
+    backup_path = f"{path}.bak-{timestamp}"
+    _atomic_write(backup_path, contents)
+    return backup_path
+
+
 def enable() -> dict[str, object]:
     """Insert the managed block; refuse to clobber user-owned values."""
     path = config_path()
@@ -354,6 +373,7 @@ def enable() -> dict[str, object]:
     rendered = _render(next_root, table_lines)
     changed = rendered != contents
     if changed:
+        _backup_config(path, contents)
         _atomic_write(path, rendered)
     return {
         "action": "enable",
@@ -380,11 +400,13 @@ def disable() -> dict[str, object]:
         return {"action": "disable", "path": path, "changed": False, "file_removed": False}
     cleaned = _without_block(contents)
     if not cleaned.strip():
+        _backup_config(path, contents)
         os.unlink(path)
         return {"action": "disable", "path": path, "changed": True, "file_removed": True}
     root_lines, table_lines = _split_root(cleaned)
     rendered = _render(root_lines, table_lines)
     if rendered != contents:
+        _backup_config(path, contents)
         _atomic_write(path, rendered)
     return {"action": "disable", "path": path, "changed": True, "file_removed": False}
 
