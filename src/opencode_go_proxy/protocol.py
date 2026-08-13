@@ -6,6 +6,8 @@ import time
 import uuid
 from typing import Any
 
+from .codex_tools import merge_codex_app_tools
+
 Json = dict[str, Any]
 
 
@@ -29,6 +31,11 @@ def _as_int(value: Any) -> int:
     return 0
 
 
+# The only codex_app tool whose live input schema accepts a model override:
+# create_thread. fork_thread / handoff_thread declare additionalProperties:
+# false without a model key, so injecting one would make the app reject the
+# call, and the live codex-router reference (SPAWN_MODEL_TOOLS) rewrites
+# create_thread only. send_message_to_thread keeps its own settings.
 SESSION_SPAWN_TOOLS = {"create_thread"}
 
 
@@ -126,10 +133,6 @@ def inject_session_model(payload: Json, session_model: str) -> Json:
 DEFAULT_MODEL = "deepseek-v4-flash"
 IMAGE_MODEL_DEFAULT = "mimo-v2.5"
 
-# Map OpenAI/Codex model slugs to OpenCode Go equivalents.
-# When Codex sends a model not in the catalog, the alias map provides the replacement.
-# If no alias exists, DEFAULT_MODEL is used.
-# DeepSeek V4 Flash is the default — cheapest non-vision model on Go ($10/mo gets ~158k requests/mo).
 MODEL_ALIASES: dict[str, str] = {
     "gpt-5.5": "deepseek-v4-pro",
     "gpt-5.4-mini": "deepseek-v4-flash",
@@ -138,6 +141,8 @@ MODEL_ALIASES: dict[str, str] = {
     "o4-mini": "deepseek-v4-flash",
     "codex-auto-review": "deepseek-v4-flash",
 }
+
+
 
 
 def _catalog_mtime() -> tuple[str, int | None]:
@@ -524,6 +529,10 @@ def responses_tools_to_chat_tools(tools: Any) -> tuple[list[Json] | None, Json]:
     if not isinstance(tools, list):
         return None, stats
 
+    # Requests that carry a tools array get the codex_app snapshot merged in
+    # first, so a routed model can spawn threads even when the app sent only a
+    # reduced codex_app namespace (deferred schemas).
+    tools = merge_codex_app_tools(tools)
     stats["input_tools"] = len(tools)
     chat_tools: list[Json] = []
     for tool in tools:
@@ -560,6 +569,35 @@ def responses_tools_to_chat_tools(tools: Any) -> tuple[list[Json] | None, Json]:
             continue
 
         if tt != "function":
+            if tt == "web_search_preview":
+                # The app's web search tool arrives as a bare type entry with no
+                # name or schema; the upstream model needs a callable function,
+                # and the app dispatches the returned call by this exact name.
+                chat_tools.append(
+                    {
+                        "type": "function",
+                        "function": {
+                            "name": "web_search_preview",
+                            "description": (
+                                "Search the web for current information. Use it when the user "
+                                "asks a question that needs up-to-date or external information."
+                            ),
+                            "parameters": {
+                                "type": "object",
+                                "properties": {
+                                    "query": {
+                                        "type": "string",
+                                        "description": "The search query.",
+                                    }
+                                },
+                                "required": ["query"],
+                                "additionalProperties": False,
+                            },
+                        },
+                    }
+                )
+                stats["forwarded_tools"] += 1
+                continue
             if tt == "custom":
                 name = tool.get("name")
                 if not isinstance(name, str) or not name:
@@ -629,8 +667,18 @@ def responses_payload_to_chat_payload(payload: Json) -> tuple[Json, str, Json]:
     tools, tool_stats = responses_tools_to_chat_tools(payload.get("tools"))
 
     incoming_model = payload.get("model", DEFAULT_MODEL)
-    # Normalize: if model is in the alias map, use the mapped OpenCode Go model.
-    # If it's not a known catalog model and not aliased, fall back to DEFAULT_MODEL.
+    # Detect images by scanning for actual image_url parts (not just list-shaped content).
+    has_image = any(
+        isinstance(m.get("content"), list)
+        and any(isinstance(p, dict) and p.get("type") == "image_url" for p in m["content"])
+        for m in messages
+    )
+    # Dispatch relays native slugs to the passthrough before translation; if
+    # one arrives here anyway, its model is never rewritten. For opencode-go
+    # targets the prefixed slug is checked against the catalog by its bare
+    # form, and the upstream chat payload addresses the provider with the
+    # bare slug (the reference router's upstreamModel). Unknown non-native
+    # slugs fall back to DEFAULT_MODEL, exactly as before the alias map died.
     if incoming_model in MODEL_ALIASES:
         incoming_model = MODEL_ALIASES[incoming_model]
     elif incoming_model not in known_models():

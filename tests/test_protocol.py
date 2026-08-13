@@ -4,6 +4,7 @@ import tempfile
 import unittest
 from unittest import mock
 
+from opencode_go_proxy.codex_tools import load_snapshot_tools
 from opencode_go_proxy.protocol import (
     IMAGE_MODEL_DEFAULT,
     cache_stats_from_usage,
@@ -60,8 +61,11 @@ class ProtocolTests(unittest.TestCase):
         )
         self.assertEqual(chat["tools"][0]["function"]["name"], "read_file")
         self.assertEqual(stats["messages"]["reasoning_items_dropped"], 1)
-        self.assertEqual(stats["tools"]["forwarded_tools"], 1)
-        self.assertEqual(stats["tools"]["dropped_tools"], 1)
+        # web_search_preview is translated to a callable function (not dropped)
+        # and the codex_app snapshot merges into any tools-bearing request.
+        self.assertEqual(stats["tools"]["forwarded_tools"], 2 + len(load_snapshot_tools()))
+        self.assertEqual(stats["tools"]["dropped_tools"], 0)
+        self.assertIn("web_search_preview", [t["function"]["name"] for t in chat["tools"]])
 
     def test_custom_freeform_tools_convert_to_input_function_tools(self) -> None:
         chat, _model, stats = responses_payload_to_chat_payload(
@@ -83,7 +87,7 @@ class ProtocolTests(unittest.TestCase):
             }
         )
 
-        self.assertEqual(stats["tools"]["forwarded_tools"], 1)
+        self.assertEqual(stats["tools"]["forwarded_tools"], 1 + len(load_snapshot_tools()))
         self.assertEqual(stats["tools"]["dropped_tools"], 0)
         self.assertEqual(chat["tools"][0]["type"], "function")
         function = chat["tools"][0]["function"]
@@ -319,7 +323,7 @@ class ProtocolTests(unittest.TestCase):
         tool_names = [t["function"]["name"] for t in chat["tools"]]
         self.assertIn("mcp__computer_use__click", tool_names)
         self.assertIn("mcp__computer_use__take_screenshot", tool_names)
-        self.assertEqual(stats["tools"]["forwarded_tools"], 2)
+        self.assertEqual(stats["tools"]["forwarded_tools"], 2 + len(load_snapshot_tools()))
         self.assertEqual(stats["tools"]["dropped_tools"], 0)
 
 

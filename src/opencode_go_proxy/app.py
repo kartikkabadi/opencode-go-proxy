@@ -204,8 +204,12 @@ class ResponsesProxyHandler(BaseHTTPRequestHandler):
 
         try:
             self._guard_request()
-            if self.path not in RESPONSES_PATHS | CHAT_COMPLETIONS_PATHS:
-                if self.path in MESSAGES_PATHS:
+            # The Codex app may send ?compact=true on the responses path; the query
+            # string must not turn a known path into a 404. The payload translates
+            # through the normal path either way (compact is just a hint).
+            path = self.path.split("?", 1)[0]
+            if path not in RESPONSES_PATHS | CHAT_COMPLETIONS_PATHS:
+                if path in MESSAGES_PATHS:
                     self._send_json(MESSAGES_UNSUPPORTED, status=HTTPStatus.BAD_REQUEST)
                 else:
                     self._send_json({"error": {"message": "not found"}}, status=HTTPStatus.NOT_FOUND)
@@ -220,7 +224,7 @@ class ResponsesProxyHandler(BaseHTTPRequestHandler):
                 model=payload.get("model"),
                 stream=payload.get("stream", False),
             )
-            if self.path in CHAT_COMPLETIONS_PATHS:
+            if path in CHAT_COMPLETIONS_PATHS:
                 handle_chat_completions_request(self, payload, config, request_id)
             elif payload.get("stream") is True:
                 # Real streaming: send SSE headers, then stream from upstream in real-time.
