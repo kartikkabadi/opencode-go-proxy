@@ -15,6 +15,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var configLabel: NSMenuItem!
     private var configToggleItem: NSMenuItem!
     private var usageBarItems: [NSMenuItem] = []
+    private var usageSectionItem: NSMenuItem!
+    private var goLimitsLabel: NSMenuItem!
+    private var goUsageLabel: NSMenuItem!
+    private var zenTodayLabel: NSMenuItem!
+    private var zenBarItems: [NSMenuItem] = []
     private var toggleItem: NSMenuItem!
     private var timer: Timer?
 
@@ -94,6 +99,29 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         resetLabel = NSMenuItem(title: "", action: nil, keyEquivalent: "")
         resetLabel.isEnabled = false
         menu.addItem(resetLabel)
+
+        usageSectionItem = NSMenuItem(title: "Usage", action: nil, keyEquivalent: "")
+        usageSectionItem.isEnabled = false
+        menu.addItem(usageSectionItem)
+
+        goLimitsLabel = NSMenuItem(title: "", action: nil, keyEquivalent: "")
+        goLimitsLabel.isEnabled = false
+        menu.addItem(goLimitsLabel)
+
+        goUsageLabel = NSMenuItem(title: "", action: nil, keyEquivalent: "")
+        goUsageLabel.isEnabled = false
+        menu.addItem(goUsageLabel)
+
+        zenTodayLabel = NSMenuItem(title: "", action: nil, keyEquivalent: "")
+        zenTodayLabel.isEnabled = false
+        menu.addItem(zenTodayLabel)
+
+        for _ in 0..<7 {
+            let item = NSMenuItem(title: "", action: nil, keyEquivalent: "")
+            item.isEnabled = false
+            zenBarItems.append(item)
+            menu.addItem(item)
+        }
 
         todayLabel = NSMenuItem(title: "", action: nil, keyEquivalent: "")
         todayLabel.isEnabled = false
@@ -198,6 +226,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             resetLabel.title = text ?? ""
             resetLabel.isHidden = text == nil
         }
+        let usage = serverState?.usage
+        if let usageSectionItem {
+            usageSectionItem.isHidden = usage?.go == nil && usage?.goLimits == nil && usage?.zen == nil
+        }
+        if let goLimitsLabel {
+            goLimitsLabel.title = Self.goLimitsText(usage?.goLimits) ?? ""
+            goLimitsLabel.isHidden = usage?.goLimits == nil
+        }
+        if let goUsageLabel {
+            goUsageLabel.title = Self.goUsageText(usage?.go) ?? ""
+            goUsageLabel.isHidden = usage?.go == nil
+        }
+        if let zenTodayLabel {
+            zenTodayLabel.title = Self.zenTodayText(usage?.zen) ?? ""
+            zenTodayLabel.isHidden = usage?.zen == nil
+        }
+        updateZenBars(usage?.zen)
         if let todayLabel {
             todayLabel.title = Self.todayText(serverState?.usage)
         }
@@ -254,6 +299,35 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
+    /// Zen 7-day bars. Zen usage carries no per-day dates, so weekdays are
+    /// computed relative to today (oldest-first counts, today last).
+    private func updateZenBars(_ zen: ZenUsage?) {
+        guard let zen else {
+            for item in zenBarItems {
+                item.title = "—"
+            }
+            return
+        }
+        let days = zen.last7d
+        let maxTokens = days.max() ?? 0
+        for (index, item) in zenBarItems.enumerated() {
+            let offset = days.count - 1 - index
+            guard offset >= 0, offset < days.count else {
+                item.title = "—"
+                continue
+            }
+            let tokens = days[offset]
+            let date = Calendar.current.date(byAdding: .day, value: -offset, to: Date()) ?? Date()
+            let weekday = Self.weekdayFormatter.string(from: date)
+            var bar = ""
+            if tokens > 0 {
+                let count = max(1, Int(ceil(Double(tokens) / Double(max(1, maxTokens)) * 8)))
+                bar = String(repeating: "█", count: count)
+            }
+            item.title = "\(weekday) \(bar) \(Self.formatTokens(tokens))"
+        }
+    }
+
     private static func displayUpstream(_ raw: String?) -> String {
         guard let raw, !raw.isEmpty else { return "—" }
         var value = raw
@@ -274,6 +348,47 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private static func todayText(_ usage: UsageSummary?) -> String {
         guard let usage else { return "Today —" }
         return "Today \(usage.todayTurns) turns · \(formatTokens(usage.todayTokens)) tok"
+    }
+
+    private static func goLimitsText(_ limits: GoLimits?) -> String? {
+        guard let limits else { return nil }
+        return "Go limits: $\(limits.monthlyDollars)/mo · $\(limits.weeklyDollars)/wk · $\(limits.rolling5hDollars)/5h"
+    }
+
+    private static func goUsageText(_ go: GoUsage?) -> String? {
+        guard let go else { return nil }
+        var parts: [String] = []
+        if let rolling = go.rolling {
+            parts.append(Self.windowText(rolling, label: "rolling"))
+            if let reset = resetText(rolling.resetsAt) {
+                parts.append(Self.lowercasedFirst(reset))
+            }
+        }
+        if let weekly = go.weekly {
+            parts.append(Self.windowText(weekly, label: "wk"))
+        }
+        if let monthly = go.monthly {
+            parts.append(Self.windowText(monthly, label: "mo"))
+        }
+        return "Go usage: " + parts.joined(separator: " · ")
+    }
+
+    private static func windowText(_ window: GoWindow, label: String) -> String {
+        var text = window.percent.map { "\($0)% \(label)" } ?? "\(label) —"
+        if !window.status.isEmpty && window.status != "ok" {
+            text += " (\(window.status))"
+        }
+        return text
+    }
+
+    private static func zenTodayText(_ zen: ZenUsage?) -> String? {
+        guard let zen else { return nil }
+        return "Zen today: \(zen.todayTurns) turns · \(formatTokens(zen.todayTokens)) tok"
+    }
+
+    private static func lowercasedFirst(_ text: String) -> String {
+        guard let first = text.first else { return text }
+        return first.lowercased() + text.dropFirst()
     }
 
     private static func resetText(_ resetAt: String?) -> String? {

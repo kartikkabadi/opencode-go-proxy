@@ -21,11 +21,47 @@ struct UsageSummary: Decodable, Equatable {
     let todayTurns: Int
     let todayTokens: Int
     let last7d: [UsageDay]
+    /// Zen contract additions (0.4.0). Optional so a pre-0.4.0 proxy that
+    /// omits these keys still decodes: synthesized Decodable treats a missing
+    /// or null optional key as nil.
+    let go: GoUsage?
+    let goLimits: GoLimits?
+    let zen: ZenUsage?
 }
 
 struct UsageDay: Decodable, Equatable {
     let date: String
     let tokens: Int
+}
+
+/// Go subscription windows from the Zen usage endpoint
+/// ({"rolling": {...}, "weekly": {...}, "monthly": {...}}).
+struct GoUsage: Decodable, Equatable {
+    let rolling: GoWindow?
+    let weekly: GoWindow?
+    let monthly: GoWindow?
+}
+
+struct GoWindow: Decodable, Equatable {
+    let status: String
+    let percent: Int?
+    let resetsAt: String?
+}
+
+/// Go plan dollar limits (fixed per the Zen contract).
+struct GoLimits: Decodable, Equatable {
+    let monthlyDollars: Int
+    let weeklyDollars: Int
+    let rolling5hDollars: Int
+    let subscriptionMonthlyDollars: Int
+}
+
+/// Zen-metered usage: today's rollup plus seven plain token counts
+/// (oldest first, today last).
+struct ZenUsage: Decodable, Equatable {
+    let todayTurns: Int
+    let todayTokens: Int
+    let last7d: [Int]
 }
 
 enum StateFetcher {
