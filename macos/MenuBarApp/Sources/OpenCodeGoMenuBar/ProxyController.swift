@@ -33,7 +33,7 @@ final class ProxyController {
         URL(string: "http://127.0.0.1:\(state.port)/health")!
     }
 
-    private static let proxySource = "git+https://github.com/kartikkabadi/opencode-go-proxy"
+    private static let proxySource = "git+https://github.com/kartikkabadi/opencode-go-proxy@v0.3.0"
     private static let cliLogName = "opencode-go-proxy-cli.log"
     private static let cliLogTailLimit = 600
     private static let configMarker = "# BEGIN opencode-go-proxy-managed"
@@ -47,13 +47,18 @@ final class ProxyController {
         guard childPID < 0, !state.isStarting else { return }
         state = ProxyState(isRunning: false, isStarting: true, isHealthy: false, port: state.port)
 
-        // Single-port guard: if another process already owns the port (the
-        // launchd service, another proxy, anything else), refuse to spawn a
-        // second one. One proxy per port; the menu bar is the control surface,
-        // but it must not fight an existing process for the socket.
+        // Single-port guard: if another process already owns the port, refuse
+        // to spawn a second one — except the legacy launchd agent this app
+        // replaced, which is migrated (unloaded) automatically once.
         if portIsInUse() {
-            failStart("Port \(state.port) is already in use by another process. Stop the launchd service or the other proxy first (one proxy per port).")
-            return
+            if oldLaunchdJobLoaded() {
+                unloadOldLaunchdJob()
+                Thread.sleep(forTimeInterval: 0.5)
+            }
+            if portIsInUse() {
+                failStart("Port \(state.port) is already in use by another process (one proxy per port).")
+                return
+            }
         }
 
         do {
@@ -257,6 +262,33 @@ final class ProxyController {
             }
         }
         return rc == 0
+    }
+
+    /// True when the legacy launchd agent (pre-0.3.0) is still loaded.
+    private func oldLaunchdJobLoaded() -> Bool {
+        launchctl(["print", "gui/\(getuid())/com.opencode.go.proxy"]) == 0
+    }
+
+    /// Unload the legacy launchd agent so the menu bar can own the port.
+    private func unloadOldLaunchdJob() {
+        _ = launchctl(["bootout", "gui/\(getuid())/com.opencode.go.proxy"])
+    }
+
+    /// Run launchctl; returns its exit status, or -1 when it cannot run.
+    private func launchctl(_ arguments: [String]) -> Int32 {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/bin/launchctl")
+        process.arguments = arguments
+        let sink = Pipe()
+        process.standardOutput = sink
+        process.standardError = sink
+        do {
+            try process.run()
+            process.waitUntilExit()
+            return process.terminationStatus
+        } catch {
+            return -1
+        }
     }
 
     private func failStart(_ message: String) {
