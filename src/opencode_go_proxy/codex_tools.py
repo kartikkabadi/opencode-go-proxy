@@ -2,9 +2,9 @@
 
 The Codex app ships most of its toolset as ``type: "namespace"`` entries that
 chat-completions upstreams do not understand; the proxy flattens them to plain
-functions named ``<namespace>__<tool>``. This module snapshots the app's own
-namespaces (``codex_app``, ``plugin_management``) from the installed codex
-binary and merges the snapshot into request tool lists that arrive without
+functions named ``<namespace>__<tool>``. This module snapshots the app's
+``codex_app`` namespace from the installed codex binary and merges the
+snapshot into request tool lists that arrive without
 those tools, so a routed model can still call ``codex_app__create_thread``,
 ``codex_app__list_threads``, and friends.
 
@@ -20,6 +20,7 @@ from __future__ import annotations
 import json
 import os
 import subprocess
+import time
 from datetime import UTC, datetime
 from typing import Any
 
@@ -43,9 +44,9 @@ _REPO_CONTRIB_PATH = os.path.join(
     STATE_TOOLS_NAME,
 )
 
-# (path, mtime_ns, tools) so a per-request merge does not re-read an unchanged
-# snapshot; None until the first successful load.
-_snapshot_cache: tuple[str, int, list[Json]] | None = None
+# (path, mtime_ns, captured_with, tools) so a per-request merge does not
+# re-read an unchanged snapshot; None until the first successful load.
+_snapshot_cache: tuple[str, int, str | None, list[Json]] | None = None
 
 
 def state_tools_path() -> str:
@@ -107,17 +108,33 @@ def _collect_codex_app_tools(node: Any, collected: dict[str, Json]) -> None:
         _collect_codex_app_tools(value, collected)
 
 
+# (binary, probe_time, version) so hot paths never spawn ``codex --version``
+# per request; a short TTL keeps the probe honest across app upgrades.
+_version_cache: tuple[str, float, str | None] | None = None
+
+VERSION_PROBE_TTL = 30.0
+
+
 def _codex_version(binary: str) -> str | None:
-    """The binary's version banner for captured_with; None when it cannot be read."""
+    """The binary's version banner, cached briefly; None when it cannot be read."""
+    global _version_cache
+    now = time.monotonic()
+    if (
+        _version_cache is not None
+        and _version_cache[0] == binary
+        and now - _version_cache[1] < VERSION_PROBE_TTL
+    ):
+        return _version_cache[2]
     try:
         completed = subprocess.run(
             [binary, "--version"], capture_output=True, text=True, timeout=VERSION_TIMEOUT_SEC, check=False
         )
     except (OSError, subprocess.TimeoutExpired):
-        return None
-    if completed.returncode != 0:
-        return None
-    return completed.stdout.strip() or None
+        version = None
+    else:
+        version = completed.stdout.strip() or None if completed.returncode == 0 else None
+    _version_cache = (binary, now, version)
+    return version
 
 
 CODEX_BIN_ENV = "OPENCODE_GO_PROXY_CODEX_BIN"
@@ -172,9 +189,10 @@ def capture_codex_app_tools() -> list[Json] | None:
     if not collected:
         return None
     tools = [collected[key] for key in sorted(collected)]
+    captured_with = _codex_version(binary) or binary
     snapshot = {
         "captured_at": datetime.now(UTC).isoformat(),
-        "captured_with": _codex_version(binary) or binary,
+        "captured_with": captured_with,
         "tools": tools,
     }
     path = state_tools_path()
@@ -187,17 +205,17 @@ def capture_codex_app_tools() -> list[Json] | None:
         # process and later merges fall back to the checked-in contrib file.
         return tools
     global _snapshot_cache
-    _snapshot_cache = (path, os.stat(path).st_mtime_ns, list(tools))
+    _snapshot_cache = (path, os.stat(path).st_mtime_ns, captured_with, list(tools))
     return tools
 
 def load_snapshot_tools() -> list[Json]:
     """The codex_app tool list: state-dir capture first, then the contrib fallback.
 
-    Revalidation keeps the snapshot honest as the app updates: a cache hit
-    re-captures when the codex binary is newer than the snapshot file (cheap
-    stat, no subprocess), and a file re-read probes the binary version against
-    ``captured_with``. Recapture is best-effort — a failure keeps the last
-    known-good snapshot.
+    Revalidation keeps the snapshot honest as the app updates: both a cache
+    hit and a file re-read compare the binary's probed version (cached
+    briefly, so hot paths spawn no subprocess) against ``captured_with`` and
+    re-capture on mismatch. Recapture is best-effort — a failure keeps the
+    last known-good snapshot.
     """
     global _snapshot_cache
     path = state_tools_path()
@@ -208,44 +226,30 @@ def load_snapshot_tools() -> list[Json]:
             mtime = -1
         if _snapshot_cache is not None and _snapshot_cache[0] == path and _snapshot_cache[1] == mtime:
             binary = _resolve_codex_bin()
-            if binary and _binary_newer_than(binary, mtime):
-                refreshed = capture_codex_app_tools()
-                if refreshed:
-                    return list(refreshed)
-            return list(_snapshot_cache[2])
+            if binary:
+                probed = _codex_version(binary)
+                if probed and _snapshot_cache[2] != probed:
+                    refreshed = capture_codex_app_tools()
+                    if refreshed:
+                        return list(refreshed)
+            return list(_snapshot_cache[3])
         try:
             with open(path, encoding="utf-8") as fh:
                 snapshot = json.load(fh)
             tools = [t for t in snapshot.get("tools", []) if isinstance(t, dict)]
         except (OSError, ValueError, TypeError):
             tools = []
+        captured_with = snapshot.get("captured_with") if isinstance(snapshot, dict) else None
         binary = _resolve_codex_bin()
         if tools and binary:
-            captured_with = snapshot.get("captured_with") if isinstance(snapshot, dict) else None
-            if captured_with != _codex_version(binary):
+            probed = _codex_version(binary)
+            if probed and captured_with != probed:
                 refreshed = capture_codex_app_tools()
                 if refreshed:
                     return list(refreshed)
         if tools:
-            _snapshot_cache = (path, mtime, list(tools))
+            _snapshot_cache = (path, mtime, captured_with, list(tools))
             return list(tools)
-
-    if os.path.exists(_REPO_CONTRIB_PATH):
-        try:
-            with open(_REPO_CONTRIB_PATH, encoding="utf-8") as fh:
-                snapshot = json.load(fh)
-            return [t for t in snapshot.get("tools", []) if isinstance(t, dict)]
-        except (OSError, ValueError, TypeError):
-            return []
-    return []
-
-
-def _binary_newer_than(binary: str, mtime_ns: int) -> bool:
-    """True when the codex binary was modified after the snapshot (mtime_ns)."""
-    try:
-        return os.stat(binary).st_mtime_ns > mtime_ns
-    except OSError:
-        return False
 
     if os.path.exists(_REPO_CONTRIB_PATH):
         try:

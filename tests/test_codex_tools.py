@@ -232,6 +232,7 @@ class TestCapture:
             first = capture_codex_app_tools()
             assert first is not None
             codex_tools._snapshot_cache = None  # process restart equivalent
+            codex_tools._version_cache = None
             os.environ["FAKE_VERSION"] = "codex-cli 2.0.0"
             refreshed = load_snapshot_tools()
         assert refreshed is not None
@@ -240,16 +241,30 @@ class TestCapture:
             snapshot = json.load(fh)
         assert snapshot["captured_with"] == "codex-cli 2.0.0"
 
-    def test_newer_binary_mtime_triggers_recapture(self, fake_codex_bin) -> None:
+    def test_cache_hit_recaptures_on_version_change(self, fake_codex_bin) -> None:
         with mock.patch.dict(os.environ, {"OPENCODE_GO_PROXY_CODEX_BIN": fake_codex_bin}):
             capture_codex_app_tools()
             before = os.stat(state_tools_path()).st_mtime_ns
-            newer = before + 10_000_000_000
-            os.utime(fake_codex_bin, ns=(newer, newer))
+            codex_tools._version_cache = None  # force a fresh version probe
+            os.environ["FAKE_VERSION"] = "codex-cli 9.0.0"
             loaded = load_snapshot_tools()
             after = os.stat(state_tools_path()).st_mtime_ns
         assert loaded is not None
         assert after > before
+        with open(state_tools_path(), encoding="utf-8") as fh:
+            snapshot = json.load(fh)
+        assert snapshot["captured_with"] == "codex-cli 9.0.0"
+
+    def test_cache_hit_serves_when_version_matches(self, fake_codex_bin) -> None:
+        with mock.patch.dict(os.environ, {"OPENCODE_GO_PROXY_CODEX_BIN": fake_codex_bin}):
+            capture_codex_app_tools()
+            before = os.stat(state_tools_path()).st_mtime_ns
+            codex_tools._version_cache = None  # force a fresh version probe
+            loaded = load_snapshot_tools()
+            after = os.stat(state_tools_path()).st_mtime_ns
+        assert loaded is not None
+        assert snapshot_names(loaded) == {"codex_app__create_thread", "codex_app__list_threads"}
+        assert after == before  # no recapture: the snapshot file was not rewritten
 
 
 class TestSnapshotLoad:
