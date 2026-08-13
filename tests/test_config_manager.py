@@ -57,6 +57,7 @@ class TestEnable:
         assert "[features.multi_agent_v2]" in text
         assert "enabled = true" in text
         assert "[model_providers.opencode-go]" in text
+        assert 'name = "opencode-go"' in text
         assert f"base_url = {json.dumps(config_manager.managed_base_url())}" in text
         assert 'wire_api = "responses"' in text
 

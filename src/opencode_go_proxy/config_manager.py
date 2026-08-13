@@ -13,14 +13,16 @@ config.toml:
     enabled = true
 
     [model_providers.opencode-go]
+    name = "opencode-go"
     base_url = "http://127.0.0.1:8787/v1"
     wire_api = "responses"
     # END opencode-go-proxy-managed
 
 The multi_agent_v2 feature block is written only when the installed codex
 binary accepts the flag (probed via `codex debug prompt-input --enable
-multi_agent_v2`); the provider block omits keys the user already sets in
-their own [model_providers.opencode-go] table. Semantics mirror codex-router's
+multi_agent_v2`); the provider block is omitted entirely when the user
+declares their own [model_providers.opencode-go] table (TOML forbids
+splitting one table across two locations). Semantics mirror codex-router's
 config-manager: enable never replaces a user-owned openai_base_url or
 model_catalog_json, disable removes only the managed block (and the file when
 the block was its only content), and the Codex Voice realtime keys are added
@@ -214,13 +216,16 @@ def _block_lines(
     if multi_agent_v2 and not _user_configures_multi_agent_v2(root_lines, table_lines):
         lines.extend(["", "[features.multi_agent_v2]", "enabled = true"])
     provider_keys = _provider_keys_owned(table_lines)
-    provider_lines = []
-    if "base_url" not in provider_keys:
-        provider_lines.append(f"base_url = {_toml_string(base_url)}")
-    if "wire_api" not in provider_keys:
-        provider_lines.append("wire_api = \"responses\"")
-    if provider_lines:
-        lines.extend(["", "[model_providers.opencode-go]", *provider_lines])
+    if not provider_keys:
+        lines.extend(
+            [
+                "",
+                "[model_providers.opencode-go]",
+                'name = "opencode-go"',
+                f"base_url = {_toml_string(base_url)}",
+                'wire_api = "responses"',
+            ]
+        )
     lines.append(END_MARKER)
     return lines
 
