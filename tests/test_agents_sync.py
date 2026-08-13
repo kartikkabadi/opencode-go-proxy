@@ -86,6 +86,17 @@ class TestSyncAgents:
         report = agents_sync.sync_agents()
         assert os.path.basename(foreign) in os.listdir(agents_dir)
         assert report["removed"] == []
+    def test_collision_file_is_reported_not_overwritten(self, agents_dir) -> None:
+        _write_compact(_state_dir(), ["deepseek-v4-flash"])
+        os.makedirs(agents_dir, exist_ok=True)
+        target = os.path.join(agents_dir, "router-opencode-go-deepseek-v4-flash.toml")
+        with open(target, "w", encoding="utf-8") as handle:
+            handle.write('# user-owned agent, hands off\nname = "mine"\n')
+        report = agents_sync.sync_agents()
+        assert report["collisions"] == ["router-opencode-go-deepseek-v4-flash.toml"]
+        assert report["written"] == []
+        with open(target, encoding="utf-8") as handle:
+            assert handle.read() == '# user-owned agent, hands off\nname = "mine"\n'
 
     def test_noop_when_catalog_missing(self, agents_dir, monkeypatch) -> None:
         stale = os.path.join(agents_dir, "router-opencode-go-deepseek-v4-pro.toml")

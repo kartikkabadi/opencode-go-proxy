@@ -355,6 +355,21 @@ class TestInstallSkills:
         assert text.startswith("---\nname: opencode-go-proxy\n---\n")
         assert "Body text." in text
 
+    def test_refuses_to_overwrite_foreign_skill(self, tmp_path, capsys) -> None:
+        source = tmp_path / "SKILL.md"
+        source.write_text("---\nname: opencode-go-proxy\n---\n\nBody text.\n")
+        skills = tmp_path / "skills"
+        target = skills / "opencode-go-proxy" / "SKILL.md"
+        target.parent.mkdir(parents=True)
+        target.write_text("---\nname: opencode-go-proxy\n---\n\nUser customized.\n")
+        with mock.patch.dict(os.environ, {
+            "OPENCODE_GO_PROXY_SKILLS_DIR": str(skills),
+            "OPENCODE_GO_PROXY_SKILL_SOURCE": str(source),
+        }):
+            assert ops.install_skills([]) == 1
+        assert "refusing to overwrite" in capsys.readouterr().out
+        assert target.read_text() == "---\nname: opencode-go-proxy\n---\n\nUser customized.\n"
+
     def test_missing_source_fails(self, tmp_path, capsys) -> None:
         with mock.patch.dict(os.environ, {
             "OPENCODE_GO_PROXY_SKILLS_DIR": str(tmp_path / "skills"),

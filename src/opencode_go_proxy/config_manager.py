@@ -306,6 +306,16 @@ def enable() -> dict[str, object]:
     existing_catalog = _root_value(root_lines, "model_catalog_json")
     if existing_catalog and existing_catalog != catalog_path:
         raise ConfigError(f"refusing to replace user-owned model_catalog_json = {existing_catalog!r}")
+    # The managed block points Codex at merged-models.json, so make sure that
+    # file exists (with a fresh native capture, best-effort) before writing.
+    try:
+        from opencode_go_proxy import catalog as _catalog
+        from opencode_go_proxy import native_models
+
+        native_models.capture_native_models()
+    except Exception:  # noqa: BLE001, S110 - capture is best-effort; the render below still runs
+        pass
+    _catalog.render_merged_catalog()
     supported = multi_agent_v2_supported()
     next_root = [
         *_trim_blank_edges(root_lines),

@@ -590,6 +590,17 @@ def install_skills(argv: list[str] | None = None) -> int:
         return 1
     if SKILL_MARKER not in text:
         text = _with_skill_marker(text)
+    if os.path.exists(target):
+        try:
+            with open(target, encoding="utf-8") as handle:
+                existing = handle.read()
+        except OSError:
+            existing = ""
+        if SKILL_MARKER not in existing:
+            sys.stdout.write(
+                f"install-skills FAIL: {target} exists and is not proxy-managed; refusing to overwrite\n"
+            )
+            return 1
     try:
         _atomic_write_text(target, text)
     except OSError as exc:

@@ -83,9 +83,11 @@ def _atomic_write(path: str, contents: str) -> None:
 def sync_agents() -> dict[str, object]:
     """Write agent TOMLs for current opencode-go models; drop stale owned ones.
 
-    Returns {"path", "written", "unchanged", "removed", "catalog"}. When the
-    catalog is unreadable nothing is written or removed, so a failed refresh
-    can never wipe the agent set.
+    Returns {"path", "written", "unchanged", "removed", "collisions",
+    "catalog"}. A target file that exists without the ownership marker is
+    never overwritten — it is reported under "collisions" and left untouched.
+    When the catalog is unreadable nothing is written or removed, so a failed
+    refresh can never wipe the agent set.
     """
     directory = agents_dir()
     models = _opencode_go_models()
@@ -95,10 +97,12 @@ def sync_agents() -> dict[str, object]:
             "written": [],
             "unchanged": [],
             "removed": [],
+            "collisions": [],
             "catalog": "missing",
         }
     targets = {agent_file_name(slug): _agent_contents(slug, display) for slug, display in models}
     written: list[str] = []
+    collisions: list[str] = []
     unchanged: list[str] = []
     removed: list[str] = []
     if os.path.isdir(directory):
@@ -114,16 +118,18 @@ def sync_agents() -> dict[str, object]:
             if name in targets:
                 if existing == targets[name]:
                     unchanged.append(name)
-                else:
+                elif OWNERSHIP_MARKER in existing:
                     _atomic_write(path, targets[name])
                     written.append(name)
+                else:
+                    collisions.append(name)
             elif OWNERSHIP_MARKER in existing:
                 try:
                     os.unlink(path)
                     removed.append(name)
                 except OSError:
                     continue
-    for name in sorted(set(targets) - set(written) - set(unchanged)):
+    for name in sorted(set(targets) - set(written) - set(unchanged) - set(collisions)):
         path = os.path.join(directory, name)
         _atomic_write(path, targets[name])
         written.append(name)
@@ -132,6 +138,7 @@ def sync_agents() -> dict[str, object]:
         "written": written,
         "unchanged": unchanged,
         "removed": removed,
+        "collisions": collisions,
         "catalog": "ok",
     }
 
