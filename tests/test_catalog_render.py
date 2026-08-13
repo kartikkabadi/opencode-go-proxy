@@ -101,14 +101,14 @@ class RenderFullCatalogTests(unittest.TestCase):
         self.assertIn("You are Codex, a coding agent based on DeepSeek V4 Flash.", flash["model_messages"]["instructions_template"])
         self.assertTrue(flash["supports_reasoning_summaries"])
         self.assertEqual(flash["auto_compact_token_limit"], round(1000000 * 0.9))
-        self.assertEqual(flash["multi_agent_version"], "v1")
+        self.assertEqual(flash["multi_agent_version"], "v2")
         self.assertNotIn("multi_agent_version", flash["model_messages"])
         self.assertNotIn("auto_compact_token_limit", flash["model_messages"])
         self.assertNotIn("supports_reasoning_summaries", flash["model_messages"])
 
         pro = rendered["models"][1]
         self.assertEqual(pro["auto_compact_token_limit"], round(400000 * 0.9))
-        self.assertEqual(pro["multi_agent_version"], "v1")
+        self.assertEqual(pro["multi_agent_version"], "v2")
 
     def test_identity_line_is_replaced_per_model(self) -> None:
         rendered = render_full_catalog(compact_catalog())
@@ -188,7 +188,7 @@ class WriteCatalogTests(unittest.TestCase):
             reloaded["models"][0]["auto_compact_token_limit"],
             round(1000000 * 0.9),
         )
-        self.assertEqual(reloaded["models"][0]["multi_agent_version"], "v1")
+        self.assertEqual(reloaded["models"][0]["multi_agent_version"], "v2")
         self.assertNotIn("shared_instructions", reloaded)
         self.assertEqual(json.dumps(compact, sort_keys=True), json.dumps(compact_catalog(), sort_keys=True))
 
@@ -218,7 +218,7 @@ class CanonicalContractTests(unittest.TestCase):
         rendered = render_full_catalog(compact_catalog())
 
         for model in rendered["models"]:
-            self.assertEqual(model["multi_agent_version"], "v1")
+            self.assertEqual(model["multi_agent_version"], "v2")
             self.assertNotIn("multi_agent_version", model["model_messages"])
             self.assertEqual(model["auto_compact_token_limit"], round(model["context_window"] * 0.9))
 

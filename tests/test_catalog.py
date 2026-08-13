@@ -185,7 +185,7 @@ class ColdStartRenderTests(unittest.TestCase):
             rendered["models"][0]["auto_compact_token_limit"],
             round(1000000 * 0.9),
         )
-        self.assertEqual(rendered["models"][0]["multi_agent_version"], "v1")
+        self.assertEqual(rendered["models"][0]["multi_agent_version"], "v2")
 
 
 if __name__ == "__main__":

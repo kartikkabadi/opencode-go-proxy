@@ -45,6 +45,7 @@ STATE_COMPACT_NAME = "opencode-go-models.json"
 USER_MODELS_NAME = "user-models.json"
 MODEL_PICKER_NAME = "model-picker.json"
 ANNOUNCED_MODELS_NAME = "announced-models.json"
+MERGE_CATALOG_NAME = "merged-models.json"
 
 # Codex auto-announces a model (availability_nux card) for this long after it
 # first appears, mirroring codex-router's announcement window.
@@ -89,7 +90,7 @@ def _canonical_model_defaults() -> dict[str, Any]:
         "input_modalities": ["text"],
         "max_context_window": 1000000,
         "model_messages": {},  # computed at render
-        "multi_agent_version": "v1",
+        "multi_agent_version": "v2",
         "priority": 50,
         "service_tiers": [],
         "shell_type": "shell_command",
@@ -415,6 +416,11 @@ def model_picker_path() -> str:
 def announced_models_path() -> str:
     """Path of the announcement first-seen state under the state dir."""
     return os.path.join(state_dir(), ANNOUNCED_MODELS_NAME)
+
+
+def merged_models_path() -> str:
+    """Path of the merged native + opencode-go catalog under the state dir."""
+    return os.path.join(state_dir(), MERGE_CATALOG_NAME)
 
 
 def seed_compact_path() -> str:
@@ -763,6 +769,93 @@ def refresh_runtime_catalog(
     return refresh_catalog(now=now, ttl_hours=ttl_hours, force=force, overlay=True)
 
 
+def _full_native_record(entry: Json) -> Json:
+    """Project a captured native model into the canonical full shape."""
+    full = _canonical_model_defaults()
+    for key, value in entry.items():
+        if value is not None:
+            full[key] = value
+    slug = str(full.get("slug") or "")
+    if not full.get("comp_hash"):
+        full["comp_hash"] = f"codex-{slug.replace('/', '-')}-v1"
+    context = full.get("context_window")
+    if not isinstance(context, int) or context <= 0:
+        context = 1000000
+    full["auto_compact_token_limit"] = round(context * 0.9)
+    full["base_instructions"] = ""
+    full["model_messages"] = model_messages("", full["display_name"], context, full)
+    return full
+
+
+def _clamp_efforts(models: list[Json], native_efforts: set[str]) -> list[Json]:
+    """Drop opencode-go reasoning levels whose effort the native capture lacks.
+
+    With no native capture there is no vocabulary to clamp against, so the
+    entries are left untouched.
+    """
+    if not native_efforts:
+        return models
+    clamped = []
+    for entry in models:
+        levels = entry.get("supported_reasoning_levels")
+        if not isinstance(levels, list):
+            clamped.append(entry)
+            continue
+        kept = [
+            level
+            for level in levels
+            if isinstance(level, dict) and level.get("effort") in native_efforts
+        ]
+        clamped.append({**entry, "supported_reasoning_levels": kept})
+    return clamped
+
+
+def render_merged_catalog() -> dict:
+    """Compose the native capture with the opencode-go catalog as merged-models.json.
+
+    Native entries keep their captured slugs; opencode-go entries keep bare
+    slugs and their reasoning levels are clamped to the native effort
+    vocabulary. The opencode-go side runs the same seed/discovery/overlay
+    pipeline as the runtime catalog. Written under the state dir.
+    """
+    from .native_models import load_native_capture, native_effort_vocabulary
+
+    compact = load_runtime_compact()
+    if compact is None:
+        compact = load_seed_compact()
+    if compact is None:
+        compact = {
+            "fetched_at": datetime.datetime.now(datetime.UTC).isoformat(),
+            "etag": "",
+            "shared_instructions": "",
+            "client_version": "",
+            "models": [],
+        }
+    rendered = render_runtime_catalog(compact)
+    native = load_native_capture()
+    models = [_full_native_record(entry) for entry in native.get("models", [])]
+    models.extend(_clamp_efforts(rendered.get("models", []), native_effort_vocabulary(native)))
+    merged = {
+        "fetched_at": rendered.get("fetched_at", compact["fetched_at"]),
+        "etag": rendered.get("etag", compact["etag"]),
+        "client_version": rendered.get("client_version", compact["client_version"]),
+        "models": models,
+    }
+    _write_json(merged_models_path(), merged)
+    return merged
+
+
+
+def merged_model_slugs() -> list[str]:
+    """Slug list from the merged catalog; empty when it has not been rendered."""
+    try:
+        with open(merged_models_path()) as handle:
+            payload = json.load(handle)
+    except (OSError, json.JSONDecodeError):
+        return []
+    models = payload.get("models", []) if isinstance(payload, dict) else []
+    return sorted({str(m["slug"]) for m in models if isinstance(m, dict) and m.get("slug")})
+
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 
@@ -795,6 +888,7 @@ __all__ = [
     "DEFAULT_TTL_HOURS",
     "MODELS_DEV_URL",
     "MODEL_MESSAGES_KEYS",
+    "MERGE_CATALOG_NAME",
     "OVERLAY_EDIT_KEYS",
     "SEED_CATALOG_ENV",
     "STATE_CATALOG_NAME",
@@ -812,6 +906,7 @@ __all__ = [
     "load_seed_compact",
     "main_refresh",
     "merge_models",
+    "merged_models_path",
     "model_messages",
     "parse_iso",
     "prepare_runtime_catalog",
@@ -821,6 +916,7 @@ __all__ = [
     "refresh_catalog",
     "refresh_runtime_catalog",
     "render_full_catalog",
+    "render_merged_catalog",
     "render_runtime_catalog",
     "seed_compact_path",
     "state_catalog_path",

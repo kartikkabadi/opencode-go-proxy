@@ -142,6 +142,7 @@ def record_usage_event(
     retries: int | None = None,
     at: float | None = None,
     kind: str = "turn",
+    provider: str | None = None,
 ) -> None:
     """Append one usage event to usage-events.jsonl, creating the dir on demand.
 
@@ -152,12 +153,14 @@ def record_usage_event(
     when they are clean non-negative counts; a truncated stream never reports
     final usage, so callers simply omit them. Proxy-specific markers
     (`streamAborted`, `emptyCompletion`, `retries`, `kind`) are additive and
-    only written when set.
+    only written when set. `provider` overrides the module constant so native
+    turns meter under their own provider and never count against the
+    opencode-go quota.
     """
     record: Json = {
         "at": _iso_at(at),
         "model": _safe_text(model, "unknown"),
-        "provider": PROVIDER,
+        "provider": provider or PROVIDER,
         "meteringVersion": METERING_VERSION,
         "status": int(status),
         "durationMs": int(duration_ms),
