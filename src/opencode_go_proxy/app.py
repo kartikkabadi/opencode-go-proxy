@@ -52,6 +52,11 @@ from .upstream import (
     usage_tokens,
 )
 from .vision import caption_images_in_messages, is_image_rejection_status
+from .zen_upstream import (
+    call_zen_responses,
+    handle_zen_chat_request,
+    handle_zen_responses_request,
+)
 
 Json = dict[str, Any]
 
@@ -222,20 +227,25 @@ class ResponsesProxyHandler(BaseHTTPRequestHandler):
             check_content_type(self.headers.get("content-type"))
             config = self._config()
             payload = self._read_json(config)
+            model = payload.get("model") or DEFAULT_MODEL
             trace(
                 "request.received",
                 request_id=request_id,
                 path=self.path,
-                model=payload.get("model"),
+                model=model,
                 stream=payload.get("stream", False),
             )
             if path in CHAT_COMPLETIONS_PATHS:
                 handle_chat_completions_request(self, payload, config, request_id)
-            elif path in RESPONSES_PATHS and route_target(payload.get("model") or DEFAULT_MODEL) == "native":
+            elif path in RESPONSES_PATHS and route_target(model) == "native":
                 # Native models relay whole to the ChatGPT backend: the body,
                 # the client's own auth, and the stream are forwarded verbatim
                 # and never touch the OpenCode Go key or alias logic.
                 relay_native_request(self, payload, config, request_id)
+            elif path in RESPONSES_PATHS and route_target(model) == "zen":
+                # Zen models translate per wire family inside the zen client;
+                # they must never reach the opencode-go translation path.
+                handle_zen_responses_request(self, payload, config, request_id)
             elif payload.get("stream") is True:
                 # Real streaming: send SSE headers, then stream from upstream in real-time.
                 self.send_response(HTTPStatus.OK)
@@ -306,6 +316,10 @@ class ResponsesProxyHandler(BaseHTTPRequestHandler):
 def handle_responses_request(payload: Json, config: ProxyConfig, request_id: str) -> Json:
     started = time.time()
     session_model = payload.get("model") or DEFAULT_MODEL
+    if route_target(session_model) == "zen":
+        # Zen models never enter the opencode-go translation path: the zen
+        # client translates per wire family (and meters provider="zen").
+        return call_zen_responses(payload, config, request_id)
     payload = inject_session_model(payload, session_model)
     chat_payload, request_model, conversion_stats = responses_payload_to_chat_payload(payload)
 
@@ -384,6 +398,11 @@ def handle_chat_completions_request(handler: ResponsesProxyHandler, payload: Jso
     unchanged. A missing key surfaces the same 401 proxy error the responses
     path uses.
     """
+    if route_target(payload.get("model") or DEFAULT_MODEL) == "zen":
+        # Zen models relay to the zen chat-completions surface with the zen
+        # key and base; the opencode-go upstream is never involved.
+        handle_zen_chat_request(handler, payload, config, request_id)
+        return
     if payload.get("stream") is True:
         handle_chat_stream_passthrough(payload, config, request_id, handler)
         return
@@ -421,7 +440,11 @@ def _refresh_catalog_in_background() -> None:
     """Run the TTL-gated runtime catalog refresh; failures are logged, never fatal."""
     try:
         from opencode_go_proxy import catalog as _catalog
+        from opencode_go_proxy.zen_catalog import capture_zen_models
 
+        # Zen capture is TTL-gated and never raises (network failure falls back
+        # to cache); without it the merged catalog has no zen/ slugs.
+        capture_zen_models()
         _catalog.refresh_runtime_catalog()
         _catalog.render_merged_catalog()
     except Exception as exc:  # noqa: BLE001 - background refresh is best-effort
