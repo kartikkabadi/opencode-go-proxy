@@ -16,7 +16,9 @@ FULL_PATH = REPO_ROOT / "contrib" / "opencode-go-catalog.json"
 COMPACT_PATH = REPO_ROOT / "contrib" / "opencode-go-models.json"
 CLIENT_VERSION = "0.147.0"
 
-DROPPED_KEYS = frozenset({"base_instructions", "model_messages"})
+# auto_compact_token_limit is derived from context_window at render time, so
+# the compact form never stores it (the same rule as _default_model_record).
+DROPPED_KEYS = frozenset({"base_instructions", "model_messages", "auto_compact_token_limit"})
 
 
 def compact_model(full_model: dict) -> dict:

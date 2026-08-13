@@ -1,5 +1,6 @@
 """Integration tests: full HTTP round-trip with mocked upstream."""
 
+import base64
 import io
 import json
 import os
@@ -208,13 +209,13 @@ class TestResponsesRoundTrip:
 
     def test_missing_api_key_returns_401(self, server):
         port, _ = server
-        import opencode_go_proxy.app as app_mod
-        app_mod._api_key_cache = None
+        from opencode_go_proxy.secrets import clear_api_key_cache
+        clear_api_key_cache()
         # Mock subprocess.run to return a failed completed process (no keychain entry)
         failed_completed = mock.MagicMock()
         failed_completed.returncode = 1
         failed_completed.stdout = ""
-        with mock.patch.dict(os.environ, {}, clear=True), mock.patch("opencode_go_proxy.app.subprocess.run", return_value=failed_completed):
+        with mock.patch.dict(os.environ, {}, clear=True), mock.patch("opencode_go_proxy.secrets.subprocess.run", return_value=failed_completed):
             conn = HTTPConnection("127.0.0.1", port, timeout=5)
             conn.request("POST", "/v1/responses",
                          json.dumps({"model": "deepseek-v4-flash", "input": "hi"}),
@@ -279,12 +280,12 @@ class TestStreamingResponse:
 
     def test_streaming_missing_api_key_sends_error_event(self, server):
         port, _ = server
-        import opencode_go_proxy.app as app_mod
-        app_mod._api_key_cache = None
+        from opencode_go_proxy.secrets import clear_api_key_cache
+        clear_api_key_cache()
         failed_completed = mock.MagicMock()
         failed_completed.returncode = 1
         failed_completed.stdout = ""
-        with mock.patch.dict(os.environ, {}, clear=True), mock.patch("opencode_go_proxy.app.subprocess.run", return_value=failed_completed):
+        with mock.patch.dict(os.environ, {}, clear=True), mock.patch("opencode_go_proxy.secrets.subprocess.run", return_value=failed_completed):
             conn = HTTPConnection("127.0.0.1", port, timeout=5)
             conn.request("POST", "/v1/responses",
                          json.dumps({"model": "deepseek-v4-flash", "input": "hi", "stream": True}),
@@ -301,7 +302,7 @@ class TestStreamingResponse:
     def test_streaming_crash_sends_sse_error(self, server):
         port, _ = server
         with mock.patch.dict(os.environ, {"OPENCODE_GO_API_KEY": "test-key"}), mock.patch(
-            "opencode_go_proxy.app.responses_payload_to_chat_payload",
+            "opencode_go_proxy.streaming.responses_payload_to_chat_payload",
             side_effect=ValueError("boom"),
         ):
             conn = HTTPConnection("127.0.0.1", port, timeout=5)
@@ -727,7 +728,11 @@ class TestImageCaptioning:
             MockUpstreamResponse(json.dumps(main_resp).encode()),
         ]
 
-        with mock.patch.dict(os.environ, {"OPENCODE_GO_API_KEY": "test-key"}), mock.patch("urllib.request.urlopen", side_effect=responses):
+        # The local-runtime probe also rides urlopen; pin it off so it cannot
+        # consume one of the fixed mock responses.
+        with mock.patch.dict(os.environ, {"OPENCODE_GO_API_KEY": "test-key"}), mock.patch(
+            "opencode_go_proxy.vision.local_runtime_enabled", return_value=False
+        ), mock.patch("urllib.request.urlopen", side_effect=responses):
             conn = HTTPConnection("127.0.0.1", port, timeout=10)
             conn.request("POST", "/v1/responses",
                          json.dumps({
@@ -747,3 +752,128 @@ class TestImageCaptioning:
 
         assert resp.status == 200
         assert body["status"] == "completed"
+
+
+class TestImageCaptionLatency:
+    """Plan 001: cached captions, no transient retries, bounded fallbacks."""
+
+    @staticmethod
+    def _caption_calls(calls: list[dict]) -> list[dict]:
+        return [c for c in calls if c.get("max_tokens") == 200]
+
+    def _caption_aware_upstream(self, caption_text: str = "A screenshot of a code editor", failures: list[BaseException] | None = None):
+        calls: list[dict] = []
+
+        def handler(request, *args, **kwargs):
+            payload = json.loads(request.data)
+            calls.append(payload)
+            if payload.get("max_tokens") == 200:
+                if failures:
+                    raise failures.pop(0)
+                return MockUpstreamResponse(json.dumps({
+                    "id": "chatcmpl-cap",
+                    "object": "chat.completion",
+                    "model": payload["model"],
+                    "choices": [{"index": 0, "message": {"role": "assistant", "content": caption_text}, "finish_reason": "stop"}],
+                    "usage": {"prompt_tokens": 5, "completion_tokens": 8, "total_tokens": 13},
+                }).encode())
+            return MockUpstreamResponse(json.dumps(mock_chat_response("ok")).encode())
+
+        return handler, calls
+
+    @staticmethod
+    def _image_turn_payload(image_url: str) -> dict:
+        return {
+            "model": "deepseek-v4-flash",
+            "input": [{"type": "message", "role": "user", "content": [
+                {"type": "input_text", "text": "What's on screen?"},
+                {"type": "input_image", "image_url": image_url},
+            ]}],
+            "tools": [{"type": "function", "function": {"name": "analyze", "parameters": {"type": "object", "properties": {}}}}],
+        }
+
+    def _post_turn(self, port: int, payload: dict) -> dict:
+        conn = HTTPConnection("127.0.0.1", port, timeout=10)
+        conn.request("POST", "/v1/responses", json.dumps(payload), {"content-type": "application/json"})
+        resp = conn.getresponse()
+        body = json.loads(resp.read())
+        conn.close()
+        assert resp.status == 200
+        return body
+
+    def test_identical_image_captioned_once_across_turns(self, server):
+        port, _ = server
+        handler, calls = self._caption_aware_upstream()
+        image = "data:image/png;base64," + base64.b64encode(b"screenshot-bytes-001").decode("ascii")
+        payload = self._image_turn_payload(image)
+
+        with mock.patch.dict(os.environ, {"OPENCODE_GO_API_KEY": "test-key"}), mock.patch("urllib.request.urlopen", side_effect=handler):
+            first = self._post_turn(port, payload)
+            second = self._post_turn(port, payload)
+
+        assert first["status"] == "completed"
+        assert second["status"] == "completed"
+        caption_calls = self._caption_calls(calls)
+        assert len(caption_calls) == 1
+        assert caption_calls[0]["messages"][0]["content"][1]["image_url"]["detail"] == "low"
+        # The second turn's main call still carries the screenshot caption.
+        main_payloads = [c for c in calls if c.get("max_tokens") != 200]
+        assert len(main_payloads) == 2
+        assert "[screenshot: A screenshot of a code editor]" in main_payloads[1]["messages"][0]["content"]
+
+    def test_caption_transient_failure_degrades_without_retry(self, server):
+        port, _ = server
+        err = urllib.error.HTTPError(
+            "https://mock.test/v1/chat/completions", 503, "Service Unavailable",
+            {}, io.BytesIO(b'{"error":"down"}'),
+        )
+        handler, calls = self._caption_aware_upstream(failures=[err])
+        payload = self._image_turn_payload("data:image/png;base64," + base64.b64encode(b"bytes-002").decode("ascii"))
+
+        with mock.patch.dict(os.environ, {"OPENCODE_GO_API_KEY": "test-key"}), mock.patch("urllib.request.urlopen", side_effect=handler):
+            body = self._post_turn(port, payload)
+
+        assert body["status"] == "completed"
+        assert len(self._caption_calls(calls)) == 1
+        main_payload = next(c for c in calls if c.get("max_tokens") != 200)
+        assert "[caption failed" in main_payload["messages"][0]["content"]
+
+    def test_caption_engine_falls_back_to_mimo_on_400(self, server):
+        port, _ = server
+        err = urllib.error.HTTPError(
+            "https://mock.test/v1/chat/completions", 400, "Bad Request",
+            {}, io.BytesIO(b'{"error":"image not supported"}'),
+        )
+        handler, calls = self._caption_aware_upstream(failures=[err])
+        payload = self._image_turn_payload("data:image/png;base64," + base64.b64encode(b"bytes-003").decode("ascii"))
+
+        with mock.patch.dict(os.environ, {"OPENCODE_GO_API_KEY": "test-key"}), mock.patch("urllib.request.urlopen", side_effect=handler):
+            body = self._post_turn(port, payload)
+
+        assert body["status"] == "completed"
+        caption_calls = self._caption_calls(calls)
+        assert len(caption_calls) == 2
+        assert caption_calls[0]["model"] == "deepseek-v4-flash"
+        assert caption_calls[1]["model"] == "mimo-v2.5"
+        assert caption_calls[1]["messages"][0]["content"][1]["image_url"]["detail"] == "low"
+
+    def test_caption_detail_fallback_drops_detail_on_400(self, server):
+        port, _ = server
+        err = urllib.error.HTTPError(
+            "https://mock.test/v1/chat/completions", 400, "Bad Request",
+            {}, io.BytesIO(b'{"error":"unknown detail"}'),
+        )
+        handler, calls = self._caption_aware_upstream(failures=[err])
+        payload = self._image_turn_payload("data:image/png;base64," + base64.b64encode(b"bytes-004").decode("ascii"))
+        image_url = payload["input"][0]["content"][1]["image_url"]
+
+        with mock.patch.dict(os.environ, {"OPENCODE_GO_API_KEY": "test-key", "CODEX_IMAGE_MODEL": "mimo-v2.5"}), mock.patch("urllib.request.urlopen", side_effect=handler):
+            body = self._post_turn(port, payload)
+
+        assert body["status"] == "completed"
+        caption_calls = self._caption_calls(calls)
+        assert len(caption_calls) == 2
+        # Engine is already mimo, so only the detail fallback fires: same URL,
+        # no detail key (garbage bytes cannot be downscaled, so the URL stays).
+        assert caption_calls[0]["messages"][0]["content"][1]["image_url"] == {"url": image_url, "detail": "low"}
+        assert caption_calls[1]["messages"][0]["content"][1]["image_url"] == {"url": image_url}

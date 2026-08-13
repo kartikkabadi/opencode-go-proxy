@@ -9,14 +9,10 @@ from unittest import mock
 
 import zstandard
 
-from opencode_go_proxy.app import (
-    ProxyConfig,
-    ProxyError,
-    _caption_timeout_sec,
-    _mask_trace_body,
-    decode_request_body,
-    resolve_api_key,
-)
+from opencode_go_proxy.app import ProxyConfig, ProxyError, decode_request_body
+from opencode_go_proxy.secrets import resolve_api_key
+from opencode_go_proxy.trace import _mask_trace_body
+from opencode_go_proxy.upstream import caption_timeout_sec as _caption_timeout_sec
 
 
 def make_config() -> ProxyConfig:
@@ -33,11 +29,12 @@ def make_config() -> ProxyConfig:
 class CredentialTests(unittest.TestCase):
     def setUp(self) -> None:
         # Reset the module-level cache between tests.
-        import opencode_go_proxy.app as app_mod
-        app_mod._api_key_cache = None
+        from opencode_go_proxy.secrets import clear_api_key_cache
+
+        clear_api_key_cache()
 
     def test_env_key_wins_without_keychain_lookup(self) -> None:
-        with mock.patch.dict(os.environ, {"OPENCODE_GO_API_KEY": "env-key"}, clear=True), mock.patch("opencode_go_proxy.app.subprocess.run") as run:
+        with mock.patch.dict(os.environ, {"OPENCODE_GO_API_KEY": "env-key"}, clear=True), mock.patch("opencode_go_proxy.secrets.subprocess.run") as run:
             self.assertEqual(resolve_api_key(make_config(), "req"), "env-key")
 
         run.assert_not_called()
@@ -49,7 +46,7 @@ class CredentialTests(unittest.TestCase):
             stdout="keychain-key\n",
             stderr="",
         )
-        with mock.patch.dict(os.environ, {}, clear=True), mock.patch("opencode_go_proxy.app.subprocess.run", return_value=completed):
+        with mock.patch.dict(os.environ, {}, clear=True), mock.patch("opencode_go_proxy.secrets.subprocess.run", return_value=completed):
             self.assertEqual(resolve_api_key(make_config(), "req"), "keychain-key")
 
     def test_missing_key_names_env_and_keychain(self) -> None:
@@ -60,7 +57,7 @@ class CredentialTests(unittest.TestCase):
             stderr="could not be found",
         )
         with mock.patch.dict(os.environ, {}, clear=True), mock.patch(
-            "opencode_go_proxy.app.subprocess.run", return_value=completed
+            "opencode_go_proxy.secrets.subprocess.run", return_value=completed
         ), self.assertRaises(ProxyError) as ctx:
             resolve_api_key(make_config(), "req")
 
@@ -70,7 +67,7 @@ class CredentialTests(unittest.TestCase):
 
     def test_env_falls_back_to_standard_opencode_key(self) -> None:
         with mock.patch.dict(os.environ, {"OPENCODE_API_KEY": "std-key"}, clear=True), mock.patch(
-            "opencode_go_proxy.app.subprocess.run"
+            "opencode_go_proxy.secrets.subprocess.run"
         ) as run:
             self.assertEqual(resolve_api_key(make_config(), "req"), "std-key")
 
@@ -84,7 +81,7 @@ class CredentialTests(unittest.TestCase):
             return subprocess.CompletedProcess(args, 1, stdout="", stderr="not found")
 
         with mock.patch.dict(os.environ, {}, clear=True), mock.patch(
-            "opencode_go_proxy.app.subprocess.run", side_effect=fake_run
+            "opencode_go_proxy.secrets.subprocess.run", side_effect=fake_run
         ):
             self.assertEqual(resolve_api_key(make_config(), "req"), "router-key")
 
@@ -153,10 +150,10 @@ class _UpstreamStream:
 
 def _run_stream(lines: list[bytes]) -> list[dict]:
     """Drive handle_streaming_request against `lines` and parse its SSE events."""
-    import opencode_go_proxy.app as app_mod
-    from opencode_go_proxy.app import handle_streaming_request
+    from opencode_go_proxy.secrets import clear_api_key_cache
+    from opencode_go_proxy.streaming import handle_streaming_request
 
-    app_mod._api_key_cache = None
+    clear_api_key_cache()
     cfg = make_config()
     payload = {"model": "deepseek-v4-flash", "input": "hi", "stream": True}
     wfile = io.BytesIO()
@@ -253,8 +250,8 @@ class MaskTraceBodyTests(unittest.TestCase):
 
 
 class CaptionTimeoutTests(unittest.TestCase):
-    def test_defaults_to_60_seconds(self) -> None:
-        self.assertEqual(_caption_timeout_sec(), 60.0)
+    def test_defaults_to_30_seconds(self) -> None:
+        self.assertEqual(_caption_timeout_sec(), 30.0)
 
     def test_env_override_applies(self) -> None:
         with unittest.mock.patch.dict("os.environ", {"OPENCODE_GO_PROXY_CAPTION_TIMEOUT_SEC": "90"}):
@@ -262,7 +259,7 @@ class CaptionTimeoutTests(unittest.TestCase):
 
     def test_malformed_env_falls_back_to_default(self) -> None:
         with unittest.mock.patch.dict("os.environ", {"OPENCODE_GO_PROXY_CAPTION_TIMEOUT_SEC": "not-a-number"}):
-            self.assertEqual(_caption_timeout_sec(), 60.0)
+            self.assertEqual(_caption_timeout_sec(), 30.0)
 
     def test_zero_env_is_clamped_to_one_second(self) -> None:
         with unittest.mock.patch.dict("os.environ", {"OPENCODE_GO_PROXY_CAPTION_TIMEOUT_SEC": "0"}):

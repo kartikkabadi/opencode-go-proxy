@@ -29,7 +29,7 @@ def _as_int(value: Any) -> int:
     return 0
 
 
-SESSION_SPAWN_TOOLS = {"create_thread", "send_message_to_thread"}
+SESSION_SPAWN_TOOLS = {"create_thread"}
 
 
 def _translate_tool_choice(tool_choice: Any) -> Any:
@@ -59,7 +59,7 @@ def _session_spawn_name(item: Json) -> str | None:
 
     Only genuine codex_app thread-spawn tools match, so unrelated MCP tools
     (e.g. mcp__slack__create_thread) are never rewritten. Accepted forms:
-    - flat: name is "codex_app__create_thread" / "codex_app__send_message_to_thread"
+    - flat: name is "codex_app__create_thread"
     - namespaced: namespace is absent or "codex_app" with a bare spawn-tool name
     """
     name = item.get("name")
@@ -78,11 +78,12 @@ def _session_spawn_name(item: Json) -> str | None:
 
 
 def inject_session_model(payload: Json, session_model: str) -> Json:
-    """Inject the session's model into create_thread / send_message_to_thread calls.
+    """Inject the session's model into create_thread calls.
 
     Spawned threads inherit the routed session's model instead of falling back
     to the native Codex model (which is quota-blocked for this account). Only
-    applies when the call omits an explicit model; other tools are untouched.
+    applies when the call omits an explicit model; other tools and
+    chatgptWorkCloud targets are untouched.
     """
     if not isinstance(payload, dict):
         return payload
@@ -104,6 +105,9 @@ def inject_session_model(payload: Json, session_model: str) -> Json:
         except (ValueError, TypeError):
             continue
         if not isinstance(parsed, dict):
+            continue
+        target = parsed.get("target")
+        if isinstance(target, dict) and target.get("type") == "chatgptWorkCloud":
             continue
         model = parsed.get("model")
         if model is not None and model != "":
@@ -136,14 +140,127 @@ MODEL_ALIASES: dict[str, str] = {
 }
 
 
-def _load_catalog_models() -> set[str]:
-    """Load known model slugs from the catalog JSON file."""
+def _catalog_mtime() -> tuple[str, int | None]:
+    """(path, mtime_ns) for the catalog the proxy serves; mtime None when missing."""
     from opencode_go_proxy import catalog as _catalog
 
-    return _catalog.load_known_slugs()
+    path = _catalog.default_catalog_path()
+    try:
+        return path, os.stat(path).st_mtime_ns
+    except OSError:
+        return path, None
 
 
-KNOWN_MODELS: set[str] = _load_catalog_models()
+_KNOWN_MODELS_CACHE: tuple[str, int | None, set[str]] | None = None
+
+
+def known_models() -> set[str]:
+    """Return the live set of known model slugs, cached by catalog file mtime.
+
+    Runtime refresh rewrites the state-dir catalog, so a changed file mtime
+    makes the next call re-read without a restart. reload_known_models()
+    bypasses the cache explicitly.
+    """
+    global _KNOWN_MODELS_CACHE
+    from opencode_go_proxy import catalog as _catalog
+
+    path, mtime = _catalog_mtime()
+    if (
+        _KNOWN_MODELS_CACHE is not None
+        and _KNOWN_MODELS_CACHE[0] == path
+        and _KNOWN_MODELS_CACHE[1] == mtime
+    ):
+        return _KNOWN_MODELS_CACHE[2]
+    slugs = _catalog.load_known_slugs(catalog_path=path)
+    _KNOWN_MODELS_CACHE = (path, mtime, slugs)
+    return slugs
+
+
+def reload_known_models() -> set[str]:
+    """Drop the mtime caches and re-read known slugs from the catalog."""
+    global _KNOWN_MODELS_CACHE, _IMAGE_CAPABLE_CACHE, _CONTEXT_WINDOW_CACHE
+    _KNOWN_MODELS_CACHE = None
+    _IMAGE_CAPABLE_CACHE = None
+    _CONTEXT_WINDOW_CACHE = None
+    return known_models()
+
+
+_CONTEXT_WINDOW_CACHE: tuple[str, int | None, dict[str, int]] | None = None
+
+
+def model_context_window(model: str) -> int | None:
+    """Best-known context window for a catalog model; None when unknown.
+
+    Reads the full-shape catalog the same way known_models() does, cached by
+    file mtime. Used to cap zero-input-token estimates at the model's real
+    window instead of a proxy-wide default.
+    """
+    global _CONTEXT_WINDOW_CACHE
+
+    path, mtime = _catalog_mtime()
+    if (
+        _CONTEXT_WINDOW_CACHE is not None
+        and _CONTEXT_WINDOW_CACHE[0] == path
+        and _CONTEXT_WINDOW_CACHE[1] == mtime
+    ):
+        windows = _CONTEXT_WINDOW_CACHE[2]
+    else:
+        windows = {}
+        try:
+            with open(path) as f:
+                catalog = json.load(f)
+            for entry in catalog.get("models", []):
+                if not isinstance(entry, dict):
+                    continue
+                slug = entry.get("slug")
+                context = entry.get("context_window")
+                if isinstance(slug, str) and slug and isinstance(context, int) and context > 0:
+                    windows[slug] = context
+        except (OSError, json.JSONDecodeError):
+            pass
+        _CONTEXT_WINDOW_CACHE = (path, mtime, windows)
+    return windows.get(model)
+
+
+_IMAGE_CAPABLE_CACHE: tuple[str, int | None, set[str]] | None = None
+
+
+def image_capable_models() -> set[str]:
+    """Return catalog slugs whose record declares image input, cached by mtime.
+
+    Mirrors known_models(): a rewritten catalog file makes the next call
+    re-read. Used to keep image turns on the requested model when it can
+    actually accept images, instead of always forcing the image default.
+    """
+    global _IMAGE_CAPABLE_CACHE
+
+    path, mtime = _catalog_mtime()
+    if (
+        _IMAGE_CAPABLE_CACHE is not None
+        and _IMAGE_CAPABLE_CACHE[0] == path
+        and _IMAGE_CAPABLE_CACHE[1] == mtime
+    ):
+        return _IMAGE_CAPABLE_CACHE[2]
+    slugs: set[str] = set()
+    try:
+        with open(path) as f:
+            catalog = json.load(f)
+        for entry in catalog.get("models", []):
+            if not isinstance(entry, dict):
+                continue
+            slug = entry.get("slug")
+            modalities = entry.get("input_modalities")
+            if (
+                isinstance(slug, str)
+                and slug
+                and isinstance(modalities, list)
+                and "image" in modalities
+            ):
+                slugs.add(slug)
+    except (OSError, json.JSONDecodeError):
+        pass
+    _IMAGE_CAPABLE_CACHE = (path, mtime, slugs)
+    return slugs
 
 
 def new_response_id() -> str:
@@ -516,7 +633,7 @@ def responses_payload_to_chat_payload(payload: Json) -> tuple[Json, str, Json]:
     # If it's not a known catalog model and not aliased, fall back to DEFAULT_MODEL.
     if incoming_model in MODEL_ALIASES:
         incoming_model = MODEL_ALIASES[incoming_model]
-    elif incoming_model not in KNOWN_MODELS:
+    elif incoming_model not in known_models():
         incoming_model = DEFAULT_MODEL
     # Detect images by scanning for actual image_url parts (not just list-shaped content).
     has_image = any(
@@ -524,8 +641,16 @@ def responses_payload_to_chat_payload(payload: Json) -> tuple[Json, str, Json]:
         and any(isinstance(p, dict) and p.get("type") == "image_url" for p in m["content"])
         for m in messages
     )
-    image_model = os.environ.get("CODEX_IMAGE_MODEL", IMAGE_MODEL_DEFAULT) or IMAGE_MODEL_DEFAULT
-    upstream_model = image_model if has_image else incoming_model
+    if has_image:
+        if incoming_model in image_capable_models():
+            upstream_model = incoming_model
+        else:
+            image_model = (
+                os.environ.get("CODEX_IMAGE_MODEL", IMAGE_MODEL_DEFAULT) or IMAGE_MODEL_DEFAULT
+            )
+            upstream_model = image_model
+    else:
+        upstream_model = incoming_model
 
     chat_payload: Json = {
         "model": upstream_model,
@@ -556,7 +681,9 @@ def responses_payload_to_chat_payload(payload: Json) -> tuple[Json, str, Json]:
     return chat_payload, incoming_model, stats
 
 
-def chat_completion_to_response(chat: Json, request_model: str | None = None) -> Json:
+def chat_completion_to_response(
+    chat: Json, request_model: str | None = None, *, estimated_input_tokens: int | None = None
+) -> Json:
     response_id = new_response_id()
     model = request_model or DEFAULT_MODEL
     choice = _first_choice(chat)
@@ -570,7 +697,7 @@ def chat_completion_to_response(chat: Json, request_model: str | None = None) ->
         "model": model,
         "output": output,
         "output_text": output_text_from_items(output),
-        "usage": normalize_usage(chat.get("usage")),
+        "usage": normalize_usage(chat.get("usage"), estimated_input_tokens=estimated_input_tokens),
     }
 
 
@@ -676,7 +803,13 @@ def cache_stats_from_usage(usage: Any) -> Json:
     return {"hit": hit, "miss": miss, "ratio": hit / total if total else None}
 
 
-def normalize_usage(usage: Any) -> Json | None:
+def normalize_usage(usage: Any, *, estimated_input_tokens: int | None = None) -> Json | None:
+    """Normalize upstream usage for the client.
+
+    estimated_input_tokens substitutes the proxy's estimate for an upstream
+    input_tokens: 0 (so the client compacts correctly) and surfaces it as
+    estimatedInputTokens; the provider's own numbers are otherwise untouched.
+    """
     if not isinstance(usage, dict):
         return None
     input_tokens = _as_int(usage.get("prompt_tokens", usage.get("input_tokens", 0)))
@@ -686,6 +819,10 @@ def normalize_usage(usage: Any) -> Json | None:
         "output_tokens": output_tokens,
         "total_tokens": _as_int(usage.get("total_tokens", input_tokens + output_tokens)),
     }
+    if estimated_input_tokens is not None:
+        normalized["input_tokens"] = estimated_input_tokens
+        normalized["total_tokens"] = estimated_input_tokens + output_tokens
+        normalized["estimatedInputTokens"] = estimated_input_tokens
     # Surf the upstream's own prefix-cache accounting back to Codex in the
     # standard Responses shape so the app's token display shows cache hits,
     # and keep the reasoning split when the provider reports one.

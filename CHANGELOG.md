@@ -1,5 +1,133 @@
 # Changelog
 
+## [Unreleased]
+
+### Changed
+
+- Ops contracts match the codex-router reference (plan 010): `smoke-test` posts
+  a marker prompt through the local proxy at `http://127.0.0.1:8787/v1/responses`
+  and asserts the marker comes back (custom base via `--base-url` or
+  `OPENCODE_GO_PROXY_BASE_URL`); `support-bundle` emits a single JSON document
+  (schemaVersion 1, mode 0600) with version, generatedAt, env summary, redacted
+  config snapshot, meter tail, log tail, catalog model count, and doctor checks
+  instead of a tar.gz; `doctor` gains reference-style `ok`/`warn`/`fail` checks
+  (config file presence, catalog readability, port free/owned, log writability,
+  best-effort upstream reachability) plus `--fix`, which repairs only what is
+  safe without writing config.toml.
+- Session-model inheritance matches the reference (plan 009): only
+  `create_thread` calls get the session model injected and
+  `chatgptWorkCloud` targets are skipped; `send_message_to_thread` is no
+  longer rewritten.
+- Catalog discovery sends an identifying `User-Agent`
+  (`opencode-go-proxy/<version>`) because models.dev answers 403 to
+  urllib's default UA (plan 009).
+- Image routing (plan 009): a non-tools image turn keeps the requested
+  model when the catalog marks it image-capable (`input_modalities`
+  contains `image`), otherwise it falls back to `CODEX_IMAGE_MODEL` /
+  `mimo-v2.5`; the image-plus-tools caption path is unchanged.
+- Image fallback (plan 009b): when the upstream rejects a non-tools image
+  turn at runtime with a caption-fallback 4xx (400/404/415/422), the proxy
+  captions the images through the vision module and retries the same
+  requested model once instead of failing the turn. The split-turn
+  (image plus tools) caption path and the verbatim `/chat/completions`
+  passthrough are unchanged.
+- Usage meter events now match the codex-router reference schema (plan 008):
+  `at` is ISO 8601 UTC, token and duration fields are camelCase
+  (`inputTokens` / `outputTokens` / `totalTokens` / `durationMs`), and every
+  event carries `meteringVersion: "opencode-go-proxy/1"` plus
+  `provider: "opencode-go"`. The legacy snake_case/epoch spelling was dropped
+  rather than double-written because no live consumer reads the file today
+  (the menu bar is reworked in a later plan); if a consumer needs the old
+  fields, they return additively.
+
+- Rate-limit harvesting (plan 011): OpenAI-style (`x-ratelimit-*`) and
+  Anthropic-style (`anthropic-ratelimit-*`) response headers from upstream 200s
+  are parsed into per-provider quota snapshots (`limit` / `remaining` / `resetAt`
+  / `sampledAt`), the latest snapshot per provider is kept, and persisted
+  atomically to `quota-state.json` in the state dir. `GET /quota` (and
+  `/v1/quota`) returns the state; a headerless upstream degrades to an empty
+  snapshot.
+- Config manager (plan 012): `config enable|disable|status [--json]` owns a
+  marker-commented block in `~/.codex/config.toml` (`# BEGIN
+  opencode-go-proxy-managed` to `# END opencode-go-proxy-managed`). Enable
+  writes `openai_base_url` plus `model_catalog_json` (state-dir catalog) and
+  refuses to replace user-owned values; disable removes only the block and
+  deletes the file when the block was its only content. Codex Voice realtime
+  keys (`experimental_realtime_webrtc_call_base_url` and
+  `experimental_realtime_ws_base_url`) are added only when the user has not
+  set them, so Voice stays on native endpoints. Tests and CI run against a
+  temp file via `OPENCODE_GO_PROXY_CONFIG_PATH`; the real config.toml is a
+  gated deploy step.
+
+### Added
+
+- Base-URL overrides (plan 010): the upstream chat base resolves as the
+  `--chat-base-url` flag, then `OPENCODE_GO_BASE_URL`, then
+  `OPENCODE_ZEN_BASE_URL`, then the legacy `CHAT_COMPLETIONS_BASE_URL`, then the
+  built-in default.
+- Ops install/status (plan 010): `install` and its `setup` alias copy the
+  launchd plist into `~/Library/LaunchAgents` and load the agent on macOS,
+  gated on an explicit `--yes` flag (running it is a deploy step); `status`
+  reports running state, port ownership, launchd state, and log paths.
+- Doctor/keychain seam (plan 010): `secrets.api_key_source()` reports where the
+  key would resolve (env or keychain service) without reading the value, so
+  doctor never prints the credential.
+- Correctness contract (plan 007): an upstream 200 that streams no
+  text, tool call, or reasoning is retried once with the identical request
+  (terminal events held, ids reused); a second empty stream answers
+  `response.error` code `empty_completion`. Upstream `input_tokens: 0` is
+  estimated as `max(1000, ceil(prompt_bytes / 3.3))` capped at the model's
+  context window and surfaced as `estimatedInputTokens` (kill switch
+  `OPENCODE_GO_PROXY_ESTIMATE_ZERO_INPUT=0`; self-disables once the upstream
+  reports real tokens again). The keepalive comment thread now runs until the
+  stream truly ends, with writes serialized so comments never interleave into
+  data frames.
+- Auth transport guard (plan 006): zero-config protection for the loopback
+  listener - a missing Host header answers `400 invalid_host`, a non-loopback
+  Host answers `403 invalid_host` unless `OPENCODE_GO_PROXY_ALLOW_REMOTE=1`,
+  requests carrying Origin / Referer / Sec-Fetch-Site answer
+  `403 browser_request_rejected`, non-JSON POSTs to the API paths answer
+  `415 unsupported_media_type`, and OPTIONS stays unhandled so browser
+  preflight is blocked.
+- Protocol surface (plan 005): `/v1/chat/completions` (and `/chat/completions`)
+  is a verbatim passthrough - non-stream relays the upstream status and JSON
+  body byte-for-byte (including the upstream's own error body), stream relays
+  the upstream SSE unchanged with the same 15s keepalive comment mechanism the
+  responses stream uses and stops on client disconnect; `/v1/messages` (and
+  `/messages`) answer an explicit `400 invalid_request_error`; the WebSocket
+  426 rejection now has a test asserting the exact response body.
+- Vision bridge module (plan 004): `vision.describe()` returns structured
+  `Evidence` (summary / text / layout / unreadable); the caption engine auto-picks the
+  cheapest image-capable catalog model or a probed local runtime (Ollama, llama.cpp
+  server, LM Studio); non-cached caption reads are metered with `kind=vision`; the old
+  caption path now lives entirely in `vision.py`.
+- Catalog contract with overlay and runtime reload (plan 003): `render_full_catalog`
+  projects each model through the canonical key set Codex reads in
+  `merged-models.json` (`multi_agent_version` at the model top level, plus
+  `comp_hash`, `availability_nux`, and `approvals`/`collaboration_modes`/
+  `permissions`/`token_budget`/`auto_review` in `model_messages`), backed by a
+  key-set parity test against a sampled fixture.
+- Runtime catalog lives under the state dir (`OPENCODE_GO_PROXY_STATE_DIR`,
+  default `~/.codex/opencode-go-proxy/`); refresh never writes the repo's
+  `contrib/` files, and startup renders the state-dir compact (or the seed)
+  instantly while discovery runs in the background.
+- `known_models()` replaces the frozen `KNOWN_MODELS`: the live slug set is
+  cached by catalog file mtime, so `/v1/models` and model routing pick up a
+  refreshed catalog without a restart (`reload_known_models()` forces it).
+- User overlay for custom models: `user-models.json` (add / hide / edit display)
+  plus hidden-model flags from `model-picker.json`, seven-day `availability_nux`
+  announcements tracked in `announced-models.json`.
+- Menu bar state contract (plan 013): `GET /state` (and `/v1/state`) returns
+  one JSON document - `status`, `port`, `upstream`, the latest quota snapshot
+  by `sampledAt` (`{provider, remaining, limit?, resetAt?}` or `null`),
+  `usage` with `todayTurns` / `todayTokens` / a stable seven-entry `last7d`
+  token list (local calendar days, oldest first), and `model` (most recent
+  meter event, else the default). A missing or corrupt meter/quota file
+  degrades to zeros or `null`. The Swift menu bar renders the Standard tier
+  from that contract: quota card with reset countdown, today's turns/tokens,
+  a 7-day usage bar list, and model/upstream rows, keeping the single-port
+  guard and existing controls.
+
 ## [0.2.0] - 2026-08-10
 
 ### Added
@@ -27,6 +155,16 @@
   meter, with secret values redacted).
 - Agent skill `skills/opencode-go-proxy/SKILL.md`: orientation for operating the
   proxy (start/stop, ops commands, prefix caching, config, reliability).
+- Caption latency: identical screenshot bytes are captioned once per hour (in-process
+  byte-keyed cache, 256-entry bound), so repeat tool calls on the same screen skip the
+  upstream round trip.
+- Caption engine: `OPENCODE_GO_PROXY_CAPTION_MODEL=auto` picks the cheapest
+  image-capable catalog model (an enabled local runtime first);
+  `CODEX_IMAGE_MODEL` overrides, and `mimo-v2.5` is the fallback when the picked
+  engine rejects image input (4xx).
+- Caption images are sent with `detail: low` (`OPENCODE_GO_PROXY_CAPTION_DETAIL=none`
+  disables); if the upstream rejects the detail value, the proxy retries once with a
+  `sips`-downscaled JPEG (or the original URL) and no detail.
 - Tests: cache parsing (both DeepSeek and OpenAI usage shapes), tracker accounting,
   `/cache` endpoint, streaming `stream_options`, cache passthrough to Codex,
   meter recording, upstream retry behavior, and the ops commands.
@@ -60,6 +198,9 @@
   `HTTP/1.1 426 Upgrade Required` instead of the previous HTTP/1.0 404, which surfaced as
   "WebSocket protocol error: HTTP version must be 1.1 or higher" before the app fell back
   to HTTP streaming.
+- Image caption budget: default timeout 60s -> 30s, and caption sub-calls no longer
+  retry transient failures, so a bad caption leg costs at most ~30s instead of stacking
+  retries.
 
 ## [0.1.2] - 2026-06-21
 

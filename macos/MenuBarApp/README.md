@@ -7,11 +7,21 @@ The menu bar shows a small branch icon (no long "opencode go/" text). The menu s
 
 - status (Running / Stopped, with live health check against `/health`)
 - port (default 8787)
+- upstream base URL (from `GET /state`)
+- Quota section: remaining/limit per provider plus reset countdown, or `n/a`
+  when the upstream sent no rate-limit headers yet
+- Today's turns and tokens, plus a 7-day token bar list (from `GET /state`)
+- current model (the most recent meter event, else the proxy default)
 - Start/Stop Proxy: launches `uvx --from git+... opencode-go-proxy` as a child process,
   writing logs to `~/.codex/logs/opencode-go-proxy.{log,err}` (same paths as the launchd plist)
 - Open Logs / Reveal Log File
 - Copy Port
 - Quit (stops the child proxy first)
+
+The panel reads one stable contract at `GET /state` (plan 013) instead of
+scraping files; the row set is the Standard tier (quota card, usage bars,
+provider row), with the vision panel and local-LLM manager out of scope for
+0.2.0.
 
 ## Build
 

@@ -1,4 +1,3 @@
-import importlib
 import json
 import os
 import tempfile
@@ -65,14 +64,13 @@ class CatalogCliTest(unittest.TestCase):
         old = os.environ.get("CODEX_MODEL_CATALOG")
         try:
             os.environ["CODEX_MODEL_CATALOG"] = tmp_cat
-            importlib.reload(protocol)
-            self.assertIn("deepseek-v4-flash", protocol.KNOWN_MODELS)
+            self.assertIn("deepseek-v4-flash", protocol.reload_known_models())
         finally:
             if old is None:
                 os.environ.pop("CODEX_MODEL_CATALOG", None)
             else:
                 os.environ["CODEX_MODEL_CATALOG"] = old
-            importlib.reload(protocol)
+            protocol.reload_known_models()
 
 
 if __name__ == "__main__":

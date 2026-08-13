@@ -11,14 +11,11 @@ from unittest import mock
 
 import pytest
 
-from opencode_go_proxy.app import (
-    ProxyConfig,
-    ProxyError,
-    call_upstream_chat,
-    handle_responses_request,
-    handle_streaming_request,
-)
+from opencode_go_proxy.app import ProxyConfig, handle_responses_request
+from opencode_go_proxy.errors import ProxyError
 from opencode_go_proxy.meter import usage_events_path
+from opencode_go_proxy.streaming import handle_streaming_request
+from opencode_go_proxy.upstream import call_upstream_chat
 
 
 def make_config() -> ProxyConfig:
@@ -73,7 +70,7 @@ class TestRetry:
                 raise http_error(429, retry_after="2")
             return ok_response(ok_chat())
         with mock.patch("urllib.request.urlopen", side_effect=fake_urlopen), \
-             mock.patch("opencode_go_proxy.app.time.sleep"):
+             mock.patch("opencode_go_proxy.upstream.time.sleep"):
             value, retries = call_upstream_chat(chat_payload(), cfg, "req1")
         assert retries == 1
         assert value["choices"][0]["message"]["content"] == "hi"
@@ -88,7 +85,7 @@ class TestRetry:
                 raise http_error(503)
             return ok_response(ok_chat())
         with mock.patch("urllib.request.urlopen", side_effect=fake_urlopen), \
-             mock.patch("opencode_go_proxy.app.time.sleep"):
+             mock.patch("opencode_go_proxy.upstream.time.sleep"):
             _value, retries = call_upstream_chat(chat_payload(), cfg, "req2")
         assert retries == 1
         assert len(calls) == 2
@@ -102,7 +99,7 @@ class TestRetry:
                 raise urllib.error.URLError("connection refused")
             return ok_response(ok_chat())
         with mock.patch("urllib.request.urlopen", side_effect=fake_urlopen), \
-             mock.patch("opencode_go_proxy.app.time.sleep"):
+             mock.patch("opencode_go_proxy.upstream.time.sleep"):
             _value, retries = call_upstream_chat(chat_payload(), cfg, "req3")
         assert retries == 1
         assert len(calls) == 2
@@ -112,7 +109,7 @@ class TestRetry:
         urlopen = mock.Mock(side_effect=http_error(429))
         with mock.patch.dict(os.environ, {"OPENCODE_GO_PROXY_MAX_RETRIES": "2"}), \
              mock.patch("urllib.request.urlopen", urlopen), \
-             mock.patch("opencode_go_proxy.app.time.sleep"), pytest.raises(ProxyError) as ei:
+             mock.patch("opencode_go_proxy.upstream.time.sleep"), pytest.raises(ProxyError) as ei:
             call_upstream_chat(chat_payload(), cfg, "req4")
         assert ei.value.status == HTTPStatus.TOO_MANY_REQUESTS
         assert urlopen.call_count == 3  # initial + 2 retries
@@ -145,8 +142,8 @@ class TestMeterThroughHandler:
         assert len(events) == 1
         e = events[0]
         assert e["status"] == 200
-        assert e["input_tokens"] == 3
-        assert e["total_tokens"] == 4
+        assert e["inputTokens"] == 3
+        assert e["totalTokens"] == 4
         assert "streamAborted" not in e
 
     def _events(self) -> list[dict]:
@@ -161,7 +158,7 @@ class TestMeterThroughHandler:
         urlopen = mock.Mock(side_effect=http_error(429, retry_after="5"))
         with mock.patch.dict(os.environ, {"OPENCODE_GO_PROXY_MAX_RETRIES": "1"}), \
              mock.patch("urllib.request.urlopen", urlopen), \
-             mock.patch("opencode_go_proxy.app.time.sleep"):
+             mock.patch("opencode_go_proxy.upstream.time.sleep"):
             handle_streaming_request(payload, cfg, "req8", io.BytesIO())
         assert urlopen.call_count == 2  # initial + 1 retry
         events = self._events()
@@ -179,7 +176,7 @@ class TestMeterThroughHandler:
         urlopen = mock.Mock(side_effect=http_error(429))
         with mock.patch.dict(os.environ, {"OPENCODE_GO_PROXY_MAX_RETRIES": "1"}), \
              mock.patch("urllib.request.urlopen", urlopen), \
-             mock.patch("opencode_go_proxy.app.time.sleep"), pytest.raises(ProxyError):
+             mock.patch("opencode_go_proxy.upstream.time.sleep"), pytest.raises(ProxyError):
             handle_responses_request(payload, cfg, "req9")
         events = self._events()
         assert len(events) == 1

@@ -50,11 +50,22 @@ class DiscoverModelsTests(unittest.TestCase):
                 }
             },
         }
-        with mock.patch("opencode_go_proxy.catalog.urllib.request.urlopen", return_value=FakeResponse(payload)):
+        seen: dict = {}
+
+        def capture(request, *args, **kwargs):
+            seen["url"] = request.full_url
+            seen["ua"] = request.headers.get("User-agent")
+            return FakeResponse(payload)
+
+        with mock.patch("opencode_go_proxy.catalog.urllib.request.urlopen", side_effect=capture):
             models = discover_models()
 
         self.assertEqual([m["id"] for m in models], ["gpt-5.5", "deepseek-v4-flash"])
         self.assertNotIn("some-model", {m["id"] for m in models})
+        # models.dev rejects the default urllib UA with 403; the discovery
+        # fetch must carry an identifying UA.
+        self.assertEqual(seen["url"], "https://models.dev/api.json")
+        self.assertTrue(seen["ua"].startswith("opencode-go-proxy/"))
 
     def test_discover_models_raises_on_urlopen_failure(self) -> None:
         with mock.patch(
@@ -155,7 +166,8 @@ class ColdStartRenderTests(unittest.TestCase):
             "share one workspace, and your job is to collaborate with them until their "
             "goal is genuinely handled.",
         )
-        self.assertEqual(messages["auto_compact_token_limit"], 900000)
+        self.assertNotIn("auto_compact_token_limit", messages)
+        self.assertNotIn("multi_agent_version", messages)
 
     def test_discovery_without_limit_context_keeps_default(self) -> None:
         record = _model_from_discovery({"id": "no-context-model", "name": "No Context"})
@@ -170,9 +182,10 @@ class ColdStartRenderTests(unittest.TestCase):
         rendered = render_full_catalog(compact)
 
         self.assertEqual(
-            rendered["models"][0]["model_messages"]["auto_compact_token_limit"],
+            rendered["models"][0]["auto_compact_token_limit"],
             round(1000000 * 0.9),
         )
+        self.assertEqual(rendered["models"][0]["multi_agent_version"], "v1")
 
 
 if __name__ == "__main__":

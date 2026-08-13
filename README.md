@@ -131,9 +131,24 @@ The proxy picks the upstream model based on what Codex sends:
 2. If the model slug is a known OpenCode Go model (from the catalog), it's used as-is.
 3. Otherwise, it falls back to `deepseek-v4-flash`.
 
-When images are present in a turn with tools, the proxy routes to MiMo V2.5 for image
-captioning (it's the cheapest vision model on Go), then routes the main turn to your
-configured model. Override the vision model with `CODEX_IMAGE_MODEL`.
+When images are present in a turn with tools, the proxy captions the latest image
+(older ones are stubbed) and routes the main turn to your configured model. Image
+turns without tools stay on the requested model when the catalog marks it
+image-capable (`input_modalities` contains `image`); a text-only requested model
+falls back to the image default. If the upstream still rejects the image payload
+at runtime (400/404/415/422), the proxy captions the images and retries the
+requested model once before failing the turn. The caption
+engine auto-picks the cheapest image-capable model from the catalog (`input_modalities`
+contains image) with `mimo-v2.5` as the fallback, or a local vision runtime (Ollama,
+llama.cpp server, LM Studio) that answers a read-only probe. Captions are cached by
+image bytes for an hour, sent with `detail: low` to cut upstream vision cost, and every
+non-cached read is metered with `kind=vision`; the caption budget is 30s with no retries,
+so a failed caption degrades to a placeholder instead of stalling the turn. Override the
+engine with `CODEX_IMAGE_MODEL` or `OPENCODE_GO_PROXY_CAPTION_MODEL` (a model slug,
+`local`, or default `auto` = catalog pick); configure a local runtime with
+`OPENCODE_GO_PROXY_VISION_LOCAL_BASE_URL` / `OPENCODE_GO_PROXY_VISION_LOCAL_MODEL`.
+Disable `detail: low` with `OPENCODE_GO_PROXY_CAPTION_DETAIL=none` (a rejected detail
+value also falls back to a `sips`-downscaled image with no detail).
 
 ## API key
 
@@ -173,15 +188,20 @@ See the [lazycodex docs](https://github.com/code-yeongyu/oh-my-openagent) for se
 - Custom/freeform tool adaptation (Codex `apply_patch` works)
 - Reasoning content replay across tool-call turns
 - Real-time SSE streaming (not synthesized)
-- Image captioning via MiMo V2.5 when tools are present (override with `CODEX_IMAGE_MODEL`)
+- Cached image captioning when tools are present: cheapest catalog vision engine (or a probed local runtime) by default, `detail: low` input, 30s no-retry budget, MiMo V2.5 fallback, reads metered with `kind=vision`
 - SSRF protection on image URLs (`data:image/` and `https://` only)
 - Configurable body cap, bind address guard, keychain credential resolution
 - Local health and model-list endpoints
 - Prefix caching: byte-stable request prefixes plus `include_usage`, with per-model hit ratio on `/cache`
 - Honest usage meter: append-only `usage-events.jsonl` in the state dir (truncated or empty responses never count as success)
 - Upstream retry with bounded exponential backoff on transient failures (429/5xx/network/timeout)
-- Ops CLI: `doctor` (self-check), `smoke-test` (live upstream probe), `support-bundle` (redacted tarball)
-- Spawned threads inherit the parent session's model (`create_thread` / `send_message_to_thread`)
+- Ops CLI: `doctor` (reference-style checks with `--fix` for safe repairs), `smoke-test` (marker prompt through the local proxy), `support-bundle` (JSON schema v1, mode 0600), `install`/`setup` (launchd, gated on `--yes`) and `status`
+- Spawned threads inherit the parent session's model (`create_thread`; `chatgptWorkCloud` targets are skipped)
+- Correctness contract: empty upstream completions are retried once (a second empty stream answers an `empty_completion` error), zero-input-token reports are estimated for compaction (`OPENCODE_GO_PROXY_ESTIMATE_ZERO_INPUT=0` disables), and keepalive comments run until the stream truly ends without interleaving into data frames
+- Auth transport guard (zero config): missing Host answers `400`, non-loopback Host answers `403` (unless `OPENCODE_GO_PROXY_ALLOW_REMOTE=1`), browser-originated requests (Origin / Referer / Sec-Fetch-Site) answer `403`, non-JSON POSTs answer `415`, and OPTIONS preflight stays blocked
+- Verbatim `/v1/chat/completions` passthrough (stream and non-stream): the upstream status and body are relayed byte-for-byte, including the upstream's own error body, and `/v1/messages` answers an explicit `400`
+- Rate-limit harvesting (plan 011): upstream `x-ratelimit-*` and `anthropic-ratelimit-*` headers are parsed into per-provider quota snapshots, the latest snapshot per provider is kept, and `GET /quota` exposes `quota-state.json`
+- Menu bar state contract (plan 013): `GET /state` returns one JSON document (status, port, upstream, latest quota snapshot, today's turns/tokens, last-7-day token bars, current model) computed from the meter file and quota state
 - WebSocket upgrade requests answered with `426 Upgrade Required` (desktop app falls back to HTTP streaming)
 - zstd-compressed request bodies decompressed (`Content-Encoding: zstd`; the desktop app sends them)
 - Single-port guard in the menu bar app: refuses Start when 8787 is already owned
@@ -235,6 +255,76 @@ Within a session, every request after the first shares the full previous prefix,
 cache-eligible requests typically run at 99%+ hit ratio; only the genuinely new delta
 misses. The first request of a brand-new context always misses (nothing is cached yet).
 
+### Checking quota
+
+When the upstream answers 200 with rate-limit headers, the proxy records the latest
+per-provider snapshot (`limit` / `remaining` / `resetAt` / `sampledAt`) to
+`quota-state.json` in the state dir and exposes it as JSON:
+
+```bash
+curl http://127.0.0.1:8787/quota
+```
+
+```json
+{
+  "providers": {
+    "openai": {
+      "provider": "openai",
+      "limit": 500,
+      "remaining": 432,
+      "resetAt": "2026-08-11T06:30:00.000Z",
+      "sampledAt": "2026-08-11T06:00:00.000Z"
+    }
+  }
+}
+```
+
+A headerless upstream leaves the state empty (`"providers": {}`); the proxy never
+invents quota numbers.
+
+### Checking state
+
+`GET /state` (or `/v1/state`) composes the same local files into the single
+contract the macOS menu bar reads. `quota` is the latest provider snapshot by
+`sampledAt` (or `null`), `usage.last7d` is always seven entries (oldest first,
+including today) so the UI renders a stable bar list, and `model` is the model of
+the most recent meter event, falling back to the default:
+
+```bash
+curl http://127.0.0.1:8787/state
+```
+
+```json
+{
+  "status": "ok",
+  "port": 8787,
+  "upstream": "https://opencode.ai/zen/go/v1",
+  "quota": {
+    "provider": "openai",
+    "remaining": 432,
+    "limit": 500,
+    "resetAt": "2026-08-11T06:30:00.000Z"
+  },
+  "usage": {
+    "todayTurns": 12,
+    "todayTokens": 3456,
+    "last7d": [
+      { "date": "2026-08-05", "tokens": 0 },
+      { "date": "2026-08-06", "tokens": 1200 },
+      { "date": "2026-08-07", "tokens": 900 },
+      { "date": "2026-08-08", "tokens": 2100 },
+      { "date": "2026-08-09", "tokens": 1800 },
+      { "date": "2026-08-10", "tokens": 2700 },
+      { "date": "2026-08-11", "tokens": 3456 }
+    ]
+  },
+  "model": "deepseek-v4-flash"
+}
+```
+
+Missing or corrupt meter/quota files degrade to zeros or `null`; the endpoint
+always returns this shape.
+
 ## Install
 
 ### From source (no package manager)
@@ -272,12 +362,14 @@ All flags have environment variable defaults:
 |------|---------|---------|
 | `--bind` | `OPENCODE_GO_PROXY_BIND` | `127.0.0.1` |
 | `--port` | `OPENCODE_GO_PROXY_PORT` | `8787` |
-| `--chat-base-url` | `CHAT_COMPLETIONS_BASE_URL` | `https://opencode.ai/zen/go/v1` |
+| `--chat-base-url` | `OPENCODE_GO_BASE_URL` then `OPENCODE_ZEN_BASE_URL` then `CHAT_COMPLETIONS_BASE_URL` | `https://opencode.ai/zen/go/v1` |
 | `--api-key-env` | `OPENCODE_GO_PROXY_API_KEY_ENV` | `OPENCODE_GO_API_KEY` |
 | `--timeout-sec` | `OPENCODE_GO_PROXY_TIMEOUT_SEC` | `180` |
 | `--max-body-mb` | `OPENCODE_GO_PROXY_MAX_BODY_MB` | `20` |
 
 The proxy accepts both `/responses` and `/v1/responses`.
+
+The upstream base URL resolves in this order: the `--chat-base-url` flag, then `OPENCODE_GO_BASE_URL`, then `OPENCODE_ZEN_BASE_URL`, then the legacy `CHAT_COMPLETIONS_BASE_URL`, then the built-in default.
 
 **One HTTP port only.** The proxy binds a single listener: `OPENCODE_GO_PROXY_PORT`
 (default `8787`). There is no admin port, control channel, or secondary service. If
@@ -297,15 +389,60 @@ name = "Go"  # shows as "Go" instead of "opencode go/"
 The reference catalog's per-model `display_name` values are already short
 ("DeepSeek V4 Flash", "Kimi K2.7 Code", etc).
 
+## Ops CLI
+
+All commands run as subcommands of the console script, for example `opencode-go-proxy doctor --json`.
+
+- `doctor [--json] [--fix]` - runs the check set: API key resolution (env or
+  keychain), config.toml presence and proxy pointer, catalog readability, port
+  free/owned, service health, meter writability, log writability, and best-effort
+  upstream reachability. `--fix` repairs only what is safe without writing
+  config.toml (log/meter directories, catalog render). Config writes are handled
+  by the config-manager step and stay approval-gated.
+- `config enable|disable|status [--json]` - owns one marker-commented block in
+  `~/.codex/config.toml` (`# BEGIN opencode-go-proxy-managed` to
+  `# END opencode-go-proxy-managed`): enable writes `openai_base_url` and
+  `model_catalog_json` and never replaces user-owned values, disable removes
+  only the managed block (and deletes the file when the block was its only
+  content), and Codex Voice realtime keys are preserved on native endpoints
+  unless you set them yourself. Point it at another file for testing with
+  `OPENCODE_GO_PROXY_CONFIG_PATH`.
+- `smoke-test [--base-url URL]` - posts one marker prompt to the local proxy at
+  `http://127.0.0.1:8787/v1/responses` and asserts the marker comes back. Point
+  it at an isolated scratch proxy with `--base-url` or `OPENCODE_GO_PROXY_BASE_URL`.
+- `support-bundle [--output PATH]` - writes the JSON schema v1 diagnostic bundle
+  (version, generatedAt, env summary, redacted config snapshot, meter tail, log
+  tail, catalog model count, doctor checks) to a mode-600 file. Secret-shaped
+  values are redacted.
+- `install` / `setup --yes` - copies the launchd plist into `~/Library/LaunchAgents`
+  and loads the agent (macOS). The `--yes` flag is the explicit confirmation
+  gate; running it against the live agent is a deploy step, not part of this
+  build. Uninstall, update, and rollback are documented but not implemented.
+- `status [--json]` - reports whether the proxy is running, who owns the port,
+  launchd state, and where logs live.
+
 ## Model catalog
 
-Without a catalog entry, Codex prints a model metadata warning every turn. A reference catalog
-with all OpenCode Go models is included at `contrib/opencode-go-catalog.json`. Copy it to the
-proxy's default catalog path so `/models` works out of the box:
+The proxy serves `/v1/models` from a runtime catalog in the state dir
+(`OPENCODE_GO_PROXY_STATE_DIR`, default `~/.codex/opencode-go-proxy/`). At startup it renders
+the state-dir compact catalog (or the checked-in seed at `contrib/opencode-go-models.json`)
+immediately, then refreshes in the background: models.dev discovery merges in additively,
+TTL-gated so a fresh catalog never hits the network, and the full catalog is written to
+`opencode-go-catalog.json` under the state dir. Runtime refresh never writes the repo's
+`contrib/` files; maintain the checked-in seed with `opencode-go-proxy --refresh-catalog`.
+
+Rendered models follow the exact key set Codex reads in codex-router's `merged-models.json`:
+`multi_agent_version` lives at the model top level, `comp_hash`/`availability_nux`/`tool_mode`
+are present, and `model_messages` carries `approvals`, `collaboration_modes`, `permissions`,
+`token_budget`, and `auto_review` instead of dropping them. A parity test pins the renderer to
+that key set.
+
+To keep Codex from printing a model metadata warning every turn, point `model_catalog_json` at
+a full-shape catalog. The rendered one in the state dir works; copy it where you like:
 
 ```bash
 mkdir -p ~/.codex/model-catalogs
-cp contrib/opencode-go-catalog.json ~/.codex/model-catalogs/opencode-go.json
+cp ~/.codex/opencode-go-proxy/opencode-go-catalog.json ~/.codex/model-catalogs/opencode-go.json
 ```
 
 ```toml
@@ -316,6 +453,29 @@ The catalog ships with the `ModelsCache` wrapper (`fetched_at`/`etag`/`client_ve
 Codex 0.142+ desktop app requires all four top-level fields — a bare `{"models": [...]}` catalog
 causes the model picker to fall back to "Custom" instead of showing the full list. The CLI
 (`codex debug models`) tolerates the bare format, so this only surfaces in the desktop app.
+
+### Local model overlay
+
+Custom models are layered on top of the merged catalog at runtime, never by editing
+`contrib/`. `user-models.json` in the state dir holds entries keyed by slug: a full record adds
+a model, a partial record edits display fields, `"hide": true` hides one:
+
+```json
+{
+  "version": 1,
+  "models": [
+    {"slug": "my-custom-model", "display_name": "My Custom", "context_window": 200000},
+    {"slug": "deepseek-v4-flash", "display_name": "Flash (edited)", "priority": 3},
+    {"slug": "deepseek-v4-pro", "hide": true}
+  ]
+}
+```
+
+Hidden-model flags from `model-picker.json` (`{"version": 1, "hidden": ["slug"]}`) hide models
+from the picker too. Newly added models get a seven-day `availability_nux` announcement,
+tracked in `announced-models.json` under the state dir. The proxy re-reads the rendered catalog
+on each `/v1/models` request (cached by file mtime), so editing the overlay and refreshing grows
+the live list without a restart.
 
 If you want Codex's full `base_instructions` for each model, copy your Codex installation's
 bundled `models.json` and append the OpenCode Go entries from the reference catalog (keep the
@@ -337,8 +497,8 @@ Every request emits compact JSON lines on stderr. Important events:
 ## Troubleshooting
 
 **Model metadata warning every turn**
-Set `model_catalog_json` in Codex config and copy the reference catalog:
-`cp contrib/opencode-go-catalog.json ~/.codex/model-catalogs/opencode-go.json`
+Set `model_catalog_json` in Codex config and copy the rendered catalog:
+`cp ~/.codex/opencode-go-proxy/opencode-go-catalog.json ~/.codex/model-catalogs/opencode-go.json`
 
 **Connection refused on localhost:8787**
 Proxy isn't running. Start it: `opencode-go-proxy` or check `launchctl list | grep opencode`.
