@@ -2,25 +2,31 @@
 
 Composes the proxy's local state into one JSON document for the macOS menu
 bar: server identity (status/port/upstream), the latest quota snapshot, usage
-aggregates from the meter file, and the current model. Everything is
-best-effort: a missing or corrupt meter or quota file degrades to zeros or
-null rather than failing the endpoint, so the menu bar always gets a stable
-shape to render.
+aggregates from the meter file, the polled OpenCode Go plan usage, and the
+current model. Everything is best-effort: a missing or corrupt meter or quota
+file, or an unreachable usage endpoint, degrades to zeros or null rather than
+failing the endpoint, so the menu bar always gets a stable shape to render.
 """
 
 from __future__ import annotations
 
 import datetime
-import json
 from typing import Any
 
-from .meter import usage_events_path
+from .meter import usage_summary
 from .protocol import DEFAULT_MODEL
 from .quota import read_quota_state
+from .usage_poller import poll_go_usage
 
 Json = dict[str, Any]
 
-_DAY_KEYS = ("inputTokens", "outputTokens")
+# Dollar budgets for the OpenCode Go plan, rendered next to live usage.
+GO_LIMITS: Json = {
+    "monthlyDollars": 60,
+    "weeklyDollars": 30,
+    "rolling5hDollars": 12,
+    "subscriptionMonthlyDollars": 10,
+}
 
 
 def _clean_int(value: Any) -> int | None:
@@ -32,83 +38,6 @@ def _clean_int(value: Any) -> int | None:
     if isinstance(value, float) and value.is_integer() and value >= 0:
         return int(value)
     return None
-
-
-def _event_tokens(event: Json) -> int:
-    """Tokens for one event: totalTokens, or the zero-token estimate when the
-    upstream reported 0 (estimatedInputTokens plus any real output)."""
-    total = _clean_int(event.get("totalTokens"))
-    if total is not None and total > 0:
-        return total
-    estimated = _clean_int(event.get("estimatedInputTokens"))
-    if estimated is not None and estimated > 0:
-        output = _clean_int(event.get("outputTokens")) or 0
-        return estimated + output
-    if total is not None:
-        return total
-    return sum(_clean_int(event.get(key)) or 0 for key in _DAY_KEYS)
-
-
-def _local_day(value: Any, now: datetime.datetime) -> str | None:
-    """ISO day string (YYYY-MM-DD) in ``now``'s timezone for an event ``at``."""
-    if not isinstance(value, str):
-        return None
-    try:
-        instant = datetime.datetime.fromisoformat(value)
-    except ValueError:
-        return None
-    if instant.tzinfo is None:
-        instant = instant.replace(tzinfo=datetime.UTC)
-    return instant.astimezone(now.tzinfo).date().isoformat()
-
-
-def usage_summary(now: datetime.datetime | None = None) -> Json:
-    """Aggregate meter events: today's turns/tokens, 7-day bars, last model.
-
-    Days are bucketed in the caller's local timezone so the menu bar's
-    "today" matches the calendar day the user sees. ``last7d`` is always
-    seven entries (oldest first, including today), zero-filled for quiet
-    days, so the UI renders a stable bar list. ``model`` is the model of the
-    most recent event, or None when the meter file is absent or empty.
-    """
-    now = now or datetime.datetime.now().astimezone()
-    today = now.date().isoformat()
-    days = [(now - datetime.timedelta(days=offset)).date().isoformat() for offset in range(6, -1, -1)]
-    by_day: dict[str, int] = {day: 0 for day in days}
-    today_turns = 0
-    today_tokens = 0
-    last_model: str | None = None
-    try:
-        with open(usage_events_path(), encoding="utf-8") as handle:
-            for line in handle:
-                if not line.strip():
-                    continue
-                try:
-                    event = json.loads(line)
-                except ValueError:
-                    continue
-                if not isinstance(event, dict):
-                    continue
-                day = _local_day(event.get("at"), now)
-                if day is None:
-                    continue
-                tokens = _event_tokens(event)
-                if day in by_day:
-                    by_day[day] += tokens
-                    if day == today:
-                        today_turns += 1
-                        today_tokens += tokens
-                model = event.get("model")
-                if isinstance(model, str) and model:
-                    last_model = model
-    except OSError:
-        pass
-    return {
-        "todayTurns": today_turns,
-        "todayTokens": today_tokens,
-        "last7d": [{"date": day, "tokens": by_day[day]} for day in days],
-        "model": last_model,
-    }
 
 
 def _sampled_at(value: Any) -> float | None:
@@ -156,8 +85,23 @@ def _latest_quota() -> Json | None:
     return best
 
 
+def _zen_rollup(now: datetime.datetime | None = None) -> Json:
+    """Zen-only usage: today's turns/tokens and seven daily token sums."""
+    summary = usage_summary(now, provider="zen")
+    return {
+        "todayTurns": summary["todayTurns"],
+        "todayTokens": summary["todayTokens"],
+        "last7d": [day["tokens"] for day in summary["last7d"]],
+    }
+
+
 def build_state(port: int, upstream: str, now: datetime.datetime | None = None) -> Json:
-    """One stable JSON contract for the menu bar (GET /state)."""
+    """One stable JSON contract for the menu bar (GET /state).
+
+    ``usage`` keeps the legacy all-provider keys (todayTurns, todayTokens,
+    last7d) and adds the Go plan slot (null when the poller cannot fetch it),
+    the fixed Go dollar budgets, and the zen-only rollup.
+    """
     usage = usage_summary(now)
     model = usage.get("model")
     if not isinstance(model, str) or not model:
@@ -167,6 +111,13 @@ def build_state(port: int, upstream: str, now: datetime.datetime | None = None) 
         "port": int(port),
         "upstream": upstream,
         "quota": _latest_quota(),
-        "usage": {key: usage[key] for key in ("todayTurns", "todayTokens", "last7d")},
+        "usage": {
+            "todayTurns": usage["todayTurns"],
+            "todayTokens": usage["todayTokens"],
+            "last7d": usage["last7d"],
+            "go": poll_go_usage(),
+            "goLimits": dict(GO_LIMITS),
+            "zen": _zen_rollup(now),
+        },
         "model": model,
     }

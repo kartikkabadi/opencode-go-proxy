@@ -128,6 +128,96 @@ def _iso_at(value: float | None) -> str:
     return instant.isoformat(timespec="milliseconds").replace("+00:00", "Z")
 
 
+_DAY_KEYS = ("inputTokens", "outputTokens")
+
+
+def _event_tokens(event: Json) -> int:
+    """Tokens for one event: totalTokens, or the zero-token estimate when the
+    upstream reported 0 (estimatedInputTokens plus any real output)."""
+    total = _safe_token(event.get("totalTokens"))
+    if total is not None and total > 0:
+        return total
+    estimated = _safe_token(event.get("estimatedInputTokens"))
+    if estimated is not None and estimated > 0:
+        output = _safe_token(event.get("outputTokens")) or 0
+        return estimated + output
+    if total is not None:
+        return total
+    return sum(_safe_token(event.get(key)) or 0 for key in _DAY_KEYS)
+
+
+def _local_day(value: Any, now: datetime.datetime) -> str | None:
+    """ISO day string (YYYY-MM-DD) in ``now``'s timezone for an event ``at``."""
+    if not isinstance(value, str):
+        return None
+    try:
+        instant = datetime.datetime.fromisoformat(value)
+    except ValueError:
+        return None
+    if instant.tzinfo is None:
+        instant = instant.replace(tzinfo=datetime.UTC)
+    return instant.astimezone(now.tzinfo).date().isoformat()
+
+
+def usage_summary(now: datetime.datetime | None = None, provider: str | None = None) -> Json:
+    """Aggregate meter events: today's turns/tokens, 7-day bars, last model.
+
+    Days are bucketed in the caller's local timezone so the menu bar's
+    "today" matches the calendar day the user sees. ``last7d`` is always
+    seven entries (oldest first, including today), zero-filled for quiet
+    days, so the UI renders a stable bar list. ``model`` is the model of the
+    most recent event, or None when the meter file is absent or empty. When
+    ``provider`` is given, only events whose ``provider`` field matches are
+    counted (the zen rollup filters on provider="zen").
+    """
+    now = now or datetime.datetime.now().astimezone()
+    today = now.date().isoformat()
+    days = [(now - datetime.timedelta(days=offset)).date().isoformat() for offset in range(6, -1, -1)]
+    by_day: dict[str, int] = {day: 0 for day in days}
+    today_turns = 0
+    today_tokens = 0
+    last_model: str | None = None
+    try:
+        with open(usage_events_path(), encoding="utf-8") as handle:
+            for line in handle:
+                if not line.strip():
+                    continue
+                try:
+                    event = json.loads(line)
+                except ValueError:
+                    continue
+                if not isinstance(event, dict):
+                    continue
+                if provider is not None and event.get("provider") != provider:
+                    continue
+                day = _local_day(event.get("at"), now)
+                if day is None:
+                    continue
+                tokens = _event_tokens(event)
+                if day in by_day:
+                    by_day[day] += tokens
+                    if day == today:
+                        today_turns += 1
+                        today_tokens += tokens
+                model = event.get("model")
+                if isinstance(model, str) and model:
+                    last_model = model
+    except OSError:
+        # Meter file absent or unreadable: degrade to zeros, never fail the endpoint.
+        return {
+            "todayTurns": 0,
+            "todayTokens": 0,
+            "last7d": [{"date": day, "tokens": 0} for day in days],
+            "model": None,
+        }
+    return {
+        "todayTurns": today_turns,
+        "todayTokens": today_tokens,
+        "last7d": [{"date": day, "tokens": by_day[day]} for day in days],
+        "model": last_model,
+    }
+
+
 def record_usage_event(
     *,
     model: str | None,

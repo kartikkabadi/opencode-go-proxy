@@ -266,6 +266,54 @@ class TestCli:
         assert "refusing to replace" in capsys.readouterr().err
 
 
+class TestZenProviderBlock:
+    def test_zen_block_rendered_next_to_opencode_go(self, cfg_path) -> None:
+        config_manager.enable()
+        text = _read(cfg_path)
+        assert "[model_providers.opencode-go]" in text
+        assert "[model_providers.zen]" in text
+        assert 'name = "zen"' in text
+        assert f"base_url = {json.dumps(config_manager.managed_base_url())}" in text
+        assert 'wire_api = "responses"' in text
+        assert text.index("[model_providers.opencode-go]") > text.index(config_manager.START_MARKER)
+        assert text.index("[model_providers.zen]") > text.index(config_manager.START_MARKER)
+        assert text.index(config_manager.END_MARKER) > text.index("[model_providers.zen]")
+
+    def test_omits_zen_block_when_user_owns_zen_keys(self, cfg_path) -> None:
+        user = '[model_providers.zen]\nbase_url = "https://user.example/v1"\nwire_api = "responses"\n'
+        with open(cfg_path, "w", encoding="utf-8") as handle:
+            handle.write(user)
+        config_manager.enable()
+        text = _read(cfg_path)
+        assert text.count("[model_providers.zen]") == 1
+        zen_section = text.split("[model_providers.zen]", 1)[1]
+        assert 'base_url = "https://user.example/v1"' in zen_section
+        assert "8787" not in zen_section
+        assert "[model_providers.opencode-go]" in text
+
+    def test_enable_disable_round_trip_removes_both_blocks(self, cfg_path) -> None:
+        with open(cfg_path, "w", encoding="utf-8") as handle:
+            handle.write('model = "gpt-5.6-luna"\n')
+        config_manager.enable()
+        text = _read(cfg_path)
+        assert "[model_providers.opencode-go]" in text
+        assert "[model_providers.zen]" in text
+        config_manager.disable()
+        text = _read(cfg_path)
+        assert "[model_providers.opencode-go]" not in text
+        assert "[model_providers.zen]" not in text
+        assert text == 'model = "gpt-5.6-luna"\n'
+
+    def test_status_reports_zen_block(self, cfg_path) -> None:
+        config_manager.enable()
+        report = config_manager.status()
+        assert report["provider_block"] is True
+        assert report["zen_provider_block"] is True
+        config_manager.disable()
+        report = config_manager.status()
+        assert report["zen_provider_block"] is False
+
+
 class TestNoDuplicateKeys:
     def test_enable_with_matching_user_values_has_no_duplicate_keys(self, tmp_path, fake_codex_bin) -> None:
         path = tmp_path / "config.toml"

@@ -16,13 +16,18 @@ config.toml:
     name = "opencode-go"
     base_url = "http://127.0.0.1:8787/v1"
     wire_api = "responses"
+
+    [model_providers.zen]
+    name = "zen"
+    base_url = "http://127.0.0.1:8787/v1"
+    wire_api = "responses"
     # END opencode-go-proxy-managed
 
 The multi_agent_v2 feature block is written only when the installed codex
 binary accepts the flag (probed via `codex debug prompt-input --enable
-multi_agent_v2`); the provider block is omitted entirely when the user
-declares their own [model_providers.opencode-go] table (TOML forbids
-splitting one table across two locations). Semantics mirror codex-router's
+multi_agent_v2`); a provider table is omitted entirely when the user declares
+their own [model_providers.<same-name>] table (TOML forbids splitting one
+table across two locations). Semantics mirror codex-router's
 config-manager: enable never replaces a user-owned openai_base_url or
 model_catalog_json, disable removes only the managed block (and the file when
 the block was its only content), and the Codex Voice realtime keys are added
@@ -176,18 +181,27 @@ def _toml_string(value: str) -> str:
     return json.dumps(value)
 
 
-def _provider_keys_owned(table_lines: list[str]) -> set[str]:
-    """Keys a user's own [model_providers.opencode-go] table already sets."""
-    in_section = False
-    keys: set[str] = set()
+_PROVIDER_TABLE = re.compile(r"^\[model_providers\.([^\]]+)\]$")
+
+
+def _provider_tables_owned(table_lines: list[str]) -> dict[str, set[str]]:
+    """Keys each user-owned [model_providers.<name>] table sets, by provider.
+
+    TOML forbids splitting one table across two locations, so the managed
+    block must omit a provider table entirely when the user declares it
+    anywhere outside the block.
+    """
+    owned: dict[str, set[str]] = {}
+    section: str | None = None
     for line in table_lines:
         stripped = line.strip()
         if stripped.startswith("["):
-            in_section = stripped == "[model_providers.opencode-go]"
+            match = _PROVIDER_TABLE.match(stripped)
+            section = match.group(1) if match else None
             continue
-        if in_section and "=" in stripped and not stripped.startswith("#"):
-            keys.add(stripped.split("=", 1)[0].strip())
-    return keys
+        if section is not None and "=" in stripped and not stripped.startswith("#"):
+            owned.setdefault(section, set()).add(stripped.split("=", 1)[0].strip())
+    return owned
 
 
 def _user_configures_multi_agent_v2(root_lines: list[str], table_lines: list[str]) -> bool:
@@ -215,13 +229,23 @@ def _block_lines(
         lines.append(f"{REALTIME_WS_KEY} = {_toml_string(DEFAULT_REALTIME_WS_BASE_URL)}")
     if multi_agent_v2 and not _user_configures_multi_agent_v2(root_lines, table_lines):
         lines.extend(["", "[features.multi_agent_v2]", "enabled = true"])
-    provider_keys = _provider_keys_owned(table_lines)
-    if not provider_keys:
+    owned = _provider_tables_owned(table_lines)
+    if not owned.get("opencode-go"):
         lines.extend(
             [
                 "",
                 "[model_providers.opencode-go]",
                 'name = "opencode-go"',
+                f"base_url = {_toml_string(base_url)}",
+                'wire_api = "responses"',
+            ]
+        )
+    if not owned.get("zen"):
+        lines.extend(
+            [
+                "",
+                "[model_providers.zen]",
+                'name = "zen"',
                 f"base_url = {_toml_string(base_url)}",
                 'wire_api = "responses"',
             ]
@@ -402,6 +426,7 @@ def status() -> dict[str, object]:
             "model_catalog_json": _root_value(root_lines, "model_catalog_json"),
             "multi_agent_v2": any(line.strip() == "[features.multi_agent_v2]" for line in block_lines),
             "provider_block": any(line.strip() == "[model_providers.opencode-go]" for line in block_lines),
+            "zen_provider_block": any(line.strip() == "[model_providers.zen]" for line in block_lines),
             "voice_keys_user_owned": user_owned,
             "voice_keys_managed": managed_owned,
         }
@@ -441,6 +466,7 @@ def config_cmd(argv: list[str] | None = None) -> int:
                 sys.stdout.write(f"openai_base_url: {report['openai_base_url'] or '(unset)'}\n")
                 sys.stdout.write(f"model_catalog_json: {report['model_catalog_json'] or '(unset)'}\n")
                 sys.stdout.write(f"multi_agent_v2: {'enabled' if report['multi_agent_v2'] else 'not enabled'}\n")
+                sys.stdout.write(f"zen_provider_block: {'enabled' if report['zen_provider_block'] else 'not enabled'}\n")
                 if report["voice_keys_user_owned"]:
                     sys.stdout.write(f"user voice keys: {', '.join(sorted(report['voice_keys_user_owned']))}\n")
                 if report["voice_keys_managed"]:
