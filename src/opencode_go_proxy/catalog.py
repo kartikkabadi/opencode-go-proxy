@@ -419,7 +419,7 @@ def announced_models_path() -> str:
 
 
 def merged_models_path() -> str:
-    """Path of the merged native + opencode-go catalog under the state dir."""
+    """Path of the merged native + opencode-go + zen catalog under the state dir."""
     return os.path.join(state_dir(), MERGE_CATALOG_NAME)
 
 
@@ -791,6 +791,35 @@ def _full_native_record(entry: Json) -> Json:
     return full
 
 
+def _zen_merged_records() -> list[Json]:
+    """Full-shape records for captured zen models, slug-prefixed zen/<id>.
+
+    Built straight from the canonical defaults like _full_native_record, so
+    every key Codex reads is present. The zen family travels as an explicit
+    "family" key on the state record (not part of the canonical shape; stored
+    for future display), and availability_nux stays None (the object form the
+    app schema allows) so zen models never announce.
+    """
+    from .zen_catalog import zen_families, zen_model_ids
+
+    families = zen_families()
+    records = []
+    for model_id in sorted(zen_model_ids()):
+        slug = f"zen/{model_id}"
+        full = _canonical_model_defaults()
+        full["slug"] = slug
+        full["display_name"] = model_id
+        full["description"] = f"Zen model {model_id} served through opencode.ai/zen."
+        full["comp_hash"] = _comp_hash_for(slug)
+        full["family"] = families.get(model_id)
+        context = full["context_window"]
+        full["auto_compact_token_limit"] = round(context * 0.9)
+        full["base_instructions"] = ""
+        full["model_messages"] = model_messages("", full["display_name"], context, full)
+        records.append(full)
+    return records
+
+
 def _clamp_efforts(models: list[Json], native_efforts: set[str]) -> list[Json]:
     """Drop opencode-go reasoning levels whose effort the native capture lacks.
 
@@ -819,8 +848,11 @@ def render_merged_catalog() -> dict:
 
     Native entries keep their captured slugs; opencode-go entries keep bare
     slugs and their reasoning levels are clamped to the native effort
-    vocabulary. The opencode-go side runs the same seed/discovery/overlay
-    pipeline as the runtime catalog. Written under the state dir.
+    vocabulary; zen entries are slug-prefixed zen/<id> with their family on
+    the record. The opencode-go side runs the same seed/discovery/overlay
+    pipeline as the runtime catalog. Zen capture itself is TTL-gated and runs
+    outside this render (app layer), which reads only the zen cache files, so
+    this function stays network-free. Written under the state dir.
     """
     from .native_models import load_native_capture, native_effort_vocabulary
 
@@ -839,6 +871,7 @@ def render_merged_catalog() -> dict:
     native = load_native_capture()
     models = [_full_native_record(entry) for entry in native.get("models", [])]
     models.extend(_clamp_efforts(rendered.get("models", []), native_effort_vocabulary(native)))
+    models.extend(_zen_merged_records())
     merged = {
         "fetched_at": rendered.get("fetched_at", compact["fetched_at"]),
         "etag": rendered.get("etag", compact["etag"]),
