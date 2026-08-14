@@ -1,5 +1,7 @@
 # Changelog
 
+## [0.4.10] - 2026-08-14
+
 ## [0.4.8] - 2026-08-14
 
 ### Added
@@ -401,3 +403,5 @@ Initial public release.
 [0.4.3]: https://github.com/kartikkabadi/opencode-go-proxy/releases/tag/v0.4.3
 [0.4.2]: https://github.com/kartikkabadi/opencode-go-proxy/releases/tag/v0.4.2
 [0.4.1]: https://github.com/kartikkabadi/opencode-go-proxy/releases/tag/v0.4.1
+
+[0.4.10]: https://github.com/kartikkabadi/opencode-go-proxy/releases/tag/v0.4.10
