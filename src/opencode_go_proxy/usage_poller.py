@@ -26,6 +26,9 @@ USAGE_URL_ENV = "OPENCODE_GO_USAGE_URL"
 DEFAULT_USAGE_URL = "https://opencode.ai/zen/go/v1/usage"
 POLL_TIMEOUT_SEC = 5
 TTL_SECONDS = 60
+# A failed poll is also cached (short TTL) so a dead endpoint cannot stall
+# /state by re-fetching 2x5s on every poll.
+FAILURE_TTL_SECONDS = 15
 
 # Defaults mirrored from ops._proxy_config() for key resolution when no
 # caller supplies a config (the /state handler passes none today).
@@ -40,6 +43,9 @@ _REQUEST_ID = "usage-poll"
 _lock = threading.Lock()
 # (monotonic fetch time, parsed usage dict); set only on successful fetches.
 _cache: tuple[float, Json] | None = None
+# (monotonic failure time, None); set only on failed fetches so a dead
+# endpoint degrades to None without a network round-trip for 15s.
+_failure_cache: tuple[float, None] | None = None
 
 
 def usage_url() -> str:
@@ -48,10 +54,11 @@ def usage_url() -> str:
 
 
 def clear_cache() -> None:
-    """Drop the TTL cache (test isolation only)."""
-    global _cache
+    """Drop the TTL and failure caches (test isolation only)."""
+    global _cache, _failure_cache
     with _lock:
         _cache = None
+        _failure_cache = None
 
 
 def poll_go_usage(config: ProxyConfig | None = None) -> Json | None:
@@ -62,16 +69,23 @@ def poll_go_usage(config: ProxyConfig | None = None) -> Json | None:
     degrade to None so callers can render a null slot. With no config the
     poller resolves the key with the proxy's default env (and keychain).
     """
-    global _cache
+    global _cache, _failure_cache
     now = time.monotonic()
     with _lock:
         cached = _cache
+        failed = _failure_cache
     if cached is not None and now - cached[0] < TTL_SECONDS:
         return cached[1]
+    if failed is not None and now - failed[0] < FAILURE_TTL_SECONDS:
+        return None
     usage = _fetch_usage(config if config is not None else _default_config())
     if usage is not None:
         with _lock:
             _cache = (time.monotonic(), usage)
+            _failure_cache = None
+    else:
+        with _lock:
+            _failure_cache = (time.monotonic(), None)
     return usage
 
 

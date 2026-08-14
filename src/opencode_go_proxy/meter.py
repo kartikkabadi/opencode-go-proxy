@@ -11,7 +11,9 @@ reference schema - ISO 8601 `at`, camelCase token/duration fields, plus
   `status: 502` plus a `streamAborted` marker and omits token counts, so a
   turn the client saw start but never finish is never counted as a success.
 - An upstream that answered 200 but produced no output records
-  `emptyCompletion`.
+  `status: 502` plus an `emptyCompletion` marker: the client-visible
+  outcome is a `response.error` (empty_completion), never a successful
+  turn.
 - Retries are recorded only when there were any; a transparently absorbed
   upstream failure still records its real status.
 - Metering must never break a live request: every I/O error is swallowed.
@@ -24,6 +26,7 @@ import json
 import math
 import os
 import threading
+from dataclasses import dataclass, field
 from typing import Any
 
 Json = dict[str, Any]
@@ -50,6 +53,34 @@ DEFAULT_ESTIMATE_CONTEXT_WINDOW = 272000
 _lock = threading.Lock()
 
 _models_with_real_tokens: set[str] = set()
+
+# In-process fold of usage-events.jsonl: the aggregate is updated on every
+# append (under _lock) and served when the file identity is unchanged, so
+# /state never rescans the whole meter file. The fold covers exactly the
+# bytes [0, offset) of the file it was built from, keyed by a stat
+# fingerprint so a shrink or an in-place rewrite forces a full rescan.
+_FOLD_MARKER_BYTES = 256
+
+
+@dataclass
+class _Aggregate:
+    """Folded counts for one provider bucket (key None = all providers)."""
+    by_day_tokens: dict[str, int] = field(default_factory=dict)
+    by_day_turns: dict[str, int] = field(default_factory=dict)
+    last_model: str | None = None
+
+
+@dataclass
+class _Fold:
+    """The folded state plus the exact file identity it was folded from."""
+    fingerprint: tuple[int, int, int, int]  # (st_dev, st_ino, st_size, st_mtime_ns)
+    offset: int  # byte offset (EOF at fold time) the fold covers
+    bucketing_tz: datetime.tzinfo | None  # day-bucketing timezone the fold used
+    marker: bytes  # last bytes of the file at fold time; verifies appends
+    aggregates: dict[str | None, _Aggregate] = field(default_factory=dict)
+
+
+_fold: _Fold | None = None
 
 
 def state_dir() -> str:
@@ -159,6 +190,155 @@ def _local_day(value: Any, now: datetime.datetime) -> str | None:
     return instant.astimezone(now.tzinfo).date().isoformat()
 
 
+def _fingerprint(stat: os.stat_result) -> tuple[int, int, int, int]:
+    """File identity the fold is valid for: inode, size, and mtime."""
+    return (stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns)
+
+
+def _same_bucketing_tz(a: datetime.tzinfo | None, b: datetime.tzinfo | None) -> bool:
+    """Whether two tzinfo objects bucket events into the same local days."""
+    if a is None or b is None:
+        return a is None and b is None
+    return a == b
+
+
+def _tail_bytes(path: str) -> bytes:
+    """Last ``_FOLD_MARKER_BYTES`` bytes of a file (the append-verification marker)."""
+    with open(path, "rb") as handle:
+        handle.seek(0, os.SEEK_END)
+        end = handle.tell()
+        handle.seek(max(0, end - _FOLD_MARKER_BYTES))
+        return handle.read()
+
+
+def _zero_summary(days: list[str]) -> Json:
+    """The degraded zeroed summary for an absent or unreadable meter file."""
+    return {
+        "todayTurns": 0,
+        "todayTokens": 0,
+        "last7d": [{"date": day, "tokens": 0} for day in days],
+        "model": None,
+    }
+
+
+def _fold_event(
+    aggregates: dict[str | None, _Aggregate],
+    event: Json,
+    now: datetime.datetime,
+) -> None:
+    """Fold one parsed event into the all-provider and its own provider bucket.
+
+    Mirrors the scan's exact bucketing rules: an event whose ``at`` does not
+    parse into a day is skipped entirely (no turns, tokens, or model), and
+    ``model`` is the most recent matching event's model.
+    """
+    day = _local_day(event.get("at"), now)
+    if day is None:
+        return
+    tokens = _event_tokens(event)
+    provider = event.get("provider")
+    keys: tuple[str | None, ...] = (None, provider) if isinstance(provider, str) and provider else (None,)
+    for key in keys:
+        agg = aggregates.get(key)
+        if agg is None:
+            agg = aggregates[key] = _Aggregate()
+        agg.by_day_tokens[day] = agg.by_day_tokens.get(day, 0) + tokens
+        agg.by_day_turns[day] = agg.by_day_turns.get(day, 0) + 1
+    model = event.get("model")
+    if isinstance(model, str) and model:
+        for key in keys:
+            aggregates[key].last_model = model
+
+
+def _summary_from(
+    aggregates: dict[str | None, _Aggregate],
+    provider: str | None,
+    now: datetime.datetime,
+    days: list[str],
+) -> Json:
+    """Render one provider's folded counts into the summary contract shape."""
+    agg = aggregates.get(provider)
+    if agg is None:
+        return _zero_summary(days)
+    today = now.date().isoformat()
+    return {
+        "todayTurns": agg.by_day_turns.get(today, 0),
+        "todayTokens": agg.by_day_tokens.get(today, 0),
+        "last7d": [{"date": day, "tokens": agg.by_day_tokens.get(day, 0)} for day in days],
+        "model": agg.last_model,
+    }
+
+
+def _scan_all(now: datetime.datetime) -> dict[str | None, _Aggregate]:
+    """Full rescan of the meter file, rebuilding the fold from scratch.
+
+    Raises OSError on I/O failure; the caller degrades to a zeroed summary.
+    """
+    global _fold
+    path = usage_events_path()
+    aggregates: dict[str | None, _Aggregate] = {}
+    with open(path, "rb") as handle:
+        for raw in handle:
+            if not raw.strip():
+                continue
+            try:
+                event = json.loads(raw)
+            except ValueError:
+                continue
+            if not isinstance(event, dict):
+                continue
+            _fold_event(aggregates, event, now)
+        offset = handle.tell()
+    stat = os.stat(path)
+    _fold = _Fold(
+        fingerprint=(stat.st_dev, stat.st_ino, offset, stat.st_mtime_ns),
+        offset=offset,
+        bucketing_tz=now.tzinfo,
+        marker=_tail_bytes(path),
+        aggregates=aggregates,
+    )
+    return aggregates
+
+
+def _fold_tail(now: datetime.datetime) -> dict[str | None, _Aggregate]:
+    """Fold only the bytes appended after the stored offset into the fold.
+
+    An append preserves the bytes before the old EOF, so the stored marker is
+    re-read at the boundary: a mismatch means the tail segment was rewritten,
+    and the whole file must be rescanned. Raises OSError on I/O failure.
+    """
+    path = usage_events_path()
+    with open(path, "rb") as handle:
+        handle.seek(_fold.offset)
+        tail = handle.read()
+        offset = _fold.offset + len(tail)
+    if not tail:
+        # The file shrank between stat and read; a rescan is the safe answer.
+        return _scan_all(now)
+    if _fold.marker:
+        with open(path, "rb") as handle:
+            handle.seek(_fold.offset - len(_fold.marker))
+            boundary = handle.read(len(_fold.marker))
+        if boundary != _fold.marker:
+            return _scan_all(now)
+    for raw in tail.splitlines():
+        if not raw.strip():
+            continue
+        try:
+            event = json.loads(raw)
+        except ValueError:
+            continue
+        if not isinstance(event, dict):
+            continue
+        _fold_event(_fold.aggregates, event, now)
+    stat = os.stat(path)
+    _fold.fingerprint = (stat.st_dev, stat.st_ino, offset, stat.st_mtime_ns)
+    _fold.offset = offset
+    _fold.bucketing_tz = now.tzinfo
+    _fold.marker = _tail_bytes(path)
+    return _fold.aggregates
+
+
 def usage_summary(now: datetime.datetime | None = None, provider: str | None = None) -> Json:
     """Aggregate meter events: today's turns/tokens, 7-day bars, last model.
 
@@ -169,53 +349,49 @@ def usage_summary(now: datetime.datetime | None = None, provider: str | None = N
     most recent event, or None when the meter file is absent or empty. When
     ``provider`` is given, only events whose ``provider`` field matches are
     counted (the zen rollup filters on provider="zen").
+
+    Reads are O(1) once the meter file has been folded: a stat fingerprint
+    (inode, size, mtime) decides between the cached aggregate, a tail fold of
+    appended bytes, and a full rescan when the file shrank or was replaced.
+    The fold is updated inside ``record_usage_event`` and guarded by the
+    module lock, so concurrent HTTP handlers never observe torn state.
     """
+    global _fold
     now = now or datetime.datetime.now().astimezone()
-    today = now.date().isoformat()
     days = [(now - datetime.timedelta(days=offset)).date().isoformat() for offset in range(6, -1, -1)]
-    by_day: dict[str, int] = {day: 0 for day in days}
-    today_turns = 0
-    today_tokens = 0
-    last_model: str | None = None
-    try:
-        with open(usage_events_path(), encoding="utf-8") as handle:
-            for line in handle:
-                if not line.strip():
-                    continue
+    with _lock:
+        try:
+            stat = os.stat(usage_events_path())
+        except OSError:
+            # Meter file absent or unreadable: degrade to zeros, never fail the endpoint.
+            _fold = None
+            return _zero_summary(days)
+        aggregates: dict[str | None, _Aggregate] | None
+        if _fold is not None and _same_bucketing_tz(_fold.bucketing_tz, now.tzinfo):
+            if _fingerprint(stat) == _fold.fingerprint:
+                aggregates = _fold.aggregates
+            elif (stat.st_dev, stat.st_ino) == (_fold.fingerprint[0], _fold.fingerprint[1]) and stat.st_size > _fold.offset:
                 try:
-                    event = json.loads(line)
-                except ValueError:
-                    continue
-                if not isinstance(event, dict):
-                    continue
-                if provider is not None and event.get("provider") != provider:
-                    continue
-                day = _local_day(event.get("at"), now)
-                if day is None:
-                    continue
-                tokens = _event_tokens(event)
-                if day in by_day:
-                    by_day[day] += tokens
-                    if day == today:
-                        today_turns += 1
-                        today_tokens += tokens
-                model = event.get("model")
-                if isinstance(model, str) and model:
-                    last_model = model
-    except OSError:
-        # Meter file absent or unreadable: degrade to zeros, never fail the endpoint.
-        return {
-            "todayTurns": 0,
-            "todayTokens": 0,
-            "last7d": [{"date": day, "tokens": 0} for day in days],
-            "model": None,
-        }
-    return {
-        "todayTurns": today_turns,
-        "todayTokens": today_tokens,
-        "last7d": [{"date": day, "tokens": by_day[day]} for day in days],
-        "model": last_model,
-    }
+                    aggregates = _fold_tail(now)
+                except OSError:
+                    _fold = None
+                    aggregates = None
+            else:
+                try:
+                    aggregates = _scan_all(now)
+                except OSError:
+                    _fold = None
+                    aggregates = None
+        else:
+            # No fold yet, a different bucketing tz, or a replaced file: rescan.
+            try:
+                aggregates = _scan_all(now)
+            except OSError:
+                _fold = None
+                aggregates = None
+        if aggregates is None:
+            return _zero_summary(days)
+        return _summary_from(aggregates, provider, now, days)
 
 
 def record_usage_event(
@@ -282,6 +458,29 @@ def record_usage_event(
             with open(path, "a", encoding="utf-8") as handle:
                 handle.write(line + "\n")
                 handle.flush()
+                end = handle.tell()
+                file_stat = os.fstat(handle.fileno())
         except OSError:
             # Metering is best-effort; never break a live request over it.
-            pass
+            return
+        if _fold is not None and (file_stat.st_dev, file_stat.st_ino) == (
+            _fold.fingerprint[0], _fold.fingerprint[1]
+        ):
+            # The fold must be the one built from THIS file (a stale fold from
+            # a previous state dir is discarded by the next summary's rescan),
+            # and our line must start exactly at the fold's EOF: anything else
+            # means bytes we never folded slipped in, so the fold is left as-is
+            # and the next summary's tail fold or rescan picks them up.
+            line_bytes = len(line.encode("utf-8")) + 1
+            if end - line_bytes == _fold.offset:
+                try:
+                    # Fold the appended event so the next summary is O(1). Day
+                    # buckets use the fold's own tz; a summary in a different
+                    # tz rescans and re-keys the fold.
+                    _fold_event(_fold.aggregates, record, datetime.datetime.now(_fold.bucketing_tz))
+                    _fold.fingerprint = (file_stat.st_dev, file_stat.st_ino, end, file_stat.st_mtime_ns)
+                    _fold.offset = end
+                    _fold.marker = _tail_bytes(path)
+                except OSError:
+                    # The fold is best-effort too; the next summary recovers it.
+                    return

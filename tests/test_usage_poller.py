@@ -1,6 +1,7 @@
 """Usage poller: OpenCode Go plan usage fetch, TTL cache, failure degradation."""
 
 import json
+import time
 import urllib.error
 import urllib.request
 from typing import Self
@@ -116,3 +117,68 @@ class TestFetch:
         with mock.patch("urllib.request.urlopen") as urlopen:
             assert usage_poller.poll_go_usage(make_config()) is None
         urlopen.assert_not_called()
+
+
+class TestFailureCache:
+    """_fetch_usage retries once per poll, so one poll = two urlopen calls."""
+
+    def _failing_urlopen(self, calls: list):
+        def failing(request, timeout):
+            calls.append(request)
+            raise OSError("connection refused")
+        return failing
+
+    def test_failure_cached_within_ttl_no_network(self, monkeypatch) -> None:
+        monkeypatch.setenv("OPENCODE_GO_API_KEY", "sk-test-usage")
+        calls: list = []
+        with mock.patch("urllib.request.urlopen", side_effect=self._failing_urlopen(calls)):
+            first = usage_poller.poll_go_usage(make_config())
+            second = usage_poller.poll_go_usage(make_config())
+        assert first is None
+        assert second is None
+        # One poll's retry pair only: the second poll was served from the
+        # failure cache with no network.
+        assert len(calls) == 2
+
+    def test_failure_cache_expires(self, monkeypatch) -> None:
+        monkeypatch.setenv("OPENCODE_GO_API_KEY", "sk-test-usage")
+        calls: list = []
+        with mock.patch("urllib.request.urlopen", side_effect=self._failing_urlopen(calls)):
+            assert usage_poller.poll_go_usage(make_config()) is None
+        # Well past the 15s failure TTL: the next poll must hit the network.
+        with mock.patch.object(usage_poller.time, "monotonic", return_value=time.monotonic() + 100), \
+             mock.patch("urllib.request.urlopen", side_effect=self._failing_urlopen(calls)):
+            assert usage_poller.poll_go_usage(make_config()) is None
+        assert len(calls) == 4
+
+    def test_clear_cache_clears_failure_stamp(self, monkeypatch) -> None:
+        monkeypatch.setenv("OPENCODE_GO_API_KEY", "sk-test-usage")
+        calls: list = []
+        with mock.patch("urllib.request.urlopen", side_effect=self._failing_urlopen(calls)):
+            assert usage_poller.poll_go_usage(make_config()) is None
+        usage_poller.clear_cache()
+        with mock.patch("urllib.request.urlopen", side_effect=self._failing_urlopen(calls)):
+            assert usage_poller.poll_go_usage(make_config()) is None
+        assert len(calls) == 4
+
+    def test_success_after_failure_expiry_serves_fresh(self, monkeypatch) -> None:
+        monkeypatch.setenv("OPENCODE_GO_API_KEY", "sk-test-usage")
+        calls: list = []
+
+        def flaky(request, timeout):
+            calls.append(request)
+            if len(calls) <= 2:
+                # Fail the first poll (both its retry attempts), then recover.
+                raise OSError("connection refused")
+            return FakeResponse(json.dumps(USAGE_BODY).encode())
+
+        with mock.patch("urllib.request.urlopen", side_effect=flaky):
+            assert usage_poller.poll_go_usage(make_config()) is None
+        # Past the failure TTL, a healthy endpoint succeeds and is cached.
+        with mock.patch.object(usage_poller.time, "monotonic", return_value=time.monotonic() + 100), \
+             mock.patch("urllib.request.urlopen", side_effect=flaky):
+            assert usage_poller.poll_go_usage(make_config()) == USAGE_BODY["usage"]
+            assert usage_poller.poll_go_usage(make_config()) == USAGE_BODY["usage"]
+        # Poll 1 failed (2 attempts), poll 2 succeeded (1 attempt), poll 3
+        # was served from the success cache.
+        assert len(calls) == 3

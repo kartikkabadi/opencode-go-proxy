@@ -90,6 +90,26 @@ class TestUsageSummary:
         assert summary["todayTokens"] == 7
         assert summary["model"] == "m"
 
+    def test_state_usage_consistent_across_fold_and_rescan(self) -> None:
+        # The all-provider summary and the zen rollup both read the same fold;
+        # forcing a rescan must not change the numbers /state reports.
+        import os as _os
+
+        from opencode_go_proxy.meter import usage_events_path
+
+        record_at(datetime.datetime(2026, 8, 11, 3, 30, tzinfo=UTC), model="deepseek-v4-flash",
+                  status=200, duration_ms=100, total_tokens=50, provider="zen")
+        record_at(datetime.datetime(2026, 8, 11, 2, 0, tzinfo=UTC), model="deepseek-v4-flash",
+                  status=200, duration_ms=100, total_tokens=25)
+        folded = build_state(port=8787, upstream="u", now=NOW)
+        _os.utime(usage_events_path())
+        rescanned = build_state(port=8787, upstream="u", now=NOW)
+        assert folded["usage"]["todayTurns"] == rescanned["usage"]["todayTurns"] == 2
+        assert folded["usage"]["todayTokens"] == rescanned["usage"]["todayTokens"] == 75
+        assert folded["usage"]["zen"] == rescanned["usage"]["zen"] == {
+            "todayTurns": 1, "todayTokens": 50, "last7d": [0, 0, 0, 0, 0, 0, 50],
+        }
+
 
 class TestBuildState:
     def test_empty_state_defaults(self) -> None:
