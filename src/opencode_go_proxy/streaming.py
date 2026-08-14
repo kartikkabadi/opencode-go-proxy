@@ -165,6 +165,9 @@ def handle_streaming_request(payload: Json, config: ProxyConfig, request_id: str
     stream surfaces response.error code empty_completion.
     """
     session_model = payload.get("model") or DEFAULT_MODEL
+    # The go-reject zen fallback re-dispatches the ORIGINAL parsed body (pre
+    # session-injection) to zen; keep it before inject_session_model rebinds.
+    original_payload = dict(payload)
     payload = inject_session_model(payload, session_model)
     chat_payload, request_model, conversion_stats = responses_payload_to_chat_payload(payload)
 
@@ -228,15 +231,26 @@ def handle_streaming_request(payload: Json, config: ProxyConfig, request_id: str
 
         response_id = new_response_id()
         model = request_model or DEFAULT_MODEL
+        # response.created is emitted only after the first upstream connect
+        # succeeds (see run_attempt): when the go gateway rejects a zen-owned
+        # bare slug, the fallback hands the stream to the zen relay, which
+        # emits its own created. A pre-connect created would leave a ghost
+        # in_progress response on the client.
+        created_emitted = False
+        # Any SSE event actually written to the client; the go-reject zen
+        # fallback must not fire once the client has seen go data.
+        relayed_event = False
 
         def send_event(event: Json) -> None:
-            nonlocal client_alive
+            nonlocal client_alive, relayed_event
             if not client_alive:
                 return
             event_bytes = b"data: " + json.dumps(event, separators=(",", ":")).encode("utf-8") + b"\n\n"
             if not _write(event_bytes):
                 client_alive = False
                 trace("client.disconnected", request_id=request_id, message="client closed connection during stream")
+                return
+            relayed_event = True
 
         def send_error(msg: str, *, code: str | None = None) -> None:
             error: Json = {"message": msg}
@@ -251,11 +265,6 @@ def handle_streaming_request(payload: Json, config: ProxyConfig, request_id: str
         except ProxyError as exc:
             send_error(exc.message)
             return
-
-        send_event({"type": "response.created", "response": {
-            "id": response_id, "object": "response", "created_at": now_unix(),
-            "status": "in_progress", "model": model, "output": [], "output_text": "", "usage": None,
-        }})
 
         url = f"{config.chat_base_url}/chat/completions"
         raw_payload = json.dumps(chat_payload, separators=(",",":")).encode("utf-8")
@@ -298,20 +307,23 @@ def handle_streaming_request(payload: Json, config: ProxyConfig, request_id: str
         total_retries = 0
 
         def run_attempt() -> str:
-            """Run one upstream stream; returns 'content', 'empty', 'nodata', 'gone', or 'fallback'.
+            """Run one upstream stream; returns 'content', 'empty', 'nodata', 'gone', 'zen', or 'fallback'.
 
             'content'/'empty' split a streamed 200 by whether it produced any
             output; 'nodata' means the upstream opened but never sent SSE;
-            'gone' means the client disconnected. 'fallback' means the image
-            payload was rejected and the caller must re-run with captioned
-            text. Terminal error paths send their own events, meter the turn,
-            and return 'error' so the caller stops instead of retrying an
-            upstream failure or a client abort.
+            'gone' means the client disconnected. 'zen' means the go gateway
+            rejected a zen-owned bare slug and the stream was handed to the
+            zen relay, which finished (or failed) it. 'fallback' means the
+            image payload was rejected and the caller must re-run with
+            captioned text. Terminal error paths send their own events, meter
+            the turn, and return 'error' so the caller stops instead of
+            retrying an upstream failure or a client abort.
             """
             nonlocal text, reasoning, tool_calls, tool_call_items, tool_call_open, usage
             nonlocal item_open, reasoning_open, reasoning_emitted, total_retries
             nonlocal next_output_index, msg_index, tool_indices, reasoning_index
             nonlocal req, raw_payload, chat_payload, fell_back, fallback_attempts
+            nonlocal created_emitted
 
             # Per-attempt emission state; an empty attempt never opens items,
             # but resetting keeps a retry provably clean.
@@ -399,6 +411,23 @@ def handle_streaming_request(payload: Json, config: ProxyConfig, request_id: str
                         trace("upstream.start", request_id=request_id, url=url, bytes=len(raw_payload),
                               stream=True, fallback=True)
                         return "fallback"
+                    from opencode_go_proxy.app import _go_reject_zen_fallback
+
+                    if not relayed_event and _go_reject_zen_fallback(session_model, exc.code, fail.body):
+                        # The go gateway advertises this bare slug but does not
+                        # serve it (its ModelError "not supported" envelope);
+                        # zen owns it. The rejection is the go upstream's first
+                        # response, so no go data event was relayed: close the
+                        # go connection without a client-visible error and
+                        # re-dispatch the identical original payload through the
+                        # zen streaming relay, which emits its own
+                        # response.created and meters provider="zen".
+                        trace("fallback.go_reject_zen", request_id=request_id, model=session_model,
+                              status=exc.code, path="responses", stream=True)
+                        keepalive_stop.set()
+                        ka_thread.join(timeout=interval)
+                        _zen_fallback_stream(original_payload, config, request_id, wfile)
+                        return "zen"
                     if exc.code == 429:
                         retry_after = exc.headers.get("retry-after", "5")
                         send_error(f"rate limited (retry after {retry_after}s)")
@@ -417,6 +446,13 @@ def handle_streaming_request(payload: Json, config: ProxyConfig, request_id: str
                 record_usage_event(model=model, status=502, duration_ms=int((time.time() - started) * 1000),
                                    retries=total_retries + fallback_attempts)
                 return "error"
+
+            if not created_emitted:
+                created_emitted = True
+                send_event({"type": "response.created", "response": {
+                    "id": response_id, "object": "response", "created_at": now_unix(),
+                    "status": "in_progress", "model": model, "output": [], "output_text": "", "usage": None,
+                }})
 
             try:
                 with response as resp:
@@ -520,7 +556,7 @@ def handle_streaming_request(payload: Json, config: ProxyConfig, request_id: str
         empty_attempts = 0
         while True:
             outcome = run_attempt()
-            if outcome in ("error", "gone", "nodata"):
+            if outcome in ("error", "gone", "nodata", "zen"):
                 return
             if outcome == "fallback":
                 continue
@@ -665,6 +701,25 @@ def handle_chat_stream_passthrough(payload: Json, config: ProxyConfig, request_i
         retries = fail.attempts
         exc = fail.exc
         if isinstance(exc, urllib.error.HTTPError):
+            from opencode_go_proxy.app import _go_reject_zen_fallback
+            from opencode_go_proxy.zen_catalog import ZEN_PREFIX
+            from opencode_go_proxy.zen_upstream import handle_zen_chat_request
+
+            model = payload.get("model") or DEFAULT_MODEL
+            if _go_reject_zen_fallback(model, exc.code, fail.body):
+                # The go gateway advertises this bare slug but does not serve
+                # it (its ModelError "not supported" envelope); zen owns it.
+                # Nothing has been committed yet (this chat path is
+                # connect-first), so the zen chat handler answers with its own
+                # status/body or SSE head; it takes the zen/ prefix (its API
+                # contract) and strips it before sending, so the wire request
+                # keeps the identical messages/tools/stream and the bare id.
+                trace("fallback.go_reject_zen", request_id=request_id, model=model,
+                      status=exc.code, path="chat/completions", stream=True)
+                zen_payload = dict(payload)
+                zen_payload["model"] = f"{ZEN_PREFIX}{model}"
+                handle_zen_chat_request(handler, zen_payload, config, request_id)
+                return
             # Nothing was committed yet, so the client sees the upstream's own
             # status and error body, not a proxy envelope.
             body = fail.body
@@ -766,3 +821,157 @@ def handle_chat_stream_passthrough(payload: Json, config: ProxyConfig, request_i
             model=payload.get("model") or DEFAULT_MODEL, status=response.status,
             duration_ms=elapsed_ms, retries=retries or None,
         )
+
+
+class _ZenFallbackHandler:
+    """Handler-shaped adapter that lets the zen streaming relay write through
+    an SSE response whose HTTP head the go path already committed.
+
+    The zen relay normally owns the HTTP response (send_response + headers +
+    body). In the go-reject fallback the head is already on the wire, so the
+    HTTP part is absorbed and an upstream error body is captured instead of
+    written, for the caller to surface as the terminal SSE event.
+    """
+
+    def __init__(self, wfile: Any) -> None:
+        self.wfile = self  # the relay writes through handler.wfile
+        self._wfile = wfile
+        self.error_status: int | None = None
+        self.error_body = bytearray()
+        self._error_mode = False
+
+    def write(self, data: bytes) -> None:
+        if self._error_mode:
+            self.error_body.extend(data)
+        else:
+            self._wfile.write(data)
+
+    def flush(self) -> None:
+        if not self._error_mode:
+            self._wfile.flush()
+
+    def send_response(self, status: int) -> None:
+        self._error_mode = True
+        self.error_status = status
+
+    def send_header(self, name: str, value: str) -> None:
+        pass
+
+    def end_headers(self) -> None:
+        pass
+
+
+def _zen_error_terminal(wfile: Any, status: int, body: bytes | None = None, *, message: str | None = None) -> None:
+    """Surface a zen failure as the terminal SSE event.
+
+    The SSE head is already committed by the go path, so a zen failure can
+    only appear as a response.error event plus [DONE], never as a second HTTP
+    response. The zen error envelope (type/message when the body parses) is
+    surfaced; ``message`` overrides the status fallback.
+    """
+    from opencode_go_proxy.zen_upstream import parse_zen_error
+
+    code = None
+    if message is None:
+        message = f"zen upstream HTTP {status}"
+        if body:
+            error_type, error_message = parse_zen_error(body.decode("utf-8", errors="replace"))
+            if error_message:
+                message = error_message
+            code = error_type
+    event: Json = {"type": "response.error", "error": {"message": message}}
+    if code:
+        event["error"]["code"] = code
+    try:
+        wfile.write(b"data: " + json.dumps(event, separators=(",", ":")).encode("utf-8") + b"\n\n")
+        wfile.write(b"data: [DONE]\n\n")
+        wfile.flush()
+    except (BrokenPipeError, OSError):
+        # The client went away while the terminal event was being written; the
+        # turn outcome is already metered by the zen relay, so nothing remains.
+        trace("client.disconnected", message="client closed connection during zen error terminal")
+
+
+def _zen_fallback_stream(
+    original_payload: Json,
+    config: ProxyConfig,
+    request_id: str,
+    wfile: Any,
+) -> None:
+    """Re-dispatch the identical request through the zen streaming relay.
+
+    Fires only when the go gateway rejected a bare zen-owned slug with its
+    ModelError "not supported" envelope before any data event was relayed. The
+    SSE head is already committed by the go path, so the relay's HTTP response
+    part is absorbed by a handler adapter and its stream is written through
+    ``wfile`` unchanged. The relay emits its own response.created, meters
+    provider="zen", and on failure surfaces the zen error envelope as the
+    terminal event.
+    """
+    from opencode_go_proxy.passthrough import _relay_stream
+    from opencode_go_proxy.zen_upstream import (
+        _build_zen_request,
+        _meter_zen,
+        _ZenStreamEngine,
+        bare_zen_id,
+        zen_family_for,
+    )
+
+    started = time.time()
+    model = original_payload.get("model") or DEFAULT_MODEL
+    bare_id = bare_zen_id(model)
+    family = zen_family_for(bare_id)
+    api_key = resolve_api_key(config, request_id)
+    url, body, headers = _build_zen_request(
+        original_payload, family, bare_id, api_key, stream=True, session_model=model
+    )
+    raw_payload = json.dumps(body, separators=(",", ":")).encode("utf-8")
+    req = urllib.request.Request(url, data=raw_payload, headers=headers, method="POST")
+    trace("zen.start", request_id=request_id, url=url, bytes=len(raw_payload), family=family, stream=True)
+    shim = _ZenFallbackHandler(wfile)
+
+    if family == "openai_responses":
+        # Verbatim family: connect once and relay the open stream unchanged
+        # (mirror of handle_zen_responses_request's openai_responses branch).
+        try:
+            response, retries = _open_upstream_stream(req, config, request_id, default_max_retries())
+        except _ConnectFailed as fail:
+            retries = fail.attempts
+            exc = fail.exc
+            if isinstance(exc, urllib.error.HTTPError):
+                _meter_zen(model, started, exc.code, retries=retries or None)
+                _zen_error_terminal(wfile, exc.code, fail.body)
+                return
+            status = int(HTTPStatus.GATEWAY_TIMEOUT if isinstance(exc, TimeoutError) else HTTPStatus.BAD_GATEWAY)
+            _meter_zen(model, started, status, retries=retries or None)
+            _zen_error_terminal(wfile, status)
+            return
+        outcome = _relay_stream(response, shim, request_id)
+        if outcome == "done":
+            _meter_zen(model, started, 200, retries=retries or None)
+        elif outcome == "gone":
+            _meter_zen(model, started, 0, stream_aborted=True, retries=retries or None)
+        else:
+            _meter_zen(model, started, 502, stream_aborted=True, retries=retries or None)
+        trace("zen.done", request_id=request_id, family=family, stream=True, outcome=outcome)
+        return
+
+    engine = _ZenStreamEngine(
+        shim, original_payload, config, request_id,
+        family=family, bare_id=bare_id, model=model,
+        response_id=new_response_id(), started=started, raw_payload=raw_payload,
+    )
+    engine._start_keepalive()
+    try:
+        engine.run(req)
+    except ProxyError as exc:
+        # The engine metered the network failure already (502/504 zen); the
+        # SSE head is committed so the zen error renders as the terminal event.
+        _zen_error_terminal(wfile, int(exc.status), message=exc.message)
+    finally:
+        engine._stop_keepalive()
+    if shim.error_status is not None:
+        # The engine absorbed a zen HTTP rejection at connect (metered with
+        # the zen status) before any SSE event was written; surface the zen
+        # error envelope as the terminal event.
+        _zen_error_terminal(wfile, shim.error_status, bytes(shim.error_body))

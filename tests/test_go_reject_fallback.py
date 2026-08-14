@@ -5,14 +5,18 @@ A bare slug that exists in BOTH the go catalog and the zen catalog routes to
 the opencode-go path (go wins for bare collisions). When the go gateway
 rejects that specific slug with its own ModelError "not supported" envelope
 (401/403), the proxy re-dispatches the identical request to the zen path
-instead of surfacing the go rejection. Every other go answer — 200, an
-invalid-key 401, a prefixed slug, a slug zen does not own — is handled exactly
-as before.
+instead of surfacing the go rejection — non-stream responses, non-stream
+chat, and both streaming paths (the responses stream hands the open SSE
+stream to the zen relay; the chat stream hands the request to the zen chat
+handler before anything is committed). Every other go answer — 200, an
+invalid-key 401, a prefixed slug, a slug zen does not own — is handled
+exactly as before.
 """
 
 import io
 import json
 import os
+import urllib.error
 from http import HTTPStatus
 from unittest import mock
 
@@ -26,7 +30,13 @@ from opencode_go_proxy.app import (
     handle_responses_request,
 )
 from opencode_go_proxy.errors import ProxyError
-from opencode_go_proxy.meter import state_dir
+from opencode_go_proxy.meter import state_dir, usage_events_path
+from opencode_go_proxy.secrets import clear_api_key_cache
+from opencode_go_proxy.streaming import (
+    _ConnectFailed,
+    handle_chat_stream_passthrough,
+    handle_streaming_request,
+)
 
 ZEN_SLUG = "north-mini-code-free"
 
@@ -137,6 +147,70 @@ class _FakeHandler:
 
     def flush(self) -> None:
         pass
+
+
+class _UpstreamStream:
+    """Fake urllib response iterating prebuilt SSE lines."""
+
+    def __init__(self, lines: list[bytes]) -> None:
+        self._lines = list(lines)
+        self.status = 200
+        self.headers = {}
+
+    def __iter__(self):
+        return iter(self._lines)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args: object) -> bool:
+        return False
+
+
+class _AbortingStream(_UpstreamStream):
+    """Fake upstream that dies mid-stream after one data line."""
+
+    def __init__(self) -> None:
+        super().__init__([])
+
+    def __iter__(self):
+        yield b'data: {"id":"z1","choices":[{"index":0,"delta":{"content":"zen hi"}}]}\n'
+        raise OSError("connection reset")
+
+
+def _go_http_error(status: int = 401, body: str = GO_REJECT_BODY) -> urllib.error.HTTPError:
+    return urllib.error.HTTPError(
+        "https://up.test/v1/chat/completions", status, "upstream error", {}, io.BytesIO(body.encode())
+    )
+
+
+def _sse_events(wfile: io.BytesIO) -> list[dict]:
+    events: list[dict] = []
+    for block in wfile.getvalue().decode("utf-8").split("\n\n"):
+        block = block.strip()
+        if not block.startswith("data: "):
+            continue
+        data = block[len("data: "):]
+        if data == "[DONE]":
+            continue
+        events.append(json.loads(data))
+    return events
+
+
+def _meter_events() -> list[dict]:
+    try:
+        with open(usage_events_path(), encoding="utf-8") as handle:
+            return [json.loads(line) for line in handle if line.strip()]
+    except FileNotFoundError:
+        return []
+
+
+def _zen_stream_lines() -> list[bytes]:
+    return [
+        b'data: {"id":"z1","choices":[{"index":0,"delta":{"content":"zen hi"}}]}\n',
+        b'data: {"id":"z1","choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}\n',
+        b"data: [DONE]\n",
+    ]
 
 
 class TestGoRejectHelper:
@@ -391,3 +465,232 @@ class TestChatFallback:
 
         assert ctx.value.message == "zen upstream network error: boom"
         assert ctx.value.error_type == "ZenNetworkError"
+
+
+class TestStreamingFallback:
+    """Stream=true responses: the go-reject zen fallback relays the zen stream.
+
+    The SSE head is committed before the go upstream connects, so on the
+    rejection the fallback hands the already-open SSE stream to the zen relay:
+    the client sees the zen relay's own response.created, the zen events, and
+    a provider="zen" meter record with the zen outcome.
+    """
+
+    def test_go_reject_falls_back_to_zen_stream(self) -> None:
+        _seed_collision()
+        clear_api_key_cache()
+        wfile = io.BytesIO()
+
+        with mock.patch.dict(os.environ, {"OPENCODE_GO_API_KEY": "test-key"}), mock.patch(
+            "urllib.request.urlopen",
+            side_effect=[_go_http_error(), _UpstreamStream(_zen_stream_lines())],
+        ):
+            handle_streaming_request(responses_payload(stream=True), make_config(), "req", wfile)
+
+        events = _sse_events(wfile)
+        # One created, from the zen relay (the go path never emitted one), with
+        # the original bare slug; then the zen stream, no error terminal.
+        created = [e for e in events if e["type"] == "response.created"]
+        assert len(created) == 1
+        assert created[0]["response"]["model"] == ZEN_SLUG
+        completed = [e for e in events if e["type"] == "response.completed"]
+        assert len(completed) == 1
+        assert completed[0]["response"]["output_text"] == "zen hi"
+        deltas = [e for e in events if e["type"] == "response.output_text.delta"]
+        assert any(d["delta"] == "zen hi" for d in deltas)
+        assert not any(e["type"] == "response.error" for e in events)
+        assert b"[DONE]" in wfile.getvalue()
+
+        # The go 401 is superseded: the only meter record is the zen 200.
+        meter = _meter_events()
+        assert len(meter) == 1
+        assert meter[0]["provider"] == "zen"
+        assert meter[0]["status"] == 200
+
+    def test_go_401_invalid_key_no_fallback(self) -> None:
+        _seed_collision()
+        clear_api_key_cache()
+        wfile = io.BytesIO()
+
+        with mock.patch.dict(os.environ, {"OPENCODE_GO_API_KEY": "test-key"}), mock.patch(
+            "urllib.request.urlopen", side_effect=_go_http_error(401, INVALID_KEY_BODY)
+        ) as urlopen:
+            handle_streaming_request(responses_payload(stream=True), make_config(), "req", wfile)
+
+        urlopen.assert_called_once()  # no second (zen) connect
+        events = _sse_events(wfile)
+        errors = [e for e in events if e["type"] == "response.error"]
+        assert len(errors) == 1
+        assert errors[0]["error"]["message"] == "upstream HTTP 401"
+        assert b"[DONE]" in wfile.getvalue()
+        meter = _meter_events()
+        assert len(meter) == 1
+        assert meter[0]["status"] == 401
+
+    def test_go_200_with_data_no_fallback(self) -> None:
+        _seed_collision()
+        clear_api_key_cache()
+        go_lines = [
+            b'data: {"id":"1","choices":[{"index":0,"delta":{"content":"go hi"}}]}\n',
+            b'data: {"id":"1","choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}\n',
+            b"data: [DONE]\n",
+        ]
+        wfile = io.BytesIO()
+
+        with mock.patch.dict(os.environ, {"OPENCODE_GO_API_KEY": "test-key"}), mock.patch(
+            "urllib.request.urlopen", return_value=_UpstreamStream(go_lines)
+        ) as urlopen:
+            handle_streaming_request(responses_payload(stream=True), make_config(), "req", wfile)
+
+        urlopen.assert_called_once()
+        events = _sse_events(wfile)
+        completed = [e for e in events if e["type"] == "response.completed"]
+        assert len(completed) == 1
+        assert completed[0]["response"]["output_text"] == "go hi"
+        assert not any(e["type"] == "response.error" for e in events)
+
+    def test_bare_slug_not_in_zen_ids_no_fallback(self) -> None:
+        from opencode_go_proxy import zen_catalog as _zc
+
+        _zc._ZEN_MODELS_CACHE = None
+        with open(_zc.zen_models_path(), "w") as handle:
+            json.dump({"fetched_at": "2026-08-14T00:00:00Z", "models": []}, handle)
+        clear_api_key_cache()
+        wfile = io.BytesIO()
+
+        with mock.patch.dict(os.environ, {"OPENCODE_GO_API_KEY": "test-key"}), mock.patch(
+            "urllib.request.urlopen", side_effect=_go_http_error()
+        ) as urlopen:
+            handle_streaming_request(responses_payload(stream=True), make_config(), "req", wfile)
+
+        urlopen.assert_called_once()
+        events = _sse_events(wfile)
+        errors = [e for e in events if e["type"] == "response.error"]
+        assert len(errors) == 1
+        assert errors[0]["error"]["message"] == "upstream HTTP 401"
+        meter = _meter_events()
+        assert meter and meter[0]["status"] == 401
+
+    def test_zen_failure_mid_relay_meters_502(self) -> None:
+        _seed_collision()
+        clear_api_key_cache()
+        wfile = io.BytesIO()
+
+        with mock.patch.dict(os.environ, {"OPENCODE_GO_API_KEY": "test-key"}), mock.patch(
+            "urllib.request.urlopen",
+            side_effect=[_go_http_error(), _AbortingStream()],
+        ):
+            handle_streaming_request(responses_payload(stream=True), make_config(), "req", wfile)
+
+        events = _sse_events(wfile)
+        errors = [e for e in events if e["type"] == "response.error"]
+        assert len(errors) == 1
+        assert "aborted" in errors[0]["error"]["message"]
+        assert b"[DONE]" in wfile.getvalue()
+        # The zen attempt's failure is what the meter records: 502 aborted,
+        # never the superseded go 401 and never a 200 the client did not get.
+        meter = _meter_events()
+        assert len(meter) == 1
+        assert meter[0]["provider"] == "zen"
+        assert meter[0]["status"] == 502
+        assert meter[0].get("streamAborted") is True
+
+    def test_zen_connect_rejection_surfaces_zen_envelope(self) -> None:
+        _seed_collision()
+        clear_api_key_cache()
+        zen_reject = json.dumps({"error": {"type": "ZenModelError", "message": "zen says no"}})
+        wfile = io.BytesIO()
+
+        with mock.patch.dict(os.environ, {"OPENCODE_GO_API_KEY": "test-key"}), mock.patch(
+            "urllib.request.urlopen",
+            side_effect=[_go_http_error(), _go_http_error(400, zen_reject)],
+        ):
+            handle_streaming_request(responses_payload(stream=True), make_config(), "req", wfile)
+
+        events = _sse_events(wfile)
+        errors = [e for e in events if e["type"] == "response.error"]
+        assert len(errors) == 1
+        # The zen error envelope (type + message) is the terminal event, never
+        # a second HTTP response inside the already-committed SSE stream.
+        assert errors[0]["error"]["message"] == "zen says no"
+        assert errors[0]["error"].get("code") == "ZenModelError"
+        assert b"[DONE]" in wfile.getvalue()
+        meter = _meter_events()
+        assert len(meter) == 1
+        assert meter[0]["provider"] == "zen"
+        assert meter[0]["status"] == 400
+
+    def test_stream_flag_and_request_id_preserved(self) -> None:
+        _seed_collision()
+        clear_api_key_cache()
+        go_calls: list[tuple] = []
+        zen_calls: list[tuple] = []
+
+        def go_open(req, config, request_id, max_retries):
+            go_calls.append((req, config, request_id, max_retries))
+            raise _ConnectFailed(_go_http_error(), 0, GO_REJECT_BODY.encode())
+
+        def zen_open(req, config, request_id, max_retries):
+            zen_calls.append((req, config, request_id, max_retries))
+            return _UpstreamStream(_zen_stream_lines()), 0
+
+        wfile = io.BytesIO()
+        with mock.patch.dict(os.environ, {"OPENCODE_GO_API_KEY": "test-key"}), mock.patch(
+            "opencode_go_proxy.streaming._open_upstream_stream", side_effect=go_open
+        ), mock.patch(
+            "opencode_go_proxy.zen_upstream._open_upstream_stream", side_effect=zen_open
+        ):
+            handle_streaming_request(responses_payload(stream=True), make_config(), "req", wfile)
+
+        assert len(go_calls) == 1
+        assert len(zen_calls) == 1
+        assert zen_calls[0][2] == "req"  # request_id preserved
+        body = json.loads(zen_calls[0][0].data)
+        assert body["stream"] is True  # stream flag preserved on the zen wire
+        assert body["model"] == ZEN_SLUG  # original bare slug on the zen wire
+
+
+class TestChatStreamFallback:
+    """Chat-completions stream=true: the go-reject zen fallback mirrors the
+    non-stream chat fallback (zen/ prefix payload handed to the zen handler).
+    """
+
+    def test_go_reject_falls_back_to_zen(self) -> None:
+        _seed_collision()
+        clear_api_key_cache()
+        handler = _FakeHandler()
+        payload = chat_payload()
+        payload["stream"] = True
+        config = make_config()
+
+        with mock.patch.dict(os.environ, {"OPENCODE_GO_API_KEY": "test-key"}), mock.patch(
+            "opencode_go_proxy.streaming._open_upstream_stream",
+            side_effect=_ConnectFailed(_go_http_error(), 0, GO_REJECT_BODY.encode()),
+        ), mock.patch("opencode_go_proxy.zen_upstream.handle_zen_chat_request") as zen:
+            handle_chat_stream_passthrough(payload, config, "req", handler)
+
+        zen.assert_called_once()
+        called_handler, zen_payload, called_config, called_request_id = zen.call_args.args
+        assert called_handler is handler
+        assert called_config is config
+        assert called_request_id == "req"
+        assert zen_payload["model"] == f"zen/{ZEN_SLUG}"
+        assert zen_payload["messages"] == payload["messages"]
+        assert zen_payload["stream"] is True
+
+    def test_go_401_invalid_key_relayed_verbatim_no_fallback(self) -> None:
+        _seed_collision()
+        clear_api_key_cache()
+        handler = _FakeHandler()
+        payload = chat_payload()
+        payload["stream"] = True
+
+        with mock.patch.dict(os.environ, {"OPENCODE_GO_API_KEY": "test-key"}), mock.patch(
+            "opencode_go_proxy.streaming._open_upstream_stream",
+            side_effect=_ConnectFailed(_go_http_error(401, INVALID_KEY_BODY), 0, INVALID_KEY_BODY.encode()),
+        ), mock.patch("opencode_go_proxy.zen_upstream.handle_zen_chat_request") as zen:
+            handle_chat_stream_passthrough(payload, make_config(), "req", handler)
+
+        zen.assert_not_called()
+        assert handler.status == 401
+        assert handler.wfile.getvalue() == INVALID_KEY_BODY.encode()
