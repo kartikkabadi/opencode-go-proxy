@@ -148,6 +148,17 @@ class ResponsesProxyHandler(BaseHTTPRequestHandler):
     def _error_payload(exc: ProxyError) -> Json:
         return {"error": {"type": exc.error_type or "proxy_error", "message": exc.message}}
 
+    def _send_proxy_error(self, exc: ProxyError) -> None:
+        """Write the proxy error envelope, forwarding upstream retry-after.
+
+        Only the upstream's retry-after header is copied (lowercase key); the
+        rest of the upstream response stays out of the envelope.
+        """
+        headers = None
+        if exc.headers and exc.headers.get("retry-after"):
+            headers = {"retry-after": exc.headers["retry-after"]}
+        self._send_json(self._error_payload(exc), status=exc.status, headers=headers)
+
     def _reject_websocket_upgrade(self) -> bool:
         """Reject a realtime WebSocket upgrade with HTTP/1.1 426.
 
@@ -179,7 +190,7 @@ class ResponsesProxyHandler(BaseHTTPRequestHandler):
             self._guard_request()
         except ProxyError as exc:
             trace("request.failed", status=exc.status, message=exc.message)
-            self._send_json(self._error_payload(exc), status=exc.status)
+            self._send_proxy_error(exc)
             return
         if self.path in {"/health", "/v1/health"}:
             self._send_json({"status": "ok"})
@@ -267,7 +278,7 @@ class ResponsesProxyHandler(BaseHTTPRequestHandler):
                 self._send_json(response)
         except ProxyError as exc:
             trace("request.failed", request_id=request_id, status=exc.status, message=exc.message)
-            self._send_json(self._error_payload(exc), status=exc.status)
+            self._send_proxy_error(exc)
         except BrokenPipeError:
             trace("client.disconnected", request_id=request_id, message="client closed connection during stream")
         except Exception as exc:  # pragma: no cover - defensive crash trace  # noqa: BLE001
@@ -304,10 +315,12 @@ class ResponsesProxyHandler(BaseHTTPRequestHandler):
             raise ProxyError(HTTPStatus.BAD_REQUEST, "request body must be a JSON object")
         return value
 
-    def _send_json(self, payload: Json, status: HTTPStatus = HTTPStatus.OK) -> None:
+    def _send_json(self, payload: Json, status: HTTPStatus = HTTPStatus.OK, headers: dict[str, str] | None = None) -> None:
         raw = json.dumps(payload, separators=(",",":")).encode("utf-8")
         self.send_response(status)
         self.send_header("content-type", "application/json")
+        for name, value in (headers or {}).items():
+            self.send_header(name, value)
         self.send_header("content-length", str(len(raw)))
         self.end_headers()
         self.wfile.write(raw)
@@ -407,13 +420,15 @@ def handle_chat_completions_request(handler: ResponsesProxyHandler, payload: Jso
         handle_chat_stream_passthrough(payload, config, request_id, handler)
         return
     started = time.time()
-    status, body, retries, content_type = call_upstream_chat_verbatim(payload, config, request_id)
+    status, body, retries, content_type, retry_after = call_upstream_chat_verbatim(payload, config, request_id)
     record_usage_event(
         model=payload.get("model") or DEFAULT_MODEL, status=status,
         duration_ms=int((time.time() - started) * 1000), retries=retries or None,
     )
     handler.send_response(status)
     handler.send_header("content-type", content_type or "application/json")
+    if retry_after:
+        handler.send_header("retry-after", retry_after)
     handler.send_header("content-length", str(len(body)))
     handler.end_headers()
     handler.wfile.write(body)

@@ -124,7 +124,7 @@ class TestVerbatimPassthroughClient:
         raw = json.dumps({"choices": [{"message": {"content": "hi"}}]}).encode("utf-8")
         with mock.patch.dict(os.environ, {"OPENCODE_GO_API_KEY": "test-key"}), \
              mock.patch("urllib.request.urlopen", return_value=ok_response()) as urlopen:
-            status, body, retries, _content_type = call_upstream_chat_verbatim(chat_payload(), make_config(), "req")
+            status, body, retries, _content_type, _retry_after = call_upstream_chat_verbatim(chat_payload(), make_config(), "req")
 
         assert status == 200
         assert body == raw
@@ -141,7 +141,7 @@ class TestVerbatimPassthroughClient:
         with mock.patch.dict(os.environ, {"OPENCODE_GO_API_KEY": "test-key"}), \
              mock.patch("urllib.request.urlopen", side_effect=fake_urlopen), \
              mock.patch("opencode_go_proxy.upstream.time.sleep"):
-            status, body, retries, _content_type = call_upstream_chat_verbatim(chat_payload(), make_config(), "req")
+            status, body, retries, _content_type, _retry_after = call_upstream_chat_verbatim(chat_payload(), make_config(), "req")
 
         assert status == 429
         assert body == b'{"error":"down"}'
@@ -151,7 +151,7 @@ class TestVerbatimPassthroughClient:
     def test_permanent_error_relayed_without_retry(self) -> None:
         with mock.patch.dict(os.environ, {"OPENCODE_GO_API_KEY": "test-key"}), \
              mock.patch("urllib.request.urlopen", side_effect=http_error(400)) as urlopen:
-            status, body, retries, _content_type = call_upstream_chat_verbatim(chat_payload(), make_config(), "req")
+            status, body, retries, _content_type, _retry_after = call_upstream_chat_verbatim(chat_payload(), make_config(), "req")
 
         assert status == 400
         assert body == b'{"error":"down"}'

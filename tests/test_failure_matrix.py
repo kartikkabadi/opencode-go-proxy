@@ -415,13 +415,17 @@ def read_until(response: HTTPResponse, marker: bytes, *, timeout_sec: float = 15
 def read_until_then_disconnect(
     conn: HTTPConnection, response: HTTPResponse, marker: bytes, *, timeout_sec: float = 15.0
 ) -> bytes:
-    """Read until `marker`, then close the connection as a client cancel would.
+    """Read until `marker`, then cancel the stream as a real client would.
 
-    A graceful FIN is used, not an RST: on macOS a peer RST is only reported
-    through recv, while sends after a FIN-then-RST fail with EPIPE, which is
-    the write failure the proxy's disconnect detection watches for.
+    The response must be closed, not just the connection: HTTPConnection.close()
+    only marks the socket closed in Python while the response's buffered reader
+    keeps the FD open, so the peer would never see a FIN/RST and the proxy's
+    liveness peek could not detect the cancel. Closing the response sends the
+    FIN (or RST with unread data) that the peek reads as the client-gone
+    signal the meter must record as status 0.
     """
     accumulated = read_until(response, marker, timeout_sec=timeout_sec)
+    response.close()
     conn.close()
     return accumulated
 

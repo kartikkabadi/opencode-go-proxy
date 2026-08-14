@@ -3,12 +3,15 @@
 import io
 import json
 import os
+import socket
+import struct
+import time
 from unittest import mock
 
 from opencode_go_proxy.app import ProxyConfig
 from opencode_go_proxy.meter import usage_events_path
 from opencode_go_proxy.secrets import clear_api_key_cache
-from opencode_go_proxy.streaming import handle_streaming_request
+from opencode_go_proxy.streaming import _client_gone, handle_streaming_request
 
 
 def make_config() -> ProxyConfig:
@@ -130,6 +133,24 @@ class TestEmptyCompletion:
         assert record["status"] == 200
         assert not record.get("emptyCompletion")
 
+    def test_empty_completion_metered_as_502(self, tmp_path) -> None:
+        # Two empty 200s (the retry also empty) end as response.error
+        # empty_completion; the client-visible outcome is a failed turn, so
+        # the meter records 502 with the emptyCompletion marker, never 200.
+        state = str(tmp_path / "state")
+        lines = [b"data: [DONE]\n"]
+        with mock.patch("urllib.request.urlopen", return_value=_UpstreamStream(lines)):
+            events, wfile, meter = _stream(lines, state_dir=state)
+        errors = [e for e in events if e["type"] == "response.error"]
+        assert len(errors) == 1
+        assert errors[0]["error"].get("code") == "empty_completion"
+        assert b"[DONE]" in wfile.getvalue()
+        assert meter
+        record = meter[0]
+        assert record["status"] == 502
+        assert record.get("emptyCompletion") is True
+        assert record.get("retries") == 1
+
 
 class TestOutputIndexes:
     def test_mixed_text_and_tool_calls_get_unique_indexes(self) -> None:
@@ -169,3 +190,51 @@ class TestFinalOnlyToolIndex:
         assert len(added) >= 2
         indices = [e["output_index"] for e in added]
         assert len(set(indices)) == len(indices), f"collision: {indices}"
+
+
+class TestClientGone:
+    """_client_gone peeks the client socket; a closed peer must read as gone.
+
+    On macOS a write to a reset peer does not error, so this peek is the only
+    way a cancelling client becomes visible before the stream ends.
+    """
+
+    @staticmethod
+    def _assert_eventually_gone(sock: socket.socket) -> None:
+        wfile = sock.makefile("wb", 0)  # same shape as handler.wfile
+        deadline = time.monotonic() + 2.0
+        while time.monotonic() < deadline:
+            if _client_gone(wfile):
+                return
+            time.sleep(0.005)
+        raise AssertionError("closed peer was never detected as gone")
+
+    def test_alive_peer_is_not_gone(self) -> None:
+        server, client = socket.socketpair()
+        try:
+            assert _client_gone(server.makefile("wb", 0)) is False
+        finally:
+            server.close()
+            client.close()
+
+    def test_peer_fin_reads_as_gone(self) -> None:
+        server, client = socket.socketpair()
+        try:
+            client.close()
+            self._assert_eventually_gone(server)
+        finally:
+            server.close()
+
+    def test_peer_rst_reads_as_gone(self) -> None:
+        server, client = socket.socketpair()
+        try:
+            client.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 0))
+            client.close()
+            self._assert_eventually_gone(server)
+        finally:
+            server.close()
+
+    def test_socketless_wfile_reads_as_alive(self) -> None:
+        # Test doubles (io.BytesIO) have no peekable socket; the probe must
+        # degrade to the old write-only behavior, never crash the stream.
+        assert _client_gone(io.BytesIO()) is False

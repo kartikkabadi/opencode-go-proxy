@@ -148,7 +148,9 @@ class TestEmptyCompletionRetry:
         assert not any(e["type"] == "response.completed" for e in events)
         assert b"[DONE]" in wfile.getvalue()
         assert len(meter) == 1
-        assert meter[0]["status"] == 200
+        # The client-visible outcome is a response.error, so the turn meters
+        # as a failed 502, never a success.
+        assert meter[0]["status"] == 502
         assert meter[0]["emptyCompletion"] is True
         assert meter[0]["retries"] == 1
 
