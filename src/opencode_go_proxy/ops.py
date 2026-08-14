@@ -8,7 +8,8 @@ through the local proxy and asserts the marker comes back. `support-bundle`
 writes the JSON schema v1 diagnostic bundle with secret-shaped values
 redacted. `install` points at the macOS menu bar app (no launchd agent);
 `install-skills` copies the checked-in skill into ~/.codex/skills; `status`
-reports running/port/log paths.
+reports running/port/log paths. `update` checks for (and optionally applies)
+a newer release without ever touching a running proxy.
 """
 
 from __future__ import annotations
@@ -18,6 +19,7 @@ import json
 import os
 import platform
 import re
+import shutil
 import socket
 import subprocess
 import sys
@@ -26,7 +28,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
-from typing import Any
+from typing import Any, Protocol
 
 from . import __version__, secrets
 from .config import ProxyConfig, resolve_chat_base_url
@@ -631,4 +633,108 @@ def status(argv: list[str] | None = None) -> int:
         sys.stdout.write(f"logs: {LOG_DIR}\n")
         for name in log_files:
             sys.stdout.write(f"  {name}\n")
+    return 0
+
+
+_UPDATE_SOURCE_URL = "git+https://github.com/kartikkabadi/opencode-go-proxy@v{version}"
+_UV_LIST_TIMEOUT_SECONDS = 30
+_UV_INSTALL_TIMEOUT_SECONDS = 600
+
+
+class _UpdateInfo(Protocol):
+    """The UpdateInfo fields the update command reads (updates.check_for_updates)."""
+
+    current: str
+    latest: str
+    available: bool
+    release_url: str | None
+    checked_at: str
+    error: str | None
+
+
+def _update_source_url(latest: str) -> str:
+    """The pinned install source for a released version (never the live tree)."""
+    return _UPDATE_SOURCE_URL.format(version=latest.lstrip("v"))
+
+
+def _update_apply(info: _UpdateInfo) -> int:
+    """Reinstall the released version via uv when the package is a uv tool.
+
+    When opencode-go-proxy is not installed as a uv tool (for example an
+    ephemeral `uvx --from ...` run or a repo checkout), print the exact pinned
+    uvx one-liner instead. Never touches the running proxy or this checkout.
+    """
+    source = _update_source_url(info.latest)
+    uv = shutil.which("uv")
+    if uv:
+        try:
+            listing = subprocess.run(
+                [uv, "tool", "list"],
+                capture_output=True,
+                text=True,
+                timeout=_UV_LIST_TIMEOUT_SECONDS,
+                check=False,
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            sys.stderr.write(f"update: cannot list uv tools: {exc}\n")
+            return 1
+        if listing.returncode == 0 and "opencode-go-proxy" in listing.stdout:
+            install = [uv, "tool", "install", "--force", "--from", source, "opencode-go-proxy"]
+            try:
+                result = subprocess.run(install, timeout=_UV_INSTALL_TIMEOUT_SECONDS, check=False)
+            except (OSError, subprocess.TimeoutExpired) as exc:
+                sys.stderr.write(f"update: install failed: {exc}\n")
+                return 1
+            if result.returncode == 0:
+                sys.stdout.write(f"update: installed opencode-go-proxy {info.latest}\n")
+                return 0
+            sys.stderr.write(f"update: install failed (exit {result.returncode})\n")
+            return 1
+    sys.stdout.write(f"uvx --from {source} opencode-go-proxy\n")
+    return 0
+
+
+def update_cmd(argv: list[str] | None = None) -> int:
+    """Check for (or apply) a proxy update.
+
+    Default prints "current X / latest Y" plus the release URL and exits 3
+    when an update is available, 0 when up to date, 1 on error. --json prints
+    the version_payload JSON (same exit-code semantics). --apply reinstalls
+    the released version through uv when the package is a uv tool, otherwise
+    prints the pinned uvx one-liner. --force bypasses the check cache.
+    """
+    argv = argv or []
+    want_json = "--json" in argv
+    want_apply = "--apply" in argv
+    force = "--force" in argv
+    from . import updates  # lazy import: module is optional at import time
+
+    if want_apply:
+        info = updates.check_for_updates(force=True)
+        if info.error:
+            sys.stderr.write(f"update: {info.error}\n")
+            return 1
+        if not info.available:
+            sys.stdout.write("up to date\n")
+            return 0
+        return _update_apply(info)
+
+    if want_json:
+        payload = updates.version_payload(force=force)
+        sys.stdout.write(json.dumps(payload, indent=2) + "\n")
+        update = payload.get("update") or {}
+        if update.get("error"):
+            return 1
+        return 3 if update.get("available") else 0
+
+    info = updates.check_for_updates(force=force)
+    if info.error:
+        sys.stderr.write(f"update: {info.error}\n")
+        return 1
+    if info.available:
+        sys.stdout.write(f"current {info.current} / latest {info.latest}\n")
+        if info.release_url:
+            sys.stdout.write(info.release_url + "\n")
+        return 3
+    sys.stdout.write("up to date\n")
     return 0
