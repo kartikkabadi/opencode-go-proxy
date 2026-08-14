@@ -33,7 +33,7 @@ final class ProxyController {
         URL(string: "http://127.0.0.1:\(state.port)/health")!
     }
 
-    private static let proxySource = "git+https://github.com/kartikkabadi/opencode-go-proxy@v0.3.1"
+    private static let proxySource = "git+https://github.com/kartikkabadi/opencode-go-proxy@v0.4.0"
     private static let cliLogName = "opencode-go-proxy-cli.log"
     private static let cliLogTailLimit = 600
     private static let configMarker = "# BEGIN opencode-go-proxy-managed"
