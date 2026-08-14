@@ -22,6 +22,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 
 from . import __version__
+from .compaction import COMPACT_PATHS, handle_compaction, has_compaction_trigger
 from .config import ProxyConfig, resolve_chat_base_url
 from .errors import ProxyError
 from .guards import check_browser_origin, check_content_type, check_host
@@ -246,6 +247,15 @@ class ResponsesProxyHandler(BaseHTTPRequestHandler):
                 model=model,
                 stream=payload.get("stream", False),
             )
+            # Remote compaction (v1: the dedicated /responses/compact path;
+            # v2: a responses request whose input ends in a compaction trigger
+            # item). Native models fall through to the ChatGPT backend relay,
+            # which handles compaction itself.
+            if path in COMPACT_PATHS or (
+                path in RESPONSES_PATHS and has_compaction_trigger(payload)
+            ) and route_target(model) != "native":
+                handle_compaction(self, payload, config, request_id, path=path)
+                return
             if path in CHAT_COMPLETIONS_PATHS:
                 handle_chat_completions_request(self, payload, config, request_id)
             elif path in RESPONSES_PATHS and route_target(model) == "native":
