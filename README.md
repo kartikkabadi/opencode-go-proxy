@@ -419,6 +419,52 @@ spawns the proxy itself and shows status, quota, and today's usage. There is
 no launchd agent anymore: `contrib/launchd/` was removed in 0.3.0, and the
 `install` ops command points at the menu bar app instead of a plist.
 
+## Updating
+
+Releases are small patch bumps pushed to the same git URL, so updating means
+re-installing from the newest tag. There is no PyPI and no separate package
+channel.
+
+### Menu bar (macOS)
+
+The menu bar app checks the proxy version on start and on demand. When a
+newer release exists it shows an "Update Available" row: click it, confirm,
+and the app re-installs the proxy from the new tag and restarts it. Use
+"Check for Updates" to force a fresh check. The menu bar app binary itself
+is a manual rebuild; only the proxy it runs is auto-updated.
+
+### CLI (uv tool install)
+
+If you installed the proxy as a tool, check and apply updates with the CLI:
+
+```bash
+opencode-go-proxy update         # check for a newer release
+opencode-go-proxy update --apply # install the newer release
+```
+
+`update` prints the installed version and the latest release (exit code 3
+when an update is available). `--apply` re-installs from the new tag with
+`uv tool install --force`; when the proxy was not installed as a tool it
+prints the exact one-liner to run instead.
+
+### Manual / systemd
+
+Pin the install to the newest tag:
+
+```bash
+uvx --from git+https://github.com/kartikkabadi/opencode-go-proxy@v0.4.0 \
+  opencode-go-proxy --bind 127.0.0.1 --port 8787
+```
+
+Replace `v0.4.0` with the newest tag from
+[releases](https://github.com/kartikkabadi/opencode-go-proxy/releases).
+For the systemd unit, update the `ExecStart` URL in
+`contrib/systemd/opencode-go-proxy.service` to the same pinned form, then
+`systemctl --user daemon-reload && systemctl --user restart opencode-go-proxy`.
+
+Release cadence: one small patch release per change, so updates arrive
+frequently and each one is small.
+
 ## Configuration
 
 All flags have environment variable defaults:

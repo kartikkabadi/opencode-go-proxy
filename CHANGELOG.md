@@ -314,3 +314,11 @@ Initial public release.
 - Generic error messages to client (full bodies only in trace logs)
 - No path reflection in 404 responses
 - Bind address guard warns on non-localhost
+
+[Unreleased]: https://github.com/kartikkabadi/opencode-go-proxy/compare/v0.4.0...HEAD
+[0.4.0]: https://github.com/kartikkabadi/opencode-go-proxy/releases/tag/v0.4.0
+[0.3.1]: https://github.com/kartikkabadi/opencode-go-proxy/releases/tag/v0.3.1
+[0.3.0]: https://github.com/kartikkabadi/opencode-go-proxy/releases/tag/v0.3.0
+[0.1.2]: https://github.com/kartikkabadi/opencode-go-proxy/releases/tag/v0.1.2
+[0.1.1]: https://github.com/kartikkabadi/opencode-go-proxy/releases/tag/v0.1.1
+[0.1.0]: https://github.com/kartikkabadi/opencode-go-proxy/releases/tag/v0.1.0
