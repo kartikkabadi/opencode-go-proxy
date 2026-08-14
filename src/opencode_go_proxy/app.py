@@ -204,10 +204,13 @@ class ResponsesProxyHandler(BaseHTTPRequestHandler):
             config = self._config()
             self._send_json(build_state(port=config.port, upstream=config.chat_base_url))
             return
-        if self.path in {"/version", "/v1/version"}:
+        version_path = self.path.split("?", 1)[0]
+        if version_path in {"/version", "/v1/version"}:
             from opencode_go_proxy import updates
+            from urllib.parse import urlsplit, parse_qs
 
-            self._send_json(updates.version_payload())
+            force = "1" in parse_qs(urlsplit(self.path).query).get("force", [])
+            self._send_json(updates.version_payload(force=force))
             return
         if self.path in {"/cache", "/v1/cache", "/metrics", "/v1/metrics"}:
             config = self._config()

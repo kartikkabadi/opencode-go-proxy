@@ -1,5 +1,6 @@
 """GitHub release check: semver compare, TTL cache, offline degradation."""
 
+import io
 import json
 import os
 import urllib.error
@@ -175,3 +176,62 @@ class TestVersionPayload:
         assert commit is None or (
             len(commit) == 8 and all(c in "0123456789abcdef" for c in commit)
         )
+
+
+
+
+class _FakeHandler(io.BytesIO):
+    """Minimal BaseHTTPRequestHandler surface for handler-level tests."""
+
+    def makefile(self, *args, **kwargs):
+        return self
+
+
+class TestVersionEndpointForce:
+    """GET /version?force=1 bypasses the TTL cache (handler-level)."""
+
+    def _handler_version(self, path: str) -> dict:
+        from opencode_go_proxy.app import ResponsesProxyHandler
+
+        wfile = _FakeHandler()
+        handler = ResponsesProxyHandler.__new__(ResponsesProxyHandler)
+        handler.headers = {"Host": "127.0.0.1:8787"}
+        handler.wfile = wfile
+        handler.rfile = _FakeHandler(b"GET " + path.encode() + b" HTTP/1.1")
+        handler.path = path
+        handler.command = "GET"
+        handler.client_address = ("127.0.0.1", 55555)
+        handler.close_connection = False
+        handler.server = None
+        handler.requestline = "GET " + path + " HTTP/1.1"
+        handler.request_version = "HTTP/1.1"
+        handler.server_version = "BaseHTTP/0.6"
+        handler.sys_version = ""
+        handler.error_message_format = ""
+        handler.error_content_type = ""
+        handler.log_error = lambda *a, **k: None
+        handler.log_message = lambda *a, **k: None
+        handler.send_error = lambda *a, **k: None
+        handler.send_response = lambda *a, **k: None
+        handler.send_header = lambda *a, **k: None
+        handler.end_headers = lambda *a, **k: None
+        handler.do_GET()
+        body = wfile.getvalue().decode()
+        json_part = body.split("\r\n\r\n")[-1]
+        return json.loads(json_part)
+
+    def test_force_query_bypasses_cache(self) -> None:
+        with mock.patch(_urlopen_path(), return_value=_release(_NEWER_TAG)):
+            updates.check_for_updates(force=True)
+        with mock.patch(_urlopen_path(), return_value=_release(_NEWER_TAG)):
+            payload = self._handler_version("/version?force=1")
+        assert payload["update"]["latest"] == _NEWER
+        assert payload["update"]["checked_at"] is not None
+
+    def test_no_force_reads_fresh_cache(self) -> None:
+        payload = self._handler_version("/v1/version")
+        assert set(payload) == {"version", "git_commit", "update"}
+
+    def test_force_zero_behaves_like_absent(self) -> None:
+        payload = self._handler_version("/version?force=0")
+        assert set(payload) == {"version", "git_commit", "update"}
