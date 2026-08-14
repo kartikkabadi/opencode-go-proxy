@@ -1,5 +1,38 @@
 # Changelog
 
+## [0.4.4] - 2026-08-14
+
+### Fixed
+
+- Catalog self-cleaning: a bare OpenCode Go slug the gateway rejects twice with
+  `ModelError: not supported` is hidden from the picker (two-strike rule,
+  in-memory per process lifetime; a later successful turn restores it).
+
+## [0.4.3] - 2026-08-14
+
+### Fixed
+
+- Streaming fallback: when Go rejects an unknown model before the first
+  streamed event, the identical request is re-dispatched through Zen and the
+  Zen stream is relayed.
+
+## [0.4.2] - 2026-08-14
+
+### Fixed
+
+- Non-streaming fallback: when Go answers `ModelError: not supported` for a
+  bare slug that Zen serves, the identical request is retried through Zen and
+  the Zen response (or error envelope) is returned. Go keeps ownership of
+  colliding slugs it actually serves.
+
+## [0.4.1] - 2026-08-14
+
+### Fixed
+
+- Zen-only bare slugs route to Zen, and Zen rows that collide with Go display
+  names get a `(Zen)` suffix in the catalog so the picker stays unambiguous.
+  Bare collisions both catalogs share keep routing to OpenCode Go.
+
 ## [0.4.0] - 2026-08-14
 
 ### Added
