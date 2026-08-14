@@ -186,14 +186,17 @@ class TestBuildState:
 
         os.makedirs(state_dir(), exist_ok=True)
         with open(updates._cache_path(), "w", encoding="utf-8") as handle:
+            from opencode_go_proxy import __version__ as _ver
+            _parts = [int(x) for x in _ver.split(".")]
+            _newer = f"{_parts[0]}.{_parts[1]}.{_parts[2] + 1}"
             json.dump({
                 "checked_at": "2026-08-14T00:00:00Z",
-                "latest": "0.4.4",
-                "release_url": "https://github.com/kartikkabadi/opencode-go-proxy/releases/tag/v0.4.4",
+                "latest": _newer,
+                "release_url": f"https://github.com/kartikkabadi/opencode-go-proxy/releases/tag/v{_newer}",
                 "error": None,
             }, handle)
         update = build_state(port=8787, upstream="u", now=NOW)["update"]
-        assert update["latest"] == "0.4.4"
+        assert update["latest"] == _newer
         assert update["available"] is True
 
 

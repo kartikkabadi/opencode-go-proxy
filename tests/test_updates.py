@@ -7,7 +7,10 @@ from unittest import mock
 
 from opencode_go_proxy import __version__, updates
 
-RELEASE_URL = "https://github.com/kartikkabadi/opencode-go-proxy/releases/tag/v0.4.4"
+_v = [int(x) for x in __version__.split(".")]
+_NEWER = f"{_v[0]}.{_v[1]}.{_v[2] + 1}"
+_NEWER_TAG = f"v{_NEWER}"
+RELEASE_URL = f"https://github.com/kartikkabadi/opencode-go-proxy/releases/tag/{_NEWER_TAG}"
 
 
 class MockResp:
@@ -41,9 +44,9 @@ def _cache_payload() -> dict:
 
 class TestCheckForUpdates:
     def test_newer_release_reported_available(self) -> None:
-        with mock.patch(_urlopen_path(), return_value=_release("v0.4.4")):
+        with mock.patch(_urlopen_path(), return_value=_release(_NEWER_TAG)):
             info = updates.check_for_updates(force=True)
-        assert info.latest == "0.4.4"
+        assert info.latest == _NEWER
         assert info.available is True
         assert info.release_url == RELEASE_URL
         assert info.error is None
@@ -68,14 +71,14 @@ class TestCheckForUpdates:
         assert info.available is False
 
     def test_v_prefix_stripped_from_latest(self) -> None:
-        with mock.patch(_urlopen_path(), return_value=_release("v0.4.4")):
+        with mock.patch(_urlopen_path(), return_value=_release(_NEWER_TAG)):
             info = updates.check_for_updates(force=True)
-        assert info.latest == "0.4.4"
+        assert info.latest == _NEWER
         assert not info.latest.startswith("v")
 
     def test_git_api_base_comes_from_env(self) -> None:
         with mock.patch.dict(os.environ, {"OPENCODE_GO_PROXY_GITHUB_API": "https://api.example.test"}, clear=False), \
-             mock.patch(_urlopen_path(), return_value=_release("v0.4.4")) as urlopen:
+             mock.patch(_urlopen_path(), return_value=_release(_NEWER_TAG)) as urlopen:
             updates.check_for_updates(force=True)
         request = urlopen.call_args.args[0]
         assert request.full_url == "https://api.example.test/repos/kartikkabadi/opencode-go-proxy/releases/latest"
@@ -84,16 +87,16 @@ class TestCheckForUpdates:
 
 class TestTtlCache:
     def test_cache_hit_skips_network(self) -> None:
-        with mock.patch(_urlopen_path(), return_value=_release("v0.4.4")):
+        with mock.patch(_urlopen_path(), return_value=_release(_NEWER_TAG)):
             first = updates.check_for_updates(force=True)
-        assert first.latest == "0.4.4"
+        assert first.latest == _NEWER
         with mock.patch(_urlopen_path(), side_effect=AssertionError("network must not be touched")):
             second = updates.check_for_updates()
-        assert second.latest == "0.4.4"
+        assert second.latest == _NEWER
         assert second.available is True
 
     def test_force_bypasses_cache(self) -> None:
-        with mock.patch(_urlopen_path(), return_value=_release("v0.4.4")):
+        with mock.patch(_urlopen_path(), return_value=_release(_NEWER_TAG)):
             updates.check_for_updates(force=True)
         with mock.patch(_urlopen_path(), return_value=_release("v0.4.1")):
             info = updates.check_for_updates(force=True)
@@ -101,16 +104,16 @@ class TestTtlCache:
 
     def test_expired_ttl_rechecks(self) -> None:
         with mock.patch.dict(os.environ, {"OPENCODE_GO_PROXY_UPDATE_TTL_HOURS": "0"}, clear=False), \
-             mock.patch(_urlopen_path(), side_effect=[_release("v0.4.4"), _release("v0.4.1")]):
+             mock.patch(_urlopen_path(), side_effect=[_release(_NEWER_TAG), _release("v0.4.1")]):
             first = updates.check_for_updates(force=True)
             second = updates.check_for_updates()
-        assert first.latest == "0.4.4"
+        assert first.latest == _NEWER
         assert second.latest == "0.4.1"
 
     def test_cache_file_mode_0600_under_state_dir(self) -> None:
         import stat
 
-        with mock.patch(_urlopen_path(), return_value=_release("v0.4.4")):
+        with mock.patch(_urlopen_path(), return_value=_release(_NEWER_TAG)):
             updates.check_for_updates(force=True)
         assert updates._cache_path().endswith("update-check.json")
         mode = os.stat(updates._cache_path()).st_mode & 0o777
@@ -127,12 +130,12 @@ class TestErrorPaths:
         assert info.available is False
 
     def test_offline_error_preserves_cached_latest(self) -> None:
-        with mock.patch(_urlopen_path(), return_value=_release("v0.4.4")):
+        with mock.patch(_urlopen_path(), return_value=_release(_NEWER_TAG)):
             updates.check_for_updates(force=True)
         with mock.patch(_urlopen_path(), side_effect=urllib.error.URLError("offline")):
             info = updates.check_for_updates(force=True)
         assert info.error is not None
-        assert info.latest == "0.4.4"
+        assert info.latest == _NEWER
         assert info.available is True
         assert info.release_url == RELEASE_URL
 
@@ -158,13 +161,13 @@ class TestErrorPaths:
 
 class TestVersionPayload:
     def test_payload_shape_and_update_keys(self) -> None:
-        with mock.patch(_urlopen_path(), return_value=_release("v0.4.4")):
+        with mock.patch(_urlopen_path(), return_value=_release(_NEWER_TAG)):
             payload = updates.version_payload(force=True)
         assert set(payload) == {"version", "git_commit", "update"}
         assert payload["version"] == __version__
         assert set(payload["update"]) == {"available", "checked_at", "error", "latest", "release_url"}
         assert payload["update"]["available"] is True
-        assert payload["update"]["latest"] == "0.4.4"
+        assert payload["update"]["latest"] == _NEWER
         assert payload["update"]["error"] is None
 
     def test_git_commit_is_short_hash_or_none(self) -> None:
