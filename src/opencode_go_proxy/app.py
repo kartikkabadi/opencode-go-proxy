@@ -18,6 +18,7 @@ import time
 import traceback
 import uuid
 from http import HTTPStatus
+from urllib.parse import parse_qs, urlsplit
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 
@@ -206,7 +207,6 @@ class ResponsesProxyHandler(BaseHTTPRequestHandler):
             return
         version_path = self.path.split("?", 1)[0]
         if version_path in {"/version", "/v1/version"}:
-            from urllib.parse import parse_qs, urlsplit
             from opencode_go_proxy import updates
 
             force = "1" in parse_qs(urlsplit(self.path).query).get("force", [])
