@@ -1,9 +1,17 @@
 import AppKit
 
 final class AppDelegate: NSObject, NSApplicationDelegate {
+    /// Build version of this menu bar app. The proxy auto-updates itself,
+    /// but this binary is a manual rebuild; bumped at release time in this
+    /// one place (shown as the version row's tooltip).
+    private static let appVersion = "menu bar v0.4.7"
+
     private var statusItem: NSStatusItem!
     private var proxy = ProxyController()
     private var statusLabel: NSMenuItem!
+    private var versionLabel: NSMenuItem!
+    private var updateAvailableItem: NSMenuItem!
+    private var checkForUpdatesItem: NSMenuItem!
     private var portLabel: NSMenuItem!
     private var upstreamLabel: NSMenuItem!
     private var quotaLabel: NSMenuItem!
@@ -73,6 +81,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let header = NSMenuItem(title: "OpenCode Go", action: nil, keyEquivalent: "")
         header.isEnabled = false
         menu.addItem(header)
+
+        versionLabel = NSMenuItem(title: "", action: nil, keyEquivalent: "")
+        versionLabel.isEnabled = false
+        menu.addItem(versionLabel)
+
+        updateAvailableItem = NSMenuItem(title: "", action: #selector(applyUpdate), keyEquivalent: "")
+        updateAvailableItem.target = self
+        updateAvailableItem.isHidden = true
+        menu.addItem(updateAvailableItem)
+
+        checkForUpdatesItem = NSMenuItem(title: "Check for Updates", action: #selector(checkForUpdates), keyEquivalent: "")
+        checkForUpdatesItem.target = self
+        menu.addItem(checkForUpdatesItem)
+
+        menu.addItem(.separator())
 
         statusLabel = NSMenuItem(title: "", action: nil, keyEquivalent: "")
         statusLabel.isEnabled = false
@@ -212,6 +235,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         if let statusLabel {
             statusLabel.title = statusTitle
         }
+        if let versionLabel {
+            versionLabel.title = Self.versionRowTitle(runningVersion: proxy.runningVersion, pin: proxy.activePin)
+            versionLabel.toolTip = Self.appVersion
+        }
+        if let updateAvailableItem {
+            let update = proxy.updateInfo
+            let latest = update?.latest
+            let available = update?.available == true && latest != nil
+            updateAvailableItem.title = latest.map { "Update Available: \(Self.versionText($0))" } ?? ""
+            updateAvailableItem.isHidden = !available
+            updateAvailableItem.isEnabled = state.isRunning
+        }
+        if let checkForUpdatesItem {
+            checkForUpdatesItem.isEnabled = state.isRunning
+        }
         if let portLabel {
             portLabel.title = state.isRunning && state.isHealthy ? "Port \(state.port)" : "Port \(state.port) (not listening)"
         }
@@ -337,6 +375,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         return value
     }
 
+    /// "0.4.8" → "v0.4.8"; keeps an already-prefixed version as-is.
+    private static func versionText(_ version: String) -> String {
+        version.hasPrefix("v") ? version : "v" + version
+    }
+
+    /// "proxy v0.4.8 (pin v0.4.8)" — the child's running version plus the
+    /// tag this app launches it with.
+    private static func versionRowTitle(runningVersion: String?, pin: String?) -> String {
+        guard let runningVersion else { return "proxy —" }
+        let pinText = pin.map { "pin \($0)" } ?? "unpinned"
+        return "proxy \(versionText(runningVersion)) (\(pinText))"
+    }
+
     private static func quotaText(_ quota: QuotaSnapshot?) -> String {
         guard let quota else { return "Quota n/a" }
         if let limit = quota.limit {
@@ -420,6 +471,28 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         } else {
             proxy.start()
         }
+        refresh()
+    }
+
+    @objc private func checkForUpdates() {
+        // Force a fresh check (bypasses the proxy's TTL cache) and re-fetch
+        // /state so its version/update piggyback converges immediately.
+        proxy.refreshVersion(force: true)
+        proxy.refreshState()
+        refresh()
+    }
+
+    @objc private func applyUpdate() {
+        let update = proxy.updateInfo
+        guard let latest = update?.latest, update?.available == true else { return }
+        let alert = NSAlert()
+        alert.messageText = "Update proxy to \(Self.versionText(latest))?"
+        alert.informativeText = "The proxy restarts."
+        alert.alertStyle = .informational
+        alert.addButton(withTitle: "Update")
+        alert.addButton(withTitle: "Cancel")
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+        proxy.applyUpdate(to: latest)
         refresh()
     }
 

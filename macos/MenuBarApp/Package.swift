@@ -10,6 +10,11 @@ let package = Package(
         .executableTarget(
             name: "OpenCodeGoMenuBar",
             path: "Sources/OpenCodeGoMenuBar"
+        ),
+        .testTarget(
+            name: "OpenCodeGoMenuBarTests",
+            dependencies: ["OpenCodeGoMenuBar"],
+            path: "Tests/OpenCodeGoMenuBarTests"
         )
     ]
 )

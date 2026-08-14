@@ -8,6 +8,11 @@ struct ServerState: Decodable, Equatable {
     let quota: QuotaSnapshot?
     let usage: UsageSummary
     let model: String
+    /// Update-support additions (0.4.7). Optional so a pre-0.4.5 proxy whose
+    /// /state omits these keys still decodes; the version row then falls
+    /// back to a separate GET /version.
+    let version: String?
+    let update: UpdateInfo?
 }
 
 struct QuotaSnapshot: Decodable, Equatable {
@@ -64,6 +69,35 @@ struct ZenUsage: Decodable, Equatable {
     let last7d: [Int]
 }
 
+/// Update availability as reported by the proxy (updates.py contract:
+/// version_payload()["update"] and build_state()["update"]). All fields
+/// optional so partial or pre-contract payloads still decode.
+struct UpdateInfo: Decodable, Equatable {
+    let available: Bool?
+    let latest: String?
+    let releaseUrl: String?
+    let checkedAt: String?
+    let error: String?
+
+    enum CodingKeys: String, CodingKey {
+        case available, latest, error
+        case releaseUrl = "release_url"
+        case checkedAt = "checked_at"
+    }
+}
+
+/// GET /version payload: {"version", "git_commit", "update": {...}}.
+struct VersionInfo: Decodable, Equatable {
+    let version: String
+    let gitCommit: String?
+    let update: UpdateInfo?
+
+    enum CodingKeys: String, CodingKey {
+        case version, update
+        case gitCommit = "git_commit"
+    }
+}
+
 enum StateFetcher {
     /// GET /state on the local proxy; completion(nil) on any failure so the
     /// menu degrades to "n/a" rows instead of stale numbers.
@@ -79,6 +113,33 @@ enum StateFetcher {
                 return
             }
             completion(try? JSONDecoder().decode(ServerState.self, from: data))
+        }.resume()
+    }
+}
+
+/// GET /version on the local proxy (update-support contract); nil on any
+/// failure so the menu keeps the last good version row. `force` hits
+/// ?force=1 so the proxy bypasses its update-check TTL cache.
+enum VersionFetcher {
+    static func fetch(port: Int, force: Bool, completion: @escaping (VersionInfo?) -> Void) {
+        var components = URLComponents(string: "http://127.0.0.1:\(port)/version")!
+        if force {
+            components.queryItems = [URLQueryItem(name: "force", value: "1")]
+        }
+        guard let url = components.url else {
+            completion(nil)
+            return
+        }
+        var request = URLRequest(url: url)
+        request.timeoutInterval = 1.5
+        URLSession.shared.dataTask(with: request) { data, response, _ in
+            guard let data,
+                  let response = response as? HTTPURLResponse,
+                  response.statusCode == 200 else {
+                completion(nil)
+                return
+            }
+            completion(try? JSONDecoder().decode(VersionInfo.self, from: data))
         }.resume()
     }
 }

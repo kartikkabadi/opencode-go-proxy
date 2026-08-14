@@ -17,6 +17,39 @@ struct CLIResult {
     var message: String?
 }
 
+/// Resolves the proxy install source. The compiled pin lives here so the
+/// Update flow and the menu share one format; UserDefaults["proxySource"]
+/// (written by the Update flow) overrides it per launch.
+enum ProxySourceResolver {
+    static let defaultsKey = "proxySource"
+
+    /// The pinned source baked into this build (bumped at release time).
+    static let compiledSource = "git+https://github.com/kartikkabadi/opencode-go-proxy@v0.4.0"
+
+    /// A defaults override wins over the compiled pin; an empty or missing
+    /// value falls back to `fallbackProxySource` (the compiled pin).
+    static func resolve(defaults: UserDefaults, fallbackProxySource: String) -> String {
+        if let override = defaults.object(forKey: defaultsKey) as? String, !override.isEmpty {
+            return override
+        }
+        return fallbackProxySource
+    }
+
+    /// Install source pinned to a release tag, e.g. "0.4.8" →
+    /// "git+https://github.com/kartikkabadi/opencode-go-proxy@v0.4.8".
+    static func source(pinning version: String) -> String {
+        let tag = version.hasPrefix("v") ? version : "v" + version
+        return "git+https://github.com/kartikkabadi/opencode-go-proxy@\(tag)"
+    }
+
+    /// The "vX.Y.Z" tag a source string points at, or nil when unpinned.
+    static func pinTag(from source: String) -> String? {
+        guard let at = source.lastIndex(of: "@") else { return nil }
+        let tag = String(source[source.index(after: at)...])
+        return tag.isEmpty ? nil : tag
+    }
+}
+
 final class ProxyController {
     var onStateChange: (() -> Void)?
 
@@ -24,6 +57,7 @@ final class ProxyController {
         didSet { onStateChange?() }
     }
     private(set) var serverState: ServerState?
+    private(set) var versionInfo: VersionInfo?
     private(set) var isCLIRunning = false
     private(set) var catalogCount: Int?
     private(set) var configEnabled: Bool?
@@ -33,10 +67,22 @@ final class ProxyController {
         URL(string: "http://127.0.0.1:\(state.port)/health")!
     }
 
-    private static let proxySource = "git+https://github.com/kartikkabadi/opencode-go-proxy@v0.4.0"
+    private static let proxySource = ProxySourceResolver.compiledSource
     private static let cliLogName = "opencode-go-proxy-cli.log"
     private static let cliLogTailLimit = 600
     private static let configMarker = "# BEGIN opencode-go-proxy-managed"
+
+    /// Install source resolved once per launch: the Update flow writes
+    /// UserDefaults["proxySource"], which overrides the pin compiled into
+    /// this build (resolve defaults first, compiled pin as the fallback).
+    private lazy var resolvedProxySource = ProxySourceResolver.resolve(defaults: UserDefaults.standard,
+                                                                      fallbackProxySource: Self.proxySource)
+
+    /// Pin the Update flow just applied; wins over resolvedProxySource so the
+    /// immediate child restart picks the new version without an app relaunch.
+    private var pendingProxySource: String?
+
+    private var effectiveProxySource: String { pendingProxySource ?? resolvedProxySource }
 
     private var logDir: URL {
         let base = FileManager.default.homeDirectoryForCurrentUser
@@ -91,7 +137,7 @@ final class ProxyController {
 
         let argv: [String] = [
             uvx,
-            "--from", Self.proxySource,
+            "--from", effectiveProxySource,
             "opencode-go-proxy",
             "--bind", "127.0.0.1",
             "--port", "\(state.port)",
@@ -109,6 +155,7 @@ final class ProxyController {
         monitorChild(pid)
         refreshHealth()
         refreshState()
+        refreshVersion(force: false)
         refreshCatalogCount()
     }
 
@@ -125,8 +172,56 @@ final class ProxyController {
         }
         state = ProxyState(isRunning: false, isStarting: false, isHealthy: false, port: state.port)
         serverState = nil
+        versionInfo = nil
         catalogCount = nil
     }
+
+    /// GET /version (best-effort, 1.5s timeout). `force` hits ?force=1 so the
+    /// proxy bypasses its update-check TTL cache (the "Check for Updates"
+    /// row). Failures keep the last good payload; stop() clears it.
+    func refreshVersion(force: Bool) {
+        let pid = childPID
+        guard pid > 0 else { return }
+        VersionFetcher.fetch(port: state.port, force: force) { [weak self] versionInfo in
+            DispatchQueue.main.async {
+                guard let self, self.childPID == pid, let versionInfo else { return }
+                if self.versionInfo != versionInfo {
+                    self.versionInfo = versionInfo
+                    self.onStateChange?()
+                }
+            }
+        }
+    }
+
+    /// Version the running child reports, from the /state piggyback first and
+    /// the /version fetch as fallback (pre-0.4.5 proxies); nil when unknown.
+    var runningVersion: String? { serverState?.version ?? versionInfo?.version }
+
+    /// Update availability, /state piggyback first, /version as fallback.
+    var updateInfo: UpdateInfo? { serverState?.update ?? versionInfo?.update }
+
+    /// Tag ("v0.4.8") the app launches the child with, or nil when unpinned.
+    var activePin: String? { ProxySourceResolver.pinTag(from: effectiveProxySource) }
+
+    /// Install `version` (e.g. "0.4.8"): persist the pinned source for the
+    /// next launch, swap the in-memory pin, then restart the child so the new
+    /// version serves immediately.
+    func applyUpdate(to version: String) {
+        let source = ProxySourceResolver.source(pinning: version)
+        UserDefaults.standard.set(source, forKey: ProxySourceResolver.defaultsKey)
+        pendingProxySource = source
+        if state.isRunning { stop() }
+        // The old child needs a moment to release the port after SIGTERM;
+        // wait for it before spawning the new version (single-port guard).
+        let deadline = Date().addingTimeInterval(Self.portFreeTimeout)
+        while portIsInUse() && Date() < deadline {
+            Thread.sleep(forTimeInterval: Self.portFreePollInterval)
+        }
+        start()
+    }
+
+    private static let portFreeTimeout: TimeInterval = 3
+    private static let portFreePollInterval: TimeInterval = 0.05
 
     /// Fetch the /state contract (quota card, usage bars, provider row). Only
     /// meaningful while the child process is alive; failures keep the last
@@ -320,7 +415,7 @@ final class ProxyController {
         }
         defer { close(logFD) }
 
-        let argv = [uvx, "--from", Self.proxySource, "opencode-go-proxy"] + arguments
+        let argv = [uvx, "--from", effectiveProxySource, "opencode-go-proxy"] + arguments
         let pid = spawnInGroup(argv: argv, stdoutFD: logFD, stderrFD: logFD,
                                env: childEnvironment(), cwd: stateDirectoryIfPresent())
         guard pid > 0 else {
