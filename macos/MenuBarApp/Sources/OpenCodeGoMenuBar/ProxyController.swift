@@ -24,7 +24,7 @@ enum ProxySourceResolver {
     static let defaultsKey = "proxySource"
 
     /// The pinned source baked into this build (bumped at release time).
-    static let compiledSource = "git+https://github.com/kartikkabadi/opencode-go-proxy@v0.4.0"
+    static let compiledSource = "git+https://github.com/kartikkabadi/opencode-go-proxy@v0.4.8"
 
     /// A defaults override wins over the compiled pin; an empty or missing
     /// value falls back to `fallbackProxySource` (the compiled pin).

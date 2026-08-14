@@ -4,7 +4,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// Build version of this menu bar app. The proxy auto-updates itself,
     /// but this binary is a manual rebuild; bumped at release time in this
     /// one place (shown as the version row's tooltip).
-    private static let appVersion = "menu bar v0.4.7"
+    private static let appVersion = "menu bar v0.4.8"
 
     private var statusItem: NSStatusItem!
     private var proxy = ProxyController()

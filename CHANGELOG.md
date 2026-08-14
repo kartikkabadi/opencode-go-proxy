@@ -1,5 +1,43 @@
 # Changelog
 
+## [0.4.8] - 2026-08-14
+
+### Added
+
+- `opencode-go-proxy update` command: checks the latest GitHub release
+  (`--json` for machines, exits 3 when an update exists), and `update --apply`
+  re-installs a `uv tool` install from the newest tag or prints the exact
+  pinned `uvx` one-liner otherwise. Never touches a running proxy.
+- Menu bar pin bumped to `@v0.4.8`; version strings across the package now
+  read 0.4.8.
+
+## [0.4.7] - 2026-08-14
+
+### Added
+
+- `GET /version` (and `/v1/version`): the running version, git commit, and an
+  update block checked against the latest GitHub release (24-hour TTL cache
+  under the state dir, `?force=1` bypasses it). `GET /state` gains `version`
+  and `update` fields; older clients are unaffected.
+
+## [0.4.6] - 2026-08-14
+
+### Added
+
+- `scripts/make-release.py`: one-command release (bump, changelog section,
+  commit, tag, push; `--dry-run` prints the plan). CHANGELOG anchor links,
+  PUBLISHING.md refreshed, README gains an Updating section covering the menu
+  bar, the `update` CLI, and manual/systemd installs.
+
+## [0.4.5] - 2026-08-14
+
+### Added
+
+- Menu bar update support: a Version row, an Update Available row with a
+  one-click apply (confirm → new pin saved → proxy restarts), Check for
+  Updates, and a UserDefaults pin override so proxy updates no longer require
+  rebuilding the menu bar app.
+
 ## [0.4.4] - 2026-08-14
 
 ### Fixed
@@ -355,3 +393,11 @@ Initial public release.
 [0.1.2]: https://github.com/kartikkabadi/opencode-go-proxy/releases/tag/v0.1.2
 [0.1.1]: https://github.com/kartikkabadi/opencode-go-proxy/releases/tag/v0.1.1
 [0.1.0]: https://github.com/kartikkabadi/opencode-go-proxy/releases/tag/v0.1.0
+[0.4.8]: https://github.com/kartikkabadi/opencode-go-proxy/releases/tag/v0.4.8
+[0.4.7]: https://github.com/kartikkabadi/opencode-go-proxy/releases/tag/v0.4.7
+[0.4.6]: https://github.com/kartikkabadi/opencode-go-proxy/releases/tag/v0.4.6
+[0.4.5]: https://github.com/kartikkabadi/opencode-go-proxy/releases/tag/v0.4.5
+[0.4.4]: https://github.com/kartikkabadi/opencode-go-proxy/releases/tag/v0.4.4
+[0.4.3]: https://github.com/kartikkabadi/opencode-go-proxy/releases/tag/v0.4.3
+[0.4.2]: https://github.com/kartikkabadi/opencode-go-proxy/releases/tag/v0.4.2
+[0.4.1]: https://github.com/kartikkabadi/opencode-go-proxy/releases/tag/v0.4.1
