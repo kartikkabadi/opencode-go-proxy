@@ -1442,8 +1442,10 @@ class _ZenStreamEngine:
                     note_real_input_tokens(self.model)
                 context_cap = model_context_window(self.model) or DEFAULT_ESTIMATE_CONTEXT_WINDOW
                 estimated = estimate_input_tokens(self.model, len(self.raw_payload), self.usage, context_window=context_cap)
+                # The client-visible outcome is response.error empty_completion,
+                # so the meter records 502 (a failed turn), never a success.
                 _meter_zen(
-                    self.model, self.started, 200,
+                    self.model, self.started, 502,
                     input_tokens=inp, output_tokens=outp, total_tokens=total,
                     estimated_input_tokens=estimated,
                     empty_completion=True, retries=self.retries or None,

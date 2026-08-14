@@ -379,3 +379,26 @@ class TestBackup:
         backups = _backup_names(directory, cfg_path)
         assert len(backups) == 1
         assert _read(os.path.join(directory, backups[-1])) == enabled_text
+
+    def test_backup_failure_raises_before_mutation(self, cfg_path, monkeypatch) -> None:
+        """A failed backup write must abort enable() before config.toml changes.
+
+        The backup lands via _atomic_write on a config.toml.bak-* path; when
+        that write fails, the error propagates before the main write, so the
+        config file stays byte-for-byte unchanged and no backup is left behind.
+        """
+        with open(cfg_path, "w", encoding="utf-8") as handle:
+            handle.write('model = "gpt-5.6-luna"\n')
+        before = _read(cfg_path)
+        real_replace = os.replace
+
+        def failing_replace(src: str, dst: str) -> None:
+            if ".bak-" in os.path.basename(str(dst)):
+                raise OSError("backup write failed")
+            real_replace(src, dst)
+
+        monkeypatch.setattr(os, "replace", failing_replace)
+        with pytest.raises(OSError, match="backup write failed"):
+            config_manager.enable()
+        assert _read(cfg_path) == before
+        assert _backup_names(os.path.dirname(cfg_path), cfg_path) == []

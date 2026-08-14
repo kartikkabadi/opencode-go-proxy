@@ -626,6 +626,30 @@ class TestStreamErrorHandling:
         assert records[0]["status"] == 502
         assert records[0]["streamAborted"] is True
 
+    def test_stream_empty_completion_metered_as_502(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        _fake_key(monkeypatch)
+        # Two empty 200s (the retry also empty) end as response.error
+        # empty_completion; the client-visible outcome is a failed turn, so
+        # the meter records 502 with the emptyCompletion marker, never 200.
+        lines = [
+            b'data: {"id":"1","choices":[{"index":0,"delta":{"role":"assistant","content":""}}]}\n',
+            b'data: {"id":"1","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}\n',
+            b'data: [DONE]\n',
+        ]
+        handler = _FakeHandler()
+        with mock.patch("urllib.request.urlopen", return_value=_UpstreamStream(lines)):
+            zen_upstream.handle_zen_responses_request(handler, zen_payload(), make_config(), "req")
+        assert handler.status == 200  # SSE head was committed
+        events = handler.events()
+        errors = [e for e in events if e.get("type") == "response.error"]
+        assert len(errors) == 1
+        assert errors[0]["error"]["code"] == "empty_completion"
+        assert not any(e.get("type") == "response.completed" for e in events)
+        records = _meter_records()
+        assert records and records[0]["provider"] == "zen"
+        assert records[0]["status"] == 502
+        assert records[0]["emptyCompletion"] is True
+
 
 class TestZenChatSurface:
     def test_stream_relay_to_zen_base(self, monkeypatch: pytest.MonkeyPatch) -> None:
