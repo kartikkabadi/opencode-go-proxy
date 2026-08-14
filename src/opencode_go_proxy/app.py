@@ -18,9 +18,9 @@ import time
 import traceback
 import uuid
 from http import HTTPStatus
-from urllib.parse import parse_qs, urlsplit
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
+from urllib.parse import parse_qs, urlsplit
 
 from . import __version__
 from .compaction import COMPACT_PATHS, handle_compaction, has_compaction_trigger
