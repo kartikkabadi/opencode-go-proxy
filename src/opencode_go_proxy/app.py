@@ -337,23 +337,19 @@ class ResponsesProxyHandler(BaseHTTPRequestHandler):
         self.wfile.write(raw)
 
 
-def _go_reject_zen_fallback(model: str, status: int | None, body: bytes | str | None) -> bool:
+def is_go_not_supported_rejection(model: str, status: int | None, body: bytes | str | None) -> bool:
     """True when the go gateway rejected a bare slug with its ModelError
-    "not supported" shape — the one rejection the proxy answers by re-dispatching
-    the identical request to the zen path.
+    "not supported" shape — the raw rejection, single-sourced here.
 
-    Fires only for bare slugs (no provider prefix) the zen catalog owns, only
-    on the gateway's own not-supported rejection (401/403), and only when the
-    body parses to ``{"error": {"type": "ModelError", "message": "... not
-    supported ..."}}`` (the shape seen live; whitespace-tolerant). Any other
-    go error is surfaced as-is: the go-wins contract for bare collisions
-    stands for ids the go gateway actually serves.
+    Fires only for bare slugs (no provider prefix), only on the gateway's own
+    not-supported rejection (401/403), and only when the body parses to
+    ``{"error": {"type": "ModelError", "message": "... not supported ..."}}``
+    (the shape seen live; whitespace-tolerant). Catalog membership is left to
+    callers: the zen fallback and the hide tracker each apply their own gate.
     """
     if not model or model.startswith((OPENCODE_GO_PREFIX, ZEN_PREFIX)):
         return False
     if status not in (401, 403):
-        return False
-    if model not in zen_model_ids():
         return False
     if not body:
         return False
@@ -376,6 +372,63 @@ def _go_reject_zen_fallback(model: str, status: int | None, body: bytes | str | 
     if not isinstance(message, str):
         return False
     return "not supported" in " ".join(message.split()).lower()
+
+
+def _go_reject_zen_fallback(model: str, status: int | None, body: bytes | str | None) -> bool:
+    """True when the go gateway rejected a bare slug with its ModelError
+    "not supported" shape — the one rejection the proxy answers by re-dispatching
+    the identical request to the zen path.
+
+    The raw rejection (is_go_not_supported_rejection) plus a zen-owned bare
+    slug: the go-wins contract for bare collisions stands for ids the go
+    gateway actually serves, so only zen-owned ids fall back.
+    """
+    return is_go_not_supported_rejection(model, status, body) and model in zen_model_ids()
+
+
+# Proxy-lifetime strikes for bare go slugs the gateway rejects with its
+# ModelError "not supported" envelope. Two rejections hide the slug in the
+# picker (model-picker.json + one merged re-render); a successful go turn
+# clears the strike and restores a slug this process auto-hid.
+_unsupported_strikes: dict[str, int] = {}
+_auto_hidden: set[str] = set()
+
+
+def record_go_unsupported(slug: str) -> None:
+    """Record one go gateway "not supported" rejection for a bare go slug.
+
+    Only bare slugs the zen catalog does not own and the opencode-go catalog
+    advertises are counted: prefixed slugs route by explicit choice, zen-owned
+    ids are served through the zen fallback, and native/junk slugs are never
+    go-catalog entries — none of those may be hidden. On the second rejection
+    the slug is hidden in the picker and the merged catalog re-rendered once.
+    """
+    if not slug or slug.startswith((OPENCODE_GO_PREFIX, ZEN_PREFIX)):
+        return
+    if slug in zen_model_ids() or slug not in known_models():
+        return
+    strikes = _unsupported_strikes.get(slug, 0) + 1
+    _unsupported_strikes[slug] = strikes
+    if strikes >= 2:
+        from opencode_go_proxy import catalog as _catalog
+
+        if _catalog.hide_model_from_picker(slug):
+            _auto_hidden.add(slug)
+        trace("catalog.hide_unsupported", slug=slug, strikes=strikes)
+
+
+def clear_go_unsupported(slug: str) -> None:
+    """A successful go turn proves the slug is served: clear its strike and
+    restore the slug when this process auto-hid it (model-picker.json write +
+    one merged re-render). Manual hides are left untouched."""
+    if not slug:
+        return
+    _unsupported_strikes.pop(slug, None)
+    if slug in _auto_hidden:
+        from opencode_go_proxy import catalog as _catalog
+
+        _auto_hidden.discard(slug)
+        _catalog.unhide_model_from_picker(slug)
 
 
 def handle_responses_request(payload: Json, config: ProxyConfig, request_id: str) -> Json:
@@ -438,11 +491,17 @@ def handle_responses_request(payload: Json, config: ProxyConfig, request_id: str
                 trace("fallback.go_reject_zen", request_id=request_id, model=session_model,
                       status=status, path="responses")
                 return call_zen_responses(original_payload, config, request_id)
+            elif is_go_not_supported_rejection(session_model, status, exc.body):
+                # The go catalog advertises this bare slug but the gateway does
+                # not serve it and zen does not own it: count the rejection so
+                # the picker self-cleans after two strikes.
+                record_go_unsupported(session_model)
             record_usage_event(
                 model=request_model, status=int(exc.status), duration_ms=int((time.time() - started) * 1000),
                 retries=exc.retries or None,
             )
             raise
+    clear_go_unsupported(request_model)
     record_cache(config.cache_tracker, chat_payload.get("model"), chat.get("usage"))
     context_cap = model_context_window(request_model) or DEFAULT_ESTIMATE_CONTEXT_WINDOW
     prompt_bytes = len(json.dumps(chat_payload, separators=(",", ":")).encode("utf-8"))
@@ -497,6 +556,15 @@ def handle_chat_completions_request(handler: ResponsesProxyHandler, payload: Jso
         zen_payload["model"] = f"{ZEN_PREFIX}{model}"
         handle_zen_chat_request(handler, zen_payload, config, request_id)
         return
+    elif is_go_not_supported_rejection(model, status, body):
+        # The go catalog advertises this bare slug but the gateway does not
+        # serve it and zen does not own it: count the rejection so the picker
+        # self-cleans after two strikes.
+        record_go_unsupported(model)
+    if 200 <= status < 300:
+        # A 2xx proves the go gateway serves the slug: clear its strikes and
+        # restore it if this process auto-hid it.
+        clear_go_unsupported(model)
     record_usage_event(
         model=payload.get("model") or DEFAULT_MODEL, status=status,
         duration_ms=int((time.time() - started) * 1000), retries=retries or None,

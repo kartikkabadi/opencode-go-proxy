@@ -411,7 +411,11 @@ def handle_streaming_request(payload: Json, config: ProxyConfig, request_id: str
                         trace("upstream.start", request_id=request_id, url=url, bytes=len(raw_payload),
                               stream=True, fallback=True)
                         return "fallback"
-                    from opencode_go_proxy.app import _go_reject_zen_fallback
+                    from opencode_go_proxy.app import (
+                        _go_reject_zen_fallback,
+                        is_go_not_supported_rejection,
+                        record_go_unsupported,
+                    )
 
                     if not relayed_event and _go_reject_zen_fallback(session_model, exc.code, fail.body):
                         # The go gateway advertises this bare slug but does not
@@ -428,6 +432,12 @@ def handle_streaming_request(payload: Json, config: ProxyConfig, request_id: str
                         ka_thread.join(timeout=interval)
                         _zen_fallback_stream(original_payload, config, request_id, wfile)
                         return "zen"
+                    elif not relayed_event and is_go_not_supported_rejection(session_model, exc.code, fail.body):
+                        # The go catalog advertises this bare slug but the
+                        # gateway does not serve it and zen does not own it:
+                        # count the rejection so the picker self-cleans after
+                        # two strikes.
+                        record_go_unsupported(session_model)
                     if exc.code == 429:
                         retry_after = exc.headers.get("retry-after", "5")
                         send_error(f"rate limited (retry after {retry_after}s)")
@@ -446,6 +456,12 @@ def handle_streaming_request(payload: Json, config: ProxyConfig, request_id: str
                 record_usage_event(model=model, status=502, duration_ms=int((time.time() - started) * 1000),
                                    retries=total_retries + fallback_attempts)
                 return "error"
+
+            from opencode_go_proxy.app import clear_go_unsupported
+
+            # The go upstream opened: it serves this slug, so a rejection
+            # strike (and any auto-hide) is cleared.
+            clear_go_unsupported(request_model)
 
             if not created_emitted:
                 created_emitted = True
@@ -701,7 +717,11 @@ def handle_chat_stream_passthrough(payload: Json, config: ProxyConfig, request_i
         retries = fail.attempts
         exc = fail.exc
         if isinstance(exc, urllib.error.HTTPError):
-            from opencode_go_proxy.app import _go_reject_zen_fallback
+            from opencode_go_proxy.app import (
+                _go_reject_zen_fallback,
+                is_go_not_supported_rejection,
+                record_go_unsupported,
+            )
             from opencode_go_proxy.zen_catalog import ZEN_PREFIX
             from opencode_go_proxy.zen_upstream import handle_zen_chat_request
 
@@ -720,6 +740,11 @@ def handle_chat_stream_passthrough(payload: Json, config: ProxyConfig, request_i
                 zen_payload["model"] = f"{ZEN_PREFIX}{model}"
                 handle_zen_chat_request(handler, zen_payload, config, request_id)
                 return
+            elif is_go_not_supported_rejection(model, exc.code, fail.body):
+                # The go catalog advertises this bare slug but the gateway
+                # does not serve it and zen does not own it: count the
+                # rejection so the picker self-cleans after two strikes.
+                record_go_unsupported(model)
             # Nothing was committed yet, so the client sees the upstream's own
             # status and error body, not a proxy envelope.
             body = fail.body
@@ -746,6 +771,12 @@ def handle_chat_stream_passthrough(payload: Json, config: ProxyConfig, request_i
         if isinstance(exc, TimeoutError):
             raise ProxyError(HTTPStatus.GATEWAY_TIMEOUT, "upstream timeout", retries=retries) from exc
         raise ProxyError(HTTPStatus.BAD_GATEWAY, f"upstream network error: {getattr(exc, 'reason', exc)}", retries=retries) from exc
+
+    from opencode_go_proxy.app import clear_go_unsupported
+
+    # The go upstream opened: it serves this slug, so a rejection strike (and
+    # any auto-hide) is cleared.
+    clear_go_unsupported(payload.get("model") or DEFAULT_MODEL)
 
     handler.send_response(HTTPStatus.OK)
     handler.send_header("content-type", "text/event-stream")

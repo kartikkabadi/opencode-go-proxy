@@ -559,6 +559,50 @@ def apply_hidden_models(models: list[dict], hidden: set[str]) -> list[dict]:
     ]
 
 
+def write_hidden_models(hidden: set[str], path: str | None = None) -> None:
+    """Persist hidden-model slugs in the codex-router model-picker.json shape.
+
+    The shape read_hidden_models() reads: {"version": 1, "hidden": [...]}.
+    Idempotent: writing an already-persisted set rewrites an identical file.
+    """
+    if path is None:
+        path = model_picker_path()
+    _write_json(path, {"version": 1, "hidden": sorted({str(slug) for slug in hidden})})
+
+
+def hide_model_from_picker(slug: str) -> bool:
+    """Hide one slug in the picker: persist model-picker.json and re-render.
+
+    Hidden models are filtered at render time (apply_hidden_models) and the
+    picker reads merged-models.json, so the merged catalog is re-rendered once
+    to make the hide reach the picker immediately. Returns True when the slug
+    was newly hidden; False when it was already hidden (idempotent no-op).
+    """
+    hidden = read_hidden_models()
+    if slug in hidden:
+        return False
+    hidden.add(slug)
+    write_hidden_models(hidden)
+    render_merged_catalog()
+    return True
+
+
+def unhide_model_from_picker(slug: str) -> bool:
+    """Restore one slug in the picker: drop it from model-picker.json and re-render.
+
+    Returns True when the slug was hidden and is now shown; False when it was
+    not hidden (no-op). The merged catalog is re-rendered once so the picker
+    sees the restored model immediately.
+    """
+    hidden = read_hidden_models()
+    if slug not in hidden:
+        return False
+    hidden.discard(slug)
+    write_hidden_models(hidden)
+    render_merged_catalog()
+    return True
+
+
 def _format_token_count(tokens: int) -> str:
     """Compact token formatting: "1M", "400K", "64K", matching codex-router."""
     if tokens >= 995_000:
@@ -1052,6 +1096,7 @@ __all__ = [
     "auto_announcement_copy",
     "default_catalog_path",
     "discover_models",
+    "hide_model_from_picker",
     "load_compact",
     "load_known_slugs",
     "load_runtime_compact",
@@ -1073,6 +1118,8 @@ __all__ = [
     "seed_compact_path",
     "state_catalog_path",
     "state_compact_path",
+    "unhide_model_from_picker",
     "write_announced_at",
     "write_catalog",
+    "write_hidden_models",
 ]
