@@ -436,8 +436,12 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def _refresh_catalog_in_background() -> None:
-    """Run the TTL-gated runtime catalog refresh; failures are logged, never fatal."""
+CATALOG_REFRESH_INTERVAL_HOURS = 6
+
+
+def _refresh_catalog_once(reason: str) -> None:
+    """Run one TTL-gated runtime catalog refresh; failures are logged, never fatal."""
+    trace("catalog.refresh.start", reason=reason)
     try:
         from opencode_go_proxy import catalog as _catalog
         from opencode_go_proxy.zen_catalog import capture_zen_models
@@ -449,6 +453,48 @@ def _refresh_catalog_in_background() -> None:
         _catalog.render_merged_catalog()
     except Exception as exc:  # noqa: BLE001 - background refresh is best-effort
         trace("catalog.refresh.skipped", error=str(exc))
+
+
+def _refresh_catalog_in_background() -> None:
+    """Run the startup catalog refresh in a daemon thread; failures are logged, never fatal."""
+    _refresh_catalog_once(reason="startup")
+
+
+def _catalog_refresh_enabled() -> bool:
+    from opencode_go_proxy import catalog as _catalog
+
+    return os.environ.get(_catalog.CATALOG_REFRESH_ENV) != "0"
+
+
+def _refresh_catalog_daemon(interval_hours: float = CATALOG_REFRESH_INTERVAL_HOURS) -> None:
+    """Re-run the catalog refresh on an interval until the process exits.
+
+    The refresh is TTL-gated and best-effort, so each tick is cheap: a fresh
+    compact skips discovery entirely, and a stale one issues a conditional GET
+    against models.dev. The thread is daemon=True, so it dies with the
+    process; when catalog refresh is disabled via OPENCODE_GO_CATALOG_REFRESH
+    the loop stays quiet.
+    """
+    while True:
+        time.sleep(interval_hours * 3600)
+        if not _catalog_refresh_enabled():
+            continue
+        trace("catalog.refresh.tick", interval_hours=interval_hours)
+        _refresh_catalog_once(reason="timer")
+
+
+def _start_catalog_refresh() -> None:
+    """Start the startup refresh plus the interval timer, both daemon threads.
+
+    The startup refresh always runs (refresh_catalog itself self-gates on the
+    env); the timer only when catalog refresh is enabled. daemon=True lets both
+    die with the process.
+    """
+    threading.Thread(target=_refresh_catalog_in_background, daemon=True, name="catalog-refresh").start()
+    if _catalog_refresh_enabled():
+        threading.Thread(
+            target=_refresh_catalog_daemon, daemon=True, name="catalog-refresh-timer"
+        ).start()
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -532,8 +578,9 @@ def main(argv: list[str] | None = None) -> None:
     except Exception as exc:  # noqa: BLE001 - startup catalog render is best-effort
         trace("catalog.refresh.skipped", error=str(exc))
     # The full refresh may fetch models.dev (up to a 10s timeout); run it in
-    # the background so startup never blocks on the network.
-    threading.Thread(target=_refresh_catalog_in_background, daemon=True, name="catalog-refresh").start()
+    # the background so startup never blocks on the network, and keep a
+    # low-frequency timer re-running it (both threads daemon=True).
+    _start_catalog_refresh()
     if args.timeout_sec <= 0:
         sys.stderr.write(f"error: --timeout-sec must be positive, got {args.timeout_sec}\n")
         sys.exit(2)

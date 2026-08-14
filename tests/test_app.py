@@ -266,5 +266,78 @@ class CaptionTimeoutTests(unittest.TestCase):
             self.assertEqual(_caption_timeout_sec(), 1.0)
 
 
+class CatalogRefreshTimerTests(unittest.TestCase):
+    """The background catalog refresh must also run on an interval; the timer
+    thread must be daemon (dies with the process) and quiet when refresh is
+    disabled via env. Asserted via monkeypatched Thread/sleep, never real
+    sleeps."""
+
+    def test_start_catalog_refresh_threads_are_daemon(self) -> None:
+        from opencode_go_proxy import app as proxy_app
+
+        with mock.patch.object(proxy_app.threading, "Thread") as thread_cls, mock.patch.dict(
+            os.environ, {}, clear=False
+        ):
+            os.environ.pop("OPENCODE_GO_CATALOG_REFRESH", None)
+            thread_cls.return_value = mock.Mock()
+            proxy_app._start_catalog_refresh()
+
+        self.assertTrue(all(call.kwargs.get("daemon") is True for call in thread_cls.call_args_list))
+        names = [call.kwargs["name"] for call in thread_cls.call_args_list]
+        self.assertIn("catalog-refresh", names)
+        self.assertIn("catalog-refresh-timer", names)
+
+    def test_start_catalog_refresh_skips_timer_when_disabled(self) -> None:
+        from opencode_go_proxy import app as proxy_app
+
+        with mock.patch.object(proxy_app.threading, "Thread") as thread_cls, mock.patch.dict(
+            os.environ, {"OPENCODE_GO_CATALOG_REFRESH": "0"}, clear=False
+        ):
+            thread_cls.return_value = mock.Mock()
+            proxy_app._start_catalog_refresh()
+
+        targets = [call.kwargs["target"] for call in thread_cls.call_args_list]
+        self.assertIn(proxy_app._refresh_catalog_in_background, targets)
+        self.assertNotIn(proxy_app._refresh_catalog_daemon, targets)
+
+    def test_refresh_daemon_loop_ticks_on_interval(self) -> None:
+        from opencode_go_proxy import app as proxy_app
+
+        sleeps: list[float] = []
+
+        def fake_sleep(seconds: float) -> None:
+            sleeps.append(seconds)
+            if len(sleeps) >= 2:
+                raise KeyboardInterrupt
+
+        with mock.patch.object(proxy_app.time, "sleep", side_effect=fake_sleep), mock.patch.object(
+            proxy_app, "_refresh_catalog_once"
+        ) as once, mock.patch.object(proxy_app, "trace") as traced, mock.patch.dict(
+            os.environ, {}, clear=False
+        ):
+            os.environ.pop("OPENCODE_GO_CATALOG_REFRESH", None)
+            with self.assertRaises(KeyboardInterrupt):
+                proxy_app._refresh_catalog_daemon(interval_hours=6)
+
+        # Each tick sleeps the full interval before refreshing; the second
+        # sleep raises, so exactly one refresh ran.
+        self.assertEqual(sleeps, [6 * 3600, 6 * 3600])
+        self.assertEqual(once.call_count, 1)
+        ticks = [c for c in traced.call_args_list if c.args[0] == "catalog.refresh.tick"]
+        self.assertEqual(len(ticks), 1)
+
+    def test_refresh_daemon_stays_quiet_when_disabled(self) -> None:
+        from opencode_go_proxy import app as proxy_app
+
+        with mock.patch.dict(
+            os.environ, {"OPENCODE_GO_CATALOG_REFRESH": "0"}, clear=False
+        ), mock.patch.object(proxy_app.time, "sleep", side_effect=KeyboardInterrupt), mock.patch.object(
+            proxy_app, "_refresh_catalog_once"
+        ) as once, self.assertRaises(KeyboardInterrupt):
+            proxy_app._refresh_catalog_daemon()
+
+        once.assert_not_called()
+
+
 if __name__ == "__main__":
     unittest.main()

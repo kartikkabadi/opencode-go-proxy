@@ -1,4 +1,5 @@
 import json
+import os
 import tempfile
 import unittest
 import urllib.error
@@ -8,18 +9,21 @@ from unittest import mock
 
 from opencode_go_proxy.catalog import (
     CatalogDiscoveryError,
+    CatalogNotModified,
     _model_from_discovery,
     discover_models,
     load_known_slugs,
     merge_models,
+    merged_model_slugs,
     model_messages,
     render_full_catalog,
 )
 
 
 class FakeResponse:
-    def __init__(self, payload: dict) -> None:
+    def __init__(self, payload: dict, headers: dict | None = None) -> None:
         self._payload = payload
+        self.headers = headers or {}
 
     def __enter__(self) -> Self:
         return self
@@ -29,6 +33,14 @@ class FakeResponse:
 
     def read(self) -> bytes:
         return json.dumps(self._payload).encode()
+
+
+def _request_header(request, name: str) -> str | None:
+    """Case-insensitive header lookup; urllib capitalizes header keys."""
+    return next(
+        (value for key, value in request.header_items() if key.lower() == name.lower()),
+        None,
+    )
 
 
 class DiscoverModelsTests(unittest.TestCase):
@@ -55,10 +67,11 @@ class DiscoverModelsTests(unittest.TestCase):
         def capture(request, *args, **kwargs):
             seen["url"] = request.full_url
             seen["ua"] = request.headers.get("User-agent")
-            return FakeResponse(payload)
+            seen["if_none_match"] = _request_header(request, "If-None-Match")
+            return FakeResponse(payload, headers={"ETag": 'W/"models-dev-v42"'})
 
         with mock.patch("opencode_go_proxy.catalog.urllib.request.urlopen", side_effect=capture):
-            models = discover_models()
+            models, etag = discover_models()
 
         self.assertEqual([m["id"] for m in models], ["gpt-5.5", "deepseek-v4-flash"])
         self.assertNotIn("some-model", {m["id"] for m in models})
@@ -66,6 +79,25 @@ class DiscoverModelsTests(unittest.TestCase):
         # fetch must carry an identifying UA.
         self.assertEqual(seen["url"], "https://models.dev/api.json")
         self.assertTrue(seen["ua"].startswith("opencode-go-proxy/"))
+        # No stored etag on a first fetch: no conditional header is sent, and
+        # the response ETag flows back for the caller to store.
+        self.assertIsNone(seen["if_none_match"])
+        self.assertEqual(etag, 'W/"models-dev-v42"')
+
+    def test_discover_models_sends_if_none_match_and_raises_on_304(self) -> None:
+        seen: dict = {}
+
+        def capture(request, *args, **kwargs):
+            seen["if_none_match"] = _request_header(request, "If-None-Match")
+            raise urllib.error.HTTPError(request.full_url, 304, "Not Modified", {}, None)
+
+        with mock.patch(
+            "opencode_go_proxy.catalog.urllib.request.urlopen", side_effect=capture
+        ), self.assertRaises(CatalogNotModified) as ctx:
+            discover_models(etag='W/"abc"')
+
+        self.assertEqual(seen["if_none_match"], 'W/"abc"')
+        self.assertEqual(ctx.exception.etag, 'W/"abc"')
 
     def test_discover_models_raises_on_urlopen_failure(self) -> None:
         with mock.patch(
@@ -99,6 +131,52 @@ class MergeModelsTests(unittest.TestCase):
 
         self.assertEqual([m["id"] for m in new_models], ["brand-new"])
         self.assertEqual(removed, ["old-known"])
+
+
+class MergedModelSlugsTests(unittest.TestCase):
+    """The menu bar polls /v1/models every 3s; the mtime memo must make that
+    one stat per poll and re-read only when the merged file actually changes."""
+
+    def _write_merged(self, path: str, slugs: list[str]) -> None:
+        with open(path, "w") as f:
+            json.dump({"etag": "x", "models": [{"slug": s} for s in slugs]}, f)
+
+    def test_memo_serves_cache_and_rereads_on_mtime_change(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "merged-models.json")
+            with mock.patch("opencode_go_proxy.catalog.merged_models_path", return_value=path):
+                # Missing file: empty result, cached under mtime None.
+                self.assertEqual(merged_model_slugs(), [])
+                # A new file has a new mtime: re-read.
+                self._write_merged(path, ["a", "b"])
+                self.assertEqual(merged_model_slugs(), ["a", "b"])
+                # Same content rewritten at the SAME mtime: served from the
+                # cache (no re-read), so the poll stays a single stat.
+                st = os.stat(path)
+                self._write_merged(path, ["a", "b", "c"])
+                os.utime(path, ns=(st.st_atime_ns, st.st_mtime_ns))
+                self.assertEqual(merged_model_slugs(), ["a", "b"])
+                # Touching the mtime invalidates the memo: re-read.
+                os.utime(path, ns=(st.st_atime_ns, st.st_mtime_ns + 1))
+                self.assertEqual(merged_model_slugs(), ["a", "b", "c"])
+                # Removing the file flips mtime back to None: re-read to empty.
+                os.unlink(path)
+                self.assertEqual(merged_model_slugs(), [])
+
+    def test_memo_keys_on_path(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            first = os.path.join(tmp, "one.json")
+            second = os.path.join(tmp, "two.json")
+            self._write_merged(first, ["a"])
+            self._write_merged(second, ["z"])
+            with mock.patch("opencode_go_proxy.catalog.merged_models_path", return_value=first):
+                self.assertEqual(merged_model_slugs(), ["a"])
+            # A different merged file is a different cache slot.
+            with mock.patch("opencode_go_proxy.catalog.merged_models_path", return_value=second):
+                self.assertEqual(merged_model_slugs(), ["z"])
+            # Back to the first file: served from its slot without re-reading.
+            with mock.patch("opencode_go_proxy.catalog.merged_models_path", return_value=first):
+                self.assertEqual(merged_model_slugs(), ["a"])
 
 
 class LoadKnownSlugsTests(unittest.TestCase):
