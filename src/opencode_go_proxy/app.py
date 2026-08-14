@@ -204,6 +204,11 @@ class ResponsesProxyHandler(BaseHTTPRequestHandler):
             config = self._config()
             self._send_json(build_state(port=config.port, upstream=config.chat_base_url))
             return
+        if self.path in {"/version", "/v1/version"}:
+            from opencode_go_proxy import updates
+
+            self._send_json(updates.version_payload())
+            return
         if self.path in {"/cache", "/v1/cache", "/metrics", "/v1/metrics"}:
             config = self._config()
             self._send_json(config.cache_tracker.snapshot())
@@ -720,6 +725,10 @@ def main(argv: list[str] | None = None) -> None:
         print(f"runtime catalog refreshed: {len(rendered.get('models', []))} models")
         catalog.render_merged_catalog()
         sys.exit(0)
+    if args_list and args_list[0] == "update":
+        from . import ops
+
+        sys.exit(ops.update_cmd(args_list[1:]))
     args = build_parser().parse_args(args_list)
     try:
         from opencode_go_proxy import catalog as _catalog

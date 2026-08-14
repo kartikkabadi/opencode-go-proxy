@@ -13,9 +13,11 @@ from __future__ import annotations
 import datetime
 from typing import Any
 
+from . import __version__
 from .meter import usage_summary
 from .protocol import DEFAULT_MODEL
 from .quota import read_quota_state
+from .updates import version_payload
 from .usage_poller import poll_go_usage
 
 Json = dict[str, Any]
@@ -100,12 +102,24 @@ def build_state(port: int, upstream: str, now: datetime.datetime | None = None) 
 
     ``usage`` keeps the legacy all-provider keys (todayTurns, todayTokens,
     last7d) and adds the Go plan slot (null when the poller cannot fetch it),
-    the fixed Go dollar budgets, and the zen-only rollup.
+    the fixed Go dollar budgets, and the zen-only rollup. ``version`` and
+    ``update`` come from the daily-TTL GitHub release check; the check never
+    fails the endpoint.
     """
     usage = usage_summary(now)
     model = usage.get("model")
     if not isinstance(model, str) or not model:
         model = DEFAULT_MODEL
+    try:
+        update = version_payload()["update"]
+    except Exception as exc:  # noqa: BLE001 - /state must always render its shape
+        update = {
+            "available": False,
+            "checked_at": None,
+            "error": f"update check failed: {exc}",
+            "latest": None,
+            "release_url": None,
+        }
     return {
         "status": "ok",
         "port": int(port),
@@ -120,4 +134,6 @@ def build_state(port: int, upstream: str, now: datetime.datetime | None = None) 
             "zen": _zen_rollup(now),
         },
         "model": model,
+        "version": __version__,
+        "update": update,
     }

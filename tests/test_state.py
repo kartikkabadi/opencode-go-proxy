@@ -23,8 +23,12 @@ NOW = datetime.datetime(2026, 8, 11, 10, 0, tzinfo=TZ)
 
 @pytest.fixture(autouse=True)
 def no_network_usage_poll(monkeypatch) -> None:
-    """/state must never hit the live usage endpoint or keychain in tests."""
+    """/state must never hit the live usage endpoint, keychain, or GitHub."""
     monkeypatch.setattr("opencode_go_proxy.state.poll_go_usage", lambda _config=None: None)
+    monkeypatch.setattr(
+        "opencode_go_proxy.updates._fetch_latest_release",
+        lambda _timeout: {"tag_name": "v0.4.0", "html_url": None},
+    )
 
 
 def record_at(dt_utc: datetime.datetime, **kwargs) -> None:
@@ -162,6 +166,36 @@ class TestBuildState:
         write_quota_state({"openai": {"provider": "openai", "sampledAt": "2026-08-11T00:00:00Z"}})
         assert build_state(port=8787, upstream="u", now=NOW)["quota"] is None
 
+    def test_version_and_update_keys_present(self) -> None:
+        from opencode_go_proxy import __version__
+
+        state = build_state(port=8787, upstream="u", now=NOW)
+        assert state["version"] == __version__
+        assert set(state["update"]) == {"available", "checked_at", "error", "latest", "release_url"}
+        assert state["update"]["latest"] == "0.4.0"
+        assert state["update"]["available"] is False
+        assert state["update"]["error"] is None
+
+    def test_update_block_served_from_cache(self) -> None:
+        # A fresh cached check wins over the network path, so the menu bar
+        # gets the last good answer even when the fetch is unreachable.
+        import os
+
+        from opencode_go_proxy import updates
+        from opencode_go_proxy.meter import state_dir
+
+        os.makedirs(state_dir(), exist_ok=True)
+        with open(updates._cache_path(), "w", encoding="utf-8") as handle:
+            json.dump({
+                "checked_at": "2026-08-14T00:00:00Z",
+                "latest": "0.4.4",
+                "release_url": "https://github.com/kartikkabadi/opencode-go-proxy/releases/tag/v0.4.4",
+                "error": None,
+            }, handle)
+        update = build_state(port=8787, upstream="u", now=NOW)["update"]
+        assert update["latest"] == "0.4.4"
+        assert update["available"] is True
+
 
 class TestUsageKey:
     GO: ClassVar[dict[str, object]] = {
@@ -251,7 +285,7 @@ class TestStateEndpoint:
     def test_state_returns_contract_shape(self, server) -> None:
         status, state = get(server, "/state")
         assert status == 200
-        assert set(state) == {"status", "port", "upstream", "quota", "usage", "model"}
+        assert set(state) == {"status", "port", "upstream", "quota", "usage", "model", "version", "update"}
         assert state["status"] == "ok"
         assert state["port"] == server
         assert state["upstream"] == "https://up.test/v1"
@@ -260,6 +294,7 @@ class TestStateEndpoint:
         assert set(state["usage"]) == {"todayTurns", "todayTokens", "last7d", "go", "goLimits", "zen"}
         assert state["usage"]["go"] is None
         assert state["usage"]["zen"]["last7d"] == [0, 0, 0, 0, 0, 0, 0]
+        assert set(state["update"]) == {"available", "checked_at", "error", "latest", "release_url"}
 
     def test_state_alias_path(self, server) -> None:
         status, _state = get(server, "/v1/state")
