@@ -305,6 +305,58 @@ class ZenMergedCatalogTests(unittest.TestCase):
         for key in catalog.CANONICAL_MODEL_KEYS:
             self.assertIn(key, record)
 
+    def test_zen_display_name_suffixed_when_go_record_shares_bare_id(self) -> None:
+        _seed_zen_cache(ZEN_PAYLOAD["data"])
+        merged = catalog.render_merged_catalog()
+
+        record = next(m for m in merged["models"] if m["slug"] == "zen/deepseek-v4-flash")
+        self.assertEqual(record["display_name"], "deepseek-v4-flash (Zen)")
+
+    def test_zen_display_name_suffixed_when_go_record_shares_display_name(self) -> None:
+        _seed_zen_cache(ZEN_PAYLOAD["data"])
+        compact = {
+            "fetched_at": "2026-08-14T00:00:00Z",
+            "etag": "",
+            "client_version": "0.147.0",
+            "shared_instructions": "",
+            "models": [{"slug": "some-go-model", "display_name": "claude-sonnet-4-5"}],
+        }
+        with open(catalog.state_compact_path(), "w") as handle:
+            json.dump(compact, handle)
+
+        merged = catalog.render_merged_catalog()
+
+        record = next(m for m in merged["models"] if m["slug"] == "zen/claude-sonnet-4-5")
+        self.assertEqual(record["display_name"], "claude-sonnet-4-5 (Zen)")
+
+    def test_zen_only_record_keeps_plain_display_name(self) -> None:
+        # claude-sonnet-4-5 has no opencode-go counterpart in the seed
+        # catalog, so its name stays unambiguous.
+        _seed_zen_cache(ZEN_PAYLOAD["data"])
+        merged = catalog.render_merged_catalog()
+
+        record = next(m for m in merged["models"] if m["slug"] == "zen/claude-sonnet-4-5")
+        self.assertEqual(record["display_name"], "claude-sonnet-4-5")
+
+    def test_disambiguation_leaves_slug_keys_unchanged(self) -> None:
+        _seed_zen_cache(ZEN_PAYLOAD["data"])
+        merged = catalog.render_merged_catalog()
+
+        zen_slugs = {
+            str(m["slug"]) for m in merged["models"] if str(m["slug"]).startswith("zen/")
+        }
+        self.assertEqual(
+            zen_slugs,
+            {
+                "zen/claude-sonnet-4-5",
+                "zen/deepseek-v4-flash",
+                "zen/gemini-3-pro",
+                "zen/gpt-5.5",
+                "zen/grok-4.5",
+                "zen/qwen3-coder",
+            },
+        )
+
     def test_merged_catalog_without_zen_capture_has_no_zen_records(self) -> None:
         merged = catalog.render_merged_catalog()
         self.assertFalse(any(str(m["slug"]).startswith("zen/") for m in merged["models"]))

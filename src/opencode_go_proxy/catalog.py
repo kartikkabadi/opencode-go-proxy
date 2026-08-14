@@ -862,7 +862,7 @@ def _full_native_record(entry: Json) -> Json:
     return full
 
 
-def _zen_merged_records() -> list[Json]:
+def _zen_merged_records(go_records: list[Json] | None = None) -> list[Json]:
     """Full-shape records for captured zen models, slug-prefixed zen/<id>.
 
     Built straight from the canonical defaults like _full_native_record, so
@@ -870,23 +870,37 @@ def _zen_merged_records() -> list[Json]:
     "family" key on the state record (not part of the canonical shape; stored
     for future display), and availability_nux stays None (the object form the
     app schema allows) so zen models never announce.
+
+    Display names disambiguate against the opencode-go side of the merged
+    catalog: when a go record carries the same display name or the same bare
+    id, the zen record's display name gets a " (Zen)" suffix so the two
+    picker entries read differently. Zen-only models keep the plain id as
+    their name — no go entry exists to collide with.
     """
     from .zen_catalog import zen_families, zen_model_ids
 
+    go_records = go_records or []
+    go_display_names = {
+        str(record.get("display_name")) for record in go_records if record.get("display_name")
+    }
+    go_slugs = {str(record.get("slug")) for record in go_records if record.get("slug")}
     families = zen_families()
     records = []
     for model_id in sorted(zen_model_ids()):
         slug = f"zen/{model_id}"
         full = _canonical_model_defaults()
         full["slug"] = slug
-        full["display_name"] = model_id
+        display_name = model_id
+        if display_name in go_display_names or model_id in go_slugs:
+            display_name = f"{display_name} (Zen)"
+        full["display_name"] = display_name
         full["description"] = f"Zen model {model_id} served through opencode.ai/zen."
         full["comp_hash"] = _comp_hash_for(slug)
         full["family"] = families.get(model_id)
         context = full["context_window"]
         full["auto_compact_token_limit"] = round(context * 0.9)
         full["base_instructions"] = ""
-        full["model_messages"] = model_messages("", full["display_name"], context, full)
+        full["model_messages"] = model_messages("", display_name, context, full)
         records.append(full)
     return records
 
@@ -920,10 +934,12 @@ def render_merged_catalog() -> dict:
     Native entries keep their captured slugs; opencode-go entries keep bare
     slugs and their reasoning levels are clamped to the native effort
     vocabulary; zen entries are slug-prefixed zen/<id> with their family on
-    the record. The opencode-go side runs the same seed/discovery/overlay
-    pipeline as the runtime catalog. Zen capture itself is TTL-gated and runs
-    outside this render (app layer), which reads only the zen cache files, so
-    this function stays network-free. Written under the state dir.
+    the record and a " (Zen)" display-name suffix when the opencode-go side
+    shares their bare id or display name. The opencode-go side runs the same
+    seed/discovery/overlay pipeline as the runtime catalog. Zen capture itself
+    is TTL-gated and runs outside this render (app layer), which reads only
+    the zen cache files, so this function stays network-free. Written under
+    the state dir.
     """
     from .native_models import load_native_capture, native_effort_vocabulary
 
@@ -940,9 +956,10 @@ def render_merged_catalog() -> dict:
         }
     rendered = render_runtime_catalog(compact)
     native = load_native_capture()
+    go_models = _clamp_efforts(rendered.get("models", []), native_effort_vocabulary(native))
     models = [_full_native_record(entry) for entry in native.get("models", [])]
-    models.extend(_clamp_efforts(rendered.get("models", []), native_effort_vocabulary(native)))
-    models.extend(_zen_merged_records())
+    models.extend(go_models)
+    models.extend(_zen_merged_records(go_models))
     merged = {
         "fetched_at": rendered.get("fetched_at", compact["fetched_at"]),
         "etag": rendered.get("etag", compact["etag"]),

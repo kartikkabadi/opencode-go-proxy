@@ -1,9 +1,10 @@
-"""Routing policy: prefix normalization and native vs opencode-go targets."""
+"""Routing policy: prefix normalization and native vs opencode-go vs zen targets."""
 
 import json
 import os
 import unittest
 
+from opencode_go_proxy import zen_catalog
 from opencode_go_proxy.meter import state_dir
 from opencode_go_proxy.routing import normalize_model_slug, route_target
 
@@ -23,6 +24,18 @@ def _write_native_capture(slugs: list[str]) -> str:
     with open(path, "w") as handle:
         json.dump({"captured_at": "2026-08-13T00:00:00Z", "models": models}, handle)
     return path
+
+
+def _seed_zen_ids(model_ids: list[str]) -> None:
+    """Write the zen capture file so zen_model_ids() sees these bare ids."""
+    state = state_dir()
+    os.makedirs(state, exist_ok=True)
+    with open(zen_catalog.zen_models_path(), "w") as handle:
+        json.dump(
+            {"fetched_at": "2026-08-14T00:00:00Z", "models": [{"id": model_id} for model_id in model_ids]},
+            handle,
+        )
+    zen_catalog._ZEN_MODELS_CACHE = None
 
 
 class NormalizeModelSlugTests(unittest.TestCase):
@@ -96,12 +109,56 @@ class ZenRouteTargetTests(unittest.TestCase):
         self.assertEqual(route_target("zen/gpt-5.5"), "zen")
         self.assertEqual(route_target("zen/claude-sonnet-4-5"), "zen")
 
-    def test_bare_zen_model_id_never_routes_zen(self) -> None:
-        # deepseek-v4-flash exists on zen, but bare slugs never route zen: the
-        # zen models are only reachable with the zen/ prefix.
+    def test_bare_zen_only_id_routes_zen(self) -> None:
+        # north-mini-code-free is served by zen but absent from the
+        # opencode-go compact catalog; a bare picker selection routes zen.
         _write_native_capture(["gpt-5.6-luna"])
+        _seed_zen_ids(["north-mini-code-free"])
+        self.assertEqual(route_target("north-mini-code-free"), "zen")
+
+    def test_bare_collision_id_stays_opencode_go(self) -> None:
+        # deepseek-v4-flash exists on both zen and the opencode-go catalog:
+        # go wins for bare slugs; the zen/ prefix opts a collision into zen.
+        _write_native_capture(["gpt-5.6-luna"])
+        _seed_zen_ids(["deepseek-v4-flash", "north-mini-code-free"])
         self.assertEqual(route_target("deepseek-v4-flash"), "opencode_go")
-        self.assertEqual(route_target("claude-sonnet-4-5"), "opencode_go")
+        self.assertEqual(route_target("north-mini-code-free"), "zen")
+
+    def test_bare_zen_only_id_that_is_native_stays_native(self) -> None:
+        # Native membership is decided before the zen-only rule.
+        _write_native_capture(["north-mini-code-free"])
+        _seed_zen_ids(["north-mini-code-free"])
+        self.assertEqual(route_target("north-mini-code-free"), "native")
+
+    def test_go_compact_slugs_refresh_by_mtime(self) -> None:
+        # The go-side set is mtime-cached: adding a slug to the state compact
+        # moves a zen-only id onto the opencode-go path, and removing it moves
+        # it back, without a restart.
+        from opencode_go_proxy import catalog
+
+        _seed_zen_ids(["zen-only-test-model"])
+        self.assertEqual(route_target("zen-only-test-model"), "zen")
+
+        path = catalog.state_compact_path()
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        compact = {
+            "fetched_at": "2026-08-14T00:00:00Z",
+            "etag": "",
+            "client_version": "0.147.0",
+            "shared_instructions": "",
+            "models": [{"slug": "zen-only-test-model", "display_name": "Zen Only Test"}],
+        }
+        with open(path, "w") as handle:
+            json.dump(compact, handle)
+        os.utime(path, ns=(os.stat(path).st_mtime_ns + 10**9, os.stat(path).st_mtime_ns + 10**9))
+        # Same path, newer content: the mtime cache must re-read the go set.
+        self.assertEqual(route_target("zen-only-test-model"), "opencode_go")
+
+        compact["models"] = []
+        with open(path, "w") as handle:
+            json.dump(compact, handle)
+        os.utime(path, ns=(os.stat(path).st_mtime_ns + 10**9, os.stat(path).st_mtime_ns + 10**9))
+        self.assertEqual(route_target("zen-only-test-model"), "zen")
 
     def test_opencode_go_prefix_wins_over_zen(self) -> None:
         _write_native_capture(["gpt-5.6-luna"])
