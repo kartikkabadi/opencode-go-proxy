@@ -187,12 +187,18 @@ def mock_upstream() -> Generator[_MockServer, None, None]:
 
 @pytest.fixture
 def proxy_env(mock_upstream: _MockServer) -> Generator[str, None, None]:
-    """Isolated env for the scratch proxy: fast retries, zen pointed at the mock."""
+    """Scratch-proxy env: explicit fake key, fast retries, zen at the mock.
+
+    OPENCODE_GO_API_KEY is set to a literal fake key so key resolution is
+    deterministic and never consults the ambient env or the macOS keychain
+    (CI has neither). OPENCODE_API_KEY is pinned empty so an inherited
+    standard key cannot leak in either.
+    """
     base_url = f"http://127.0.0.1:{mock_upstream.server_address[1]}"
     with mock.patch.dict(
         os.environ,
         {
-            "OPENCODE_GO_API_KEY": "",
+            "OPENCODE_GO_API_KEY": "test-key",
             "OPENCODE_API_KEY": "",
             "OPENCODE_GO_PROXY_RETRY_BASE_MS": "1",
             "OPENCODE_GO_PROXY_MAX_RETRIES": "2",

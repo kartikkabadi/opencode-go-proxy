@@ -4,9 +4,10 @@ Every scenario drives the real proxy HTTP surface (in-process server on the
 scratch port 8792) against an http.server mock upstream scripted per scenario,
 then verifies the client-visible response, the usage-meter row, and the mock's
 request log. Offline and deterministic: all traffic is loopback, the state dir
-is a per-test tmp dir, and the key env is cleared so key resolution walks to
-the macOS keychain (the resolved value never appears in test output) or fails
-for the keyless scenario.
+is a per-test tmp dir, and the proxy env carries an explicit fake key
+("test-key") so key resolution never touches the environment or the macOS
+keychain. The keyless scenario clears the key itself and forces keychain
+failure to prove the 401 contract.
 
 Contract expectations come from the reliability spec; where the current code
 behaves differently the scenario FAILS and reports the mismatch with evidence
@@ -303,12 +304,18 @@ def mock_upstream() -> Generator[_MockServer, None, None]:
 
 @pytest.fixture
 def proxy_env(mock_upstream: _MockServer) -> Generator[str, None, None]:
-    """Isolated env for the scratch proxy: no key env, loopback-only, fast retries."""
+    """Scratch-proxy env: explicit fake key, loopback-only, fast retries.
+
+    OPENCODE_GO_API_KEY is set to a literal fake key so key resolution is
+    deterministic and never consults the ambient env or the macOS keychain
+    (CI has neither). OPENCODE_API_KEY is pinned empty so an inherited
+    standard key cannot leak in either.
+    """
     base_url = f"http://127.0.0.1:{mock_upstream.server_address[1]}"
     with mock.patch.dict(
         os.environ,
         {
-            "OPENCODE_GO_API_KEY": "",
+            "OPENCODE_GO_API_KEY": "test-key",
             "OPENCODE_API_KEY": "",
             "OPENCODE_GO_PROXY_RETRY_BASE_MS": "1",
             "OPENCODE_GO_PROXY_MAX_RETRIES": "2",
@@ -701,6 +708,9 @@ def test_scenario_10_keyless_returns_clean_error(
     proxy: _ScratchProxyServer, mock_upstream: _MockServer, scratch_port: int
 ) -> None:
     check = ExpectationCheck("scenario 10: keyless")
+    # Keyless by design: override the fixture's fake key with empty values and
+    # force keychain lookup to fail, proving the proxy rejects with 401 before
+    # any upstream contact.
     with (
         mock.patch.dict(os.environ, {"OPENCODE_GO_API_KEY": "", "OPENCODE_API_KEY": ""}),
         mock.patch("opencode_go_proxy.secrets.subprocess.run", side_effect=_failed_keychain_run),
