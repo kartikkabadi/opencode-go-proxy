@@ -206,8 +206,8 @@ class ResponsesProxyHandler(BaseHTTPRequestHandler):
             return
         version_path = self.path.split("?", 1)[0]
         if version_path in {"/version", "/v1/version"}:
+            from urllib.parse import parse_qs, urlsplit
             from opencode_go_proxy import updates
-            from urllib.parse import urlsplit, parse_qs
 
             force = "1" in parse_qs(urlsplit(self.path).query).get("force", [])
             self._send_json(updates.version_payload(force=force))
