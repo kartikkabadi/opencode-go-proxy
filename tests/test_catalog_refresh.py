@@ -1,8 +1,10 @@
 import datetime
 import json
 import os
+import re
 import tempfile
 import unittest
+import urllib.error
 from unittest import mock
 
 from opencode_go_proxy.catalog import (
@@ -10,6 +12,29 @@ from opencode_go_proxy.catalog import (
     _model_from_discovery,
     refresh_catalog,
 )
+
+
+class _FakeResponse:
+    def __init__(self, payload: dict, headers: dict | None = None) -> None:
+        self._payload = payload
+        self.headers = headers or {}
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc) -> None:
+        return None
+
+    def read(self) -> bytes:
+        return json.dumps(self._payload).encode()
+
+
+def _request_header(request, name: str) -> str | None:
+    """Case-insensitive header lookup; urllib capitalizes header keys."""
+    return next(
+        (value for key, value in request.header_items() if key.lower() == name.lower()),
+        None,
+    )
 
 
 def make_compact(fetched_at: str) -> dict:
@@ -96,7 +121,7 @@ class RefreshCatalogTests(unittest.TestCase):
             }
         ]
 
-        with mock.patch("opencode_go_proxy.catalog.discover_models", return_value=discovered):
+        with mock.patch("opencode_go_proxy.catalog.discover_models", return_value=(discovered, None)):
             rendered = refresh_catalog(
                 compact_path=self.compact_path,
                 catalog_path=self.catalog_path,
@@ -112,7 +137,7 @@ class RefreshCatalogTests(unittest.TestCase):
     def test_force_refreshes_fresh_compact(self) -> None:
         self._write_compact((self.now - datetime.timedelta(hours=1)).isoformat())
 
-        with mock.patch("opencode_go_proxy.catalog.discover_models", return_value=[]):
+        with mock.patch("opencode_go_proxy.catalog.discover_models", return_value=([], None)):
             rendered = refresh_catalog(
                 compact_path=self.compact_path,
                 catalog_path=self.catalog_path,
@@ -182,6 +207,144 @@ class RefreshCatalogTests(unittest.TestCase):
             )
         self.assertEqual(rendered["models"][0]["slug"], "existing-model")
         self.assertTrue(os.path.exists(self.catalog_path))
+
+    def test_etag_is_stored_and_sent_as_if_none_match_on_next_refresh(self) -> None:
+        self._write_compact((self.now - datetime.timedelta(hours=25)).isoformat())
+        state = {"sent_etag": None, "respond_304": False}
+
+        def fake_urlopen(request, *args, **kwargs):
+            state["sent_etag"] = _request_header(request, "If-None-Match")
+            if state["respond_304"]:
+                raise urllib.error.HTTPError(request.full_url, 304, "Not Modified", {}, None)
+            return _FakeResponse(
+                {"opencode": {"models": {"existing-model": {"id": "existing-model", "name": "Existing Model"}}}},
+                headers={"ETag": 'W/"models-dev-v7"'},
+            )
+
+        with mock.patch("opencode_go_proxy.catalog.urllib.request.urlopen", side_effect=fake_urlopen):
+            rendered = refresh_catalog(
+                compact_path=self.compact_path,
+                catalog_path=self.catalog_path,
+                now=self.now,
+            )
+        with open(self.compact_path) as f:
+            compact = json.load(f)
+        # The models.dev ETag is stored in the compact (and rendered) meta.
+        self.assertEqual(compact["etag"], 'W/"models-dev-v7"')
+        self.assertEqual(rendered["etag"], 'W/"models-dev-v7"')
+        # The fixture compact already carries an etag, so even the first fetch
+        # is conditional on it.
+        self.assertEqual(state["sent_etag"], 'W/"opencode-go-models-test"')
+
+        # Compact stale again: the stored etag must be sent as If-None-Match.
+        later = self.now + datetime.timedelta(hours=25)
+        state["respond_304"] = True
+        with mock.patch("opencode_go_proxy.catalog.urllib.request.urlopen", side_effect=fake_urlopen):
+            refresh_catalog(
+                compact_path=self.compact_path,
+                catalog_path=self.catalog_path,
+                now=later,
+            )
+        self.assertEqual(state["sent_etag"], 'W/"models-dev-v7"')
+
+    def test_304_keeps_compact_and_skips_render(self) -> None:
+        self._write_compact((self.now - datetime.timedelta(hours=25)).isoformat())
+        state = {"respond_304": False}
+
+        def fake_urlopen(request, *args, **kwargs):
+            if state["respond_304"]:
+                raise urllib.error.HTTPError(request.full_url, 304, "Not Modified", {}, None)
+            return _FakeResponse(
+                {"opencode": {"models": {"existing-model": {"id": "existing-model", "name": "Existing Model"}}}},
+                headers={"ETag": 'W/"models-dev-v9"'},
+            )
+
+        with mock.patch("opencode_go_proxy.catalog.urllib.request.urlopen", side_effect=fake_urlopen):
+            refresh_catalog(
+                compact_path=self.compact_path,
+                catalog_path=self.catalog_path,
+                now=self.now,
+            )
+        compact_mtime = os.path.getmtime(self.compact_path)
+        catalog_mtime = os.path.getmtime(self.catalog_path)
+        with open(self.compact_path) as f:
+            compact_before = f.read()
+        with open(self.catalog_path) as f:
+            catalog_before = f.read()
+
+        state["respond_304"] = True
+        later = self.now + datetime.timedelta(hours=25)
+        with mock.patch("opencode_go_proxy.catalog.urllib.request.urlopen", side_effect=fake_urlopen), mock.patch(
+            "opencode_go_proxy.catalog.trace"
+        ) as traced:
+            rendered = refresh_catalog(
+                compact_path=self.compact_path,
+                catalog_path=self.catalog_path,
+                now=later,
+            )
+
+        # 304 means unchanged: neither file is rewritten, the returned catalog
+        # is the one already on disk, and a cached-refresh event is traced.
+        self.assertEqual(os.path.getmtime(self.compact_path), compact_mtime)
+        self.assertEqual(os.path.getmtime(self.catalog_path), catalog_mtime)
+        with open(self.compact_path) as f:
+            self.assertEqual(f.read(), compact_before)
+        with open(self.catalog_path) as f:
+            self.assertEqual(f.read(), catalog_before)
+        self.assertEqual(rendered["etag"], 'W/"models-dev-v9"')
+        cached = [c for c in traced.call_args_list if c.args[0] == "catalog.refresh.cached"]
+        self.assertEqual(len(cached), 1)
+
+    def test_etag_stable_across_refreshes_with_identical_content(self) -> None:
+        # No server ETag header: the content-hash fallback must be identical
+        # across refreshes of the same model set (the old daily synthetic etag
+        # churned the Codex client cache even when nothing changed).
+
+        def fake_urlopen(request, *args, **kwargs):
+            return _FakeResponse(
+                {"opencode": {"models": {"existing-model": {"id": "existing-model", "name": "Existing Model"}}}}
+            )
+
+        with mock.patch("opencode_go_proxy.catalog.urllib.request.urlopen", side_effect=fake_urlopen):
+            refresh_catalog(
+                compact_path=self.compact_path,
+                catalog_path=self.catalog_path,
+                now=self.now,
+            )
+        with open(self.compact_path) as f:
+            first = json.load(f)
+
+        later = self.now + datetime.timedelta(hours=25)
+        with mock.patch("opencode_go_proxy.catalog.urllib.request.urlopen", side_effect=fake_urlopen):
+            refresh_catalog(
+                compact_path=self.compact_path,
+                catalog_path=self.catalog_path,
+                now=later,
+            )
+        with open(self.compact_path) as f:
+            second = json.load(f)
+
+        self.assertEqual(first["etag"], second["etag"])
+        self.assertIsNotNone(re.fullmatch(r'W/"[0-9a-f]{32}"', first["etag"]))
+
+    def test_force_refresh_skips_conditional_get(self) -> None:
+        self._write_compact((self.now - datetime.timedelta(hours=1)).isoformat())
+        seen = {}
+
+        def fake_urlopen(request, *args, **kwargs):
+            seen["if_none_match"] = _request_header(request, "If-None-Match")
+            return _FakeResponse({"opencode": {"models": {}}})
+
+        with mock.patch("opencode_go_proxy.catalog.urllib.request.urlopen", side_effect=fake_urlopen):
+            refresh_catalog(
+                compact_path=self.compact_path,
+                catalog_path=self.catalog_path,
+                now=self.now,
+                force=True,
+            )
+
+        # A forced refresh wants a fresh copy: never a conditional GET.
+        self.assertIsNone(seen["if_none_match"])
 
     def test_model_from_discovery_maps_fields(self) -> None:
         record = _model_from_discovery(

@@ -8,7 +8,9 @@ opencode provider; discovery additively merges those entries into the seed.
 The runtime pipeline is layered:
 
 1. Seed/merge: state-dir compact (else checked-in seed) plus models.dev
-   discovery, TTL-gated so a fresh catalog never hits the network.
+   discovery, TTL-gated so a fresh catalog never hits the network and
+   conditional-GET'd (If-None-Match on the stored ETag) so an unchanged
+   catalog is never re-downloaded.
 2. Overlay: user-models.json overrides (add / hide / edit display), then
    availability announcements, then hidden-model flags.
 3. Render: the overlay result is projected through the canonical model shape
@@ -23,16 +25,19 @@ the explicit `refresh-catalog` CLI instead.
 from __future__ import annotations
 
 import datetime
+import hashlib
 import json
 import os
 import tempfile
 import time
 import urllib.error
 import urllib.request
+from http import HTTPStatus
 from typing import Any
 
 from . import __version__
 from .meter import state_dir
+from .trace import trace
 
 Json = dict[str, Any]
 
@@ -185,32 +190,55 @@ class CatalogDiscoveryError(Exception):
     """Raised when the models.dev catalog cannot be fetched or parsed."""
 
 
-def discover_models(timeout: int = 10) -> list[dict]:
-    """Return model dicts from models.dev whose providerID is "opencode".
+class CatalogNotModified(CatalogDiscoveryError):
+    """Raised when models.dev answers 304 to a conditional GET.
 
-    Each returned dict is a models.dev model entry (id, name, description,
-    context/modalities/reasoning/cost when present). models.dev rejects
-    the default urllib User-Agent with 403, so the fetch sends an identifying
-    UA. Raises CatalogDiscoveryError on network failure or malformed JSON.
+    Carries the etag that was sent so the caller can trace the cached-refresh
+    event and keep its existing compact untouched.
     """
-    request = urllib.request.Request(
-        MODELS_DEV_URL, headers={"User-Agent": f"opencode-go-proxy/{__version__}"}
-    )
+
+    def __init__(self, etag: str | None) -> None:
+        super().__init__(f"catalog not modified (304) for etag {etag!r}")
+        self.etag = etag
+
+
+def discover_models(timeout: int = 10, etag: str | None = None) -> tuple[list[dict], str | None]:
+    """Return (models, etag) from models.dev whose providerID is "opencode".
+
+    Each model dict is a models.dev entry (id, name, description,
+    context/modalities/reasoning/cost when present). The second element is the
+    response ETag header (None when the server sends none); the caller stores
+    it in the compact so the next refresh can send it back. When `etag` is
+    given it is sent as If-None-Match, and a 304 answer raises
+    CatalogNotModified so the caller can keep its existing catalog instead of
+    re-downloading. models.dev rejects the default urllib User-Agent with 403,
+    so the fetch sends an identifying UA. Raises CatalogDiscoveryError on
+    network failure or malformed JSON.
+    """
+    headers = {"User-Agent": f"opencode-go-proxy/{__version__}"}
+    if etag:
+        headers["If-None-Match"] = etag
+    request = urllib.request.Request(MODELS_DEV_URL, headers=headers)
     try:
         with urllib.request.urlopen(request, timeout=timeout) as resp:
             payload: Json = json.load(resp)
+            upstream_etag: str | None = resp.headers.get("ETag")
+    except urllib.error.HTTPError as exc:
+        if exc.code == HTTPStatus.NOT_MODIFIED:
+            raise CatalogNotModified(etag) from exc
+        raise CatalogDiscoveryError(f"failed to fetch {MODELS_DEV_URL}: {exc}") from exc
     except (urllib.error.URLError, TimeoutError, OSError, json.JSONDecodeError) as exc:
         raise CatalogDiscoveryError(f"failed to fetch {MODELS_DEV_URL}: {exc}") from exc
 
     provider = payload.get("opencode")
     if not isinstance(provider, dict):
-        return []
+        return [], upstream_etag
     models = provider.get("models")
     if isinstance(models, dict):
-        return [entry for entry in models.values() if isinstance(entry, dict)]
+        return [entry for entry in models.values() if isinstance(entry, dict)], upstream_etag
     if isinstance(models, list):
-        return [entry for entry in models if isinstance(entry, dict)]
-    return []
+        return [entry for entry in models if isinstance(entry, dict)], upstream_etag
+    return [], upstream_etag
 
 
 def default_catalog_path() -> str:
@@ -419,7 +447,7 @@ def announced_models_path() -> str:
 
 
 def merged_models_path() -> str:
-    """Path of the merged native + opencode-go catalog under the state dir."""
+    """Path of the merged native + opencode-go + zen catalog under the state dir."""
     return os.path.join(state_dir(), MERGE_CATALOG_NAME)
 
 
@@ -656,6 +684,26 @@ def _render_and_write(compact: dict, catalog_path: str, overlay: bool = False) -
     return rendered
 
 
+def _content_etag(models: list[dict]) -> str:
+    """Weak etag from the serialized model list; stable for identical content.
+
+    Used when models.dev sends no ETag header. The old daily synthetic etag
+    churned the Codex client cache every day even when the catalog never
+    changed, so the fallback is derived from the content itself: the model
+    list serialized deterministically (sorted by slug, sorted keys, compact
+    separators), so an unchanged model set yields the same etag forever.
+    """
+    payload = json.dumps(
+        sorted(
+            [m for m in models if isinstance(m, dict)],
+            key=lambda m: str(m.get("slug", "")),
+        ),
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return f'W/"{hashlib.md5(payload.encode("utf-8")).hexdigest()}"'
+
+
 def refresh_catalog(
     compact_path: str | None = None,
     catalog_path: str | None = None,
@@ -675,6 +723,9 @@ def refresh_catalog(
     Refreshing is skipped when the compact catalog is fresh (fetched_at within
     ttl_hours), when the OPENCODE_GO_CATALOG_REFRESH env var is "0", or when
     discovery fails and a compact catalog already exists (offline fallback).
+    Discovery is a conditional GET: the compact's etag is sent as If-None-Match,
+    and a 304 answer keeps the existing compact and the rendered catalog on
+    disk untouched (only a cached-refresh event is traced).
     """
     if now is None:
         now = datetime.datetime.now(datetime.UTC)
@@ -705,8 +756,29 @@ def refresh_catalog(
                 except ValueError:
                     pass
 
+    existing = _load_if_readable(compact_path)
+    if existing is None:
+        existing = _load_if_readable(seed_path)
+    existing = existing or {}
+
+    stored_etag = existing.get("etag")
+    if not isinstance(stored_etag, str) or not stored_etag:
+        stored_etag = None
+
     try:
-        discovered = discover_models()
+        # force=True bypasses the conditional GET: a forced refresh wants a
+        # fresh copy regardless of the stored etag.
+        discovered, upstream_etag = discover_models(etag=None if force else stored_etag)
+    except CatalogNotModified:
+        trace("catalog.refresh.cached", etag=stored_etag)
+        # 304: models.dev content is unchanged. Keep the existing compact (and
+        # its etag) untouched and skip the re-render; serve the catalog that
+        # is already on disk. Render only in the degenerate case where a
+        # catalog file is missing despite a compact.
+        cached = _load_if_readable(catalog_path)
+        if cached is not None:
+            return cached
+        return _render_and_write(existing, catalog_path, overlay=overlay)
     except CatalogDiscoveryError:
         # Offline first run: fall back to the seed so a fresh install that
         # cannot reach models.dev still renders a valid catalog. Honor an
@@ -716,10 +788,6 @@ def refresh_catalog(
             return _render_and_write(fallback, catalog_path, overlay=overlay)
         raise
 
-    existing = _load_if_readable(compact_path)
-    if existing is None:
-        existing = _load_if_readable(seed_path)
-    existing = existing or {}
     models = list(existing.get("models", []))
     known = {record.get("slug") for record in models if isinstance(record, dict) and record.get("slug")}
     for entry in discovered:
@@ -729,7 +797,10 @@ def refresh_catalog(
             known.add(model_id)
     compact = {
         "fetched_at": iso,
-        "etag": f'W/"opencode-go-models-{now:%Y%m%d}"',
+        # models.dev's real ETag when it sends one, else a content hash: both
+        # are stable while the model set is unchanged, so the Codex client's
+        # catalog cache does not churn on every refresh.
+        "etag": upstream_etag or _content_etag(models),
         "shared_instructions": existing.get("shared_instructions", ""),
         "client_version": existing.get("client_version", ""),
         "models": models,
@@ -791,6 +862,35 @@ def _full_native_record(entry: Json) -> Json:
     return full
 
 
+def _zen_merged_records() -> list[Json]:
+    """Full-shape records for captured zen models, slug-prefixed zen/<id>.
+
+    Built straight from the canonical defaults like _full_native_record, so
+    every key Codex reads is present. The zen family travels as an explicit
+    "family" key on the state record (not part of the canonical shape; stored
+    for future display), and availability_nux stays None (the object form the
+    app schema allows) so zen models never announce.
+    """
+    from .zen_catalog import zen_families, zen_model_ids
+
+    families = zen_families()
+    records = []
+    for model_id in sorted(zen_model_ids()):
+        slug = f"zen/{model_id}"
+        full = _canonical_model_defaults()
+        full["slug"] = slug
+        full["display_name"] = model_id
+        full["description"] = f"Zen model {model_id} served through opencode.ai/zen."
+        full["comp_hash"] = _comp_hash_for(slug)
+        full["family"] = families.get(model_id)
+        context = full["context_window"]
+        full["auto_compact_token_limit"] = round(context * 0.9)
+        full["base_instructions"] = ""
+        full["model_messages"] = model_messages("", full["display_name"], context, full)
+        records.append(full)
+    return records
+
+
 def _clamp_efforts(models: list[Json], native_efforts: set[str]) -> list[Json]:
     """Drop opencode-go reasoning levels whose effort the native capture lacks.
 
@@ -819,8 +919,11 @@ def render_merged_catalog() -> dict:
 
     Native entries keep their captured slugs; opencode-go entries keep bare
     slugs and their reasoning levels are clamped to the native effort
-    vocabulary. The opencode-go side runs the same seed/discovery/overlay
-    pipeline as the runtime catalog. Written under the state dir.
+    vocabulary; zen entries are slug-prefixed zen/<id> with their family on
+    the record. The opencode-go side runs the same seed/discovery/overlay
+    pipeline as the runtime catalog. Zen capture itself is TTL-gated and runs
+    outside this render (app layer), which reads only the zen cache files, so
+    this function stays network-free. Written under the state dir.
     """
     from .native_models import load_native_capture, native_effort_vocabulary
 
@@ -839,6 +942,7 @@ def render_merged_catalog() -> dict:
     native = load_native_capture()
     models = [_full_native_record(entry) for entry in native.get("models", [])]
     models.extend(_clamp_efforts(rendered.get("models", []), native_effort_vocabulary(native)))
+    models.extend(_zen_merged_records())
     merged = {
         "fetched_at": rendered.get("fetched_at", compact["fetched_at"]),
         "etag": rendered.get("etag", compact["etag"]),
@@ -850,15 +954,41 @@ def render_merged_catalog() -> dict:
 
 
 
+_MERGED_SLUGS_CACHE: tuple[str, int | None, list[str]] | None = None
+
+
 def merged_model_slugs() -> list[str]:
-    """Slug list from the merged catalog; empty when it has not been rendered."""
+    """Slug list from the merged catalog, cached by file mtime.
+
+    Mirrors protocol.known_models(): the menu bar polls /v1/models every 3s,
+    and the mtime key turns each poll into one stat instead of a full file
+    read. A rewritten merged-models.json (new mtime) makes the next call
+    re-read without a restart. Empty when the file has not been rendered.
+    """
+    global _MERGED_SLUGS_CACHE
+
+    path = merged_models_path()
     try:
-        with open(merged_models_path()) as handle:
-            payload = json.load(handle)
-    except (OSError, json.JSONDecodeError):
-        return []
-    models = payload.get("models", []) if isinstance(payload, dict) else []
-    return sorted({str(m["slug"]) for m in models if isinstance(m, dict) and m.get("slug")})
+        mtime = os.stat(path).st_mtime_ns
+    except OSError:
+        mtime = None
+    if (
+        _MERGED_SLUGS_CACHE is not None
+        and _MERGED_SLUGS_CACHE[0] == path
+        and _MERGED_SLUGS_CACHE[1] == mtime
+    ):
+        return list(_MERGED_SLUGS_CACHE[2])
+    slugs: list[str] = []
+    if mtime is not None:
+        try:
+            with open(path) as handle:
+                payload = json.load(handle)
+        except (OSError, json.JSONDecodeError):
+            payload = None
+        models = payload.get("models", []) if isinstance(payload, dict) else []
+        slugs = sorted({str(m["slug"]) for m in models if isinstance(m, dict) and m.get("slug")})
+    _MERGED_SLUGS_CACHE = (path, mtime, slugs)
+    return slugs
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -898,6 +1028,7 @@ __all__ = [
     "STATE_CATALOG_NAME",
     "STATE_COMPACT_NAME",
     "CatalogDiscoveryError",
+    "CatalogNotModified",
     "annotate_announcements",
     "apply_hidden_models",
     "apply_user_models",

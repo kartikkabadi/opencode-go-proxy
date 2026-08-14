@@ -129,8 +129,14 @@ def call_upstream_chat(chat_payload: Json, config: ProxyConfig, request_id: str,
                 retry_sleep(retries)
                 continue
             if exc.code == 429:
-                retry_after = exc.headers.get("retry-after", "5")
-                raise ProxyError(HTTPStatus.TOO_MANY_REQUESTS, f"rate limited (retry after {retry_after}s)", retries=retries) from exc
+                upstream_retry_after = (exc.headers or {}).get("retry-after")
+                retry_after = upstream_retry_after or "5"
+                raise ProxyError(
+                    HTTPStatus.TOO_MANY_REQUESTS,
+                    f"rate limited (retry after {retry_after}s)",
+                    retries=retries,
+                    headers={"retry-after": upstream_retry_after} if upstream_retry_after else None,
+                ) from exc
             if exc.code == 503:
                 raise ProxyError(HTTPStatus.SERVICE_UNAVAILABLE, "upstream unavailable", retries=retries) from exc
             if exc.code == 504:
@@ -157,15 +163,17 @@ def call_upstream_chat(chat_payload: Json, config: ProxyConfig, request_id: str,
 def call_upstream_chat_verbatim(
     chat_payload: Json, config: ProxyConfig, request_id: str,
     *, timeout_sec: float | None = None, max_retries: int | None = None,
-) -> tuple[int, bytes, int, str | None]:
-    """POST chat/completions and return ``(status, raw_body, retries, content_type)``.
+) -> tuple[int, bytes, int, str | None, str | None]:
+    """POST chat/completions and return ``(status, raw_body, retries, content_type, retry_after)``.
 
     The /chat/completions passthrough relay: an upstream HTTP error is returned
     with the upstream's own status and body so the proxy relays it verbatim
     instead of substituting a ``proxy_error`` envelope. Transient failures
     (429 / 5xx) retry under the same policy as :func:`call_upstream_chat`;
     network and timeout failures have no upstream body to relay, so they still
-    raise :class:`ProxyError` like the JSON-mapping variant.
+    raise :class:`ProxyError` like the JSON-mapping variant. ``retry_after``
+    is the upstream's retry-after header value (lowercased lookup, None when
+    absent) so the relay can forward it on rate-limit responses.
     """
     api_key = resolve_api_key(config, request_id)
 
@@ -183,7 +191,7 @@ def call_upstream_chat_verbatim(
                 record_quota_from_headers(getattr(response, "headers", None))
                 elapsed_ms = int((time.time() - started) * 1000)
                 trace("upstream.done", request_id=request_id, status=response.status, bytes=len(body), elapsed_ms=elapsed_ms)
-                return response.status, body, retries, response.headers.get("content-type")
+                return response.status, body, retries, response.headers.get("content-type"), (response.headers or {}).get("retry-after")
         except urllib.error.HTTPError as exc:
             body = exc.read()
             trace("upstream.error", request_id=request_id, status=exc.code, body=_mask_trace_body(body.decode("utf-8", errors="replace")))
@@ -192,7 +200,7 @@ def call_upstream_chat_verbatim(
                 trace("upstream.retry", request_id=request_id, attempt=retries, status=exc.code)
                 retry_sleep(retries)
                 continue
-            return exc.code, body, retries, (exc.headers.get("content-type") if exc.headers else None)
+            return exc.code, body, retries, (exc.headers.get("content-type") if exc.headers else None), (exc.headers or {}).get("retry-after")
         except urllib.error.URLError as exc:
             trace("upstream.network_error", request_id=request_id, reason=str(getattr(exc, "reason", exc)))
             if retries < max_retries:

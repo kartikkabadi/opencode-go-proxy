@@ -14,6 +14,7 @@ class ProxyError(Exception):
         retries: int = 0,
         upstream_status: int | None = None,
         error_type: str | None = None,
+        headers: dict[str, str] | None = None,
     ) -> None:
         super().__init__(message)
         self.status = status
@@ -26,3 +27,6 @@ class ProxyError(Exception):
         # Rendered as the error type in the JSON envelope; defaults to
         # "proxy_error" at dispatch time.
         self.error_type = error_type
+        # Upstream response headers the proxy forwards on its own error
+        # response (e.g. retry-after on 429); keys are lowercase.
+        self.headers = headers

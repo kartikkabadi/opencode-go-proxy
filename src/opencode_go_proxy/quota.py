@@ -47,6 +47,20 @@ _ANTHROPIC_FAMILIES = (
 
 _lock = threading.Lock()
 
+# Quota harvesting is throttled: identical snapshots are skipped entirely and
+# distinct snapshots are persisted at most once per second, so a burst of 200
+# responses with ratelimit headers costs one fsync+atomic-replace, not one
+# per request.
+WRITE_INTERVAL_SECONDS = 1.0
+
+# (path, monotonic write time) of the last persisted write; keyed by path so
+# a fresh state dir is never throttled by a previous dir's writes.
+_last_write: tuple[str, float] | None = None
+
+# (stat fingerprint, parsed state) memo for read_quota_state; callers never
+# mutate the returned value, so the cached object is safe to share.
+_read_cache: tuple[tuple[int, int, int, int], Json] | None = None
+
 
 def quota_state_path() -> str:
     return os.path.join(state_dir(), "quota-state.json")
@@ -174,14 +188,31 @@ def quota_snapshot_from_headers(headers: Any) -> dict[str, Json]:
 
 
 def read_quota_state() -> Json:
-    """Read quota-state.json; an absent or corrupt file yields an empty state."""
+    """Read quota-state.json; an absent or corrupt file yields an empty state.
+
+    The parse is memoized on the file's stat fingerprint (inode, size, mtime),
+    so /state's per-poll read is O(1) while the file is unchanged; any write,
+    replace, or external edit invalidates it. Callers must treat the returned
+    dict as read-only.
+    """
+    global _read_cache
+    path = quota_state_path()
     try:
-        with open(quota_state_path(), encoding="utf-8") as handle:
+        stat = os.stat(path)
+    except OSError:
+        return {"providers": {}}
+    fingerprint = (stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns)
+    if _read_cache is not None and _read_cache[0] == fingerprint:
+        return _read_cache[1]
+    try:
+        with open(path, encoding="utf-8") as handle:
             value = json.load(handle)
         if isinstance(value, dict) and isinstance(value.get("providers"), dict):
+            _read_cache = (fingerprint, value)
             return value
     except (OSError, ValueError):
         pass
+    _read_cache = (fingerprint, {"providers": {}})
     return {"providers": {}}
 
 
@@ -197,15 +228,34 @@ def _write_state(state: Json) -> None:
 
 
 def record_quota_from_headers(headers: Any) -> None:
-    """Parse response headers and persist the latest snapshot per provider."""
+    """Parse response headers and persist the latest snapshot per provider.
+
+    The write is skipped when the merged snapshot equals the persisted state
+    (field-wise, including sampledAt) and throttled to at most one write per
+    ``WRITE_INTERVAL_SECONDS`` per state file, so header-rich 200s don't
+    fsync+atomic-replace on every request.
+    """
     snapshots = quota_snapshot_from_headers(headers)
     if not snapshots:
         return
+    global _last_write
     with _lock:
         try:
             state = read_quota_state()
-            state["providers"].update(snapshots)
-            _write_state(state)
+            merged = dict(state)
+            merged["providers"] = dict(state.get("providers", {}))
+            merged["providers"].update(snapshots)
+            if merged == state:
+                return
+            path = quota_state_path()
+            now = time.monotonic()
+            same_file_as_last_write = (
+                _last_write is not None and _last_write[0] == path
+            )
+            if same_file_as_last_write and now - _last_write[1] < WRITE_INTERVAL_SECONDS:
+                return
+            _write_state(merged)
+            _last_write = (path, time.monotonic())
         except OSError:
             # Quota harvesting is best-effort; never break a live request.
             pass

@@ -90,5 +90,50 @@ class RouteTargetTests(unittest.TestCase):
         self.assertEqual(route_target("gpt-5.5"), "native")
 
 
+class ZenRouteTargetTests(unittest.TestCase):
+    def test_zen_prefix_routes_zen(self) -> None:
+        _write_native_capture(["gpt-5.6-luna"])
+        self.assertEqual(route_target("zen/gpt-5.5"), "zen")
+        self.assertEqual(route_target("zen/claude-sonnet-4-5"), "zen")
+
+    def test_bare_zen_model_id_never_routes_zen(self) -> None:
+        # deepseek-v4-flash exists on zen, but bare slugs never route zen: the
+        # zen models are only reachable with the zen/ prefix.
+        _write_native_capture(["gpt-5.6-luna"])
+        self.assertEqual(route_target("deepseek-v4-flash"), "opencode_go")
+        self.assertEqual(route_target("claude-sonnet-4-5"), "opencode_go")
+
+    def test_opencode_go_prefix_wins_over_zen(self) -> None:
+        _write_native_capture(["gpt-5.6-luna"])
+        self.assertEqual(route_target("opencode-go/claude-sonnet-4-5"), "opencode_go")
+        self.assertEqual(route_target("opencode-go/gpt-5.5"), "opencode_go")
+
+    def test_zen_prefix_wins_over_bare_native_collision(self) -> None:
+        # A user-selected zen/<slug> whose bare slug is a native model must
+        # stay on the zen path: it must never reach the native backend.
+        _write_native_capture(["gpt-5.6-luna"])
+        self.assertEqual(route_target("zen/gpt-5.6-luna"), "zen")
+
+    def test_native_unchanged_with_zen_routes(self) -> None:
+        _write_native_capture(["gpt-5.6-luna"])
+        self.assertEqual(route_target("gpt-5.6-luna"), "native")
+        self.assertEqual(route_target("zen/gpt-5.6-luna"), "zen")
+        self.assertEqual(route_target("opencode-go/gpt-5.6-luna"), "opencode_go")
+
+
+class NormalizeZenSlugTests(unittest.TestCase):
+    def test_strips_zen_prefix(self) -> None:
+        self.assertEqual(normalize_model_slug("zen/gpt-5.5"), "gpt-5.5")
+        self.assertEqual(normalize_model_slug("zen/claude-sonnet-4-5"), "claude-sonnet-4-5")
+
+    def test_opencode_go_prefix_still_stripped(self) -> None:
+        self.assertEqual(normalize_model_slug("opencode-go/deepseek-v4-flash"), "deepseek-v4-flash")
+
+    def test_prefixes_do_not_cross_contaminate(self) -> None:
+        self.assertEqual(normalize_model_slug("opencode-go-zen/qwen3"), "opencode-go-zen/qwen3")
+        self.assertEqual(normalize_model_slug("zen-opencode-go/gpt-5.5"), "zen-opencode-go/gpt-5.5")
+        self.assertEqual(normalize_model_slug("zen/deepseek-v4-flash"), "deepseek-v4-flash")
+
+
 if __name__ == "__main__":
     unittest.main()

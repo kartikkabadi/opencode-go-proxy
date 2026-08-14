@@ -225,7 +225,7 @@ class TestRuntimeRefresh:
         with open("contrib/opencode-go-catalog.json") as fh:
             contrib_catalog = fh.read()
 
-        with mock.patch("opencode_go_proxy.catalog.discover_models", return_value=[]):
+        with mock.patch("opencode_go_proxy.catalog.discover_models", return_value=([], None)):
             catalog.refresh_runtime_catalog()
 
         with open("contrib/opencode-go-models.json") as fh:
@@ -251,7 +251,7 @@ class TestRuntimeRefresh:
                 },
                 f,
             )
-        with mock.patch("opencode_go_proxy.catalog.discover_models", return_value=[]):
+        with mock.patch("opencode_go_proxy.catalog.discover_models", return_value=([], None)):
             catalog.refresh_runtime_catalog()
 
         # No explicit reload call: the mtime cache must pick the change up.
@@ -325,7 +325,7 @@ def test_models_endpoint_grows_after_refresh_without_restart(proxy_server) -> No
             },
             f,
         )
-    with mock.patch("opencode_go_proxy.catalog.discover_models", return_value=[]):
+    with mock.patch("opencode_go_proxy.catalog.discover_models", return_value=([], None)):
         catalog.refresh_runtime_catalog()
 
     after = set(_list_models(port))

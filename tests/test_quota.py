@@ -30,6 +30,16 @@ def make_config() -> ProxyConfig:
     )
 
 
+@pytest.fixture(autouse=True)
+def no_quota_write_interval(monkeypatch) -> None:
+    """Persistence tests assert each distinct snapshot lands immediately.
+
+    The write throttle is production behavior; the tests that exercise it
+    re-enable the interval explicitly.
+    """
+    monkeypatch.setattr("opencode_go_proxy.quota.WRITE_INTERVAL_SECONDS", 0.0)
+
+
 def chat_payload() -> dict:
     return {"model": "deepseek-v4-flash", "messages": [{"role": "user", "content": "hi"}]}
 
@@ -185,6 +195,56 @@ class TestPersistence:
             record_quota_from_headers({"x-ratelimit-remaining": "1"})  # must not raise
 
 
+class TestWriteThrottle:
+    def test_identical_snapshot_skips_write(self) -> None:
+        # A fixed sampledAt makes the second snapshot field-wise identical to
+        # the persisted one, so the write (and its fsync) must be skipped.
+        with mock.patch("opencode_go_proxy.quota._iso_at", return_value="2026-08-14T00:00:00.000Z"), \
+             mock.patch("opencode_go_proxy.quota.os.fsync") as fsync:
+            record_quota_from_headers({"x-ratelimit-limit-requests": "500", "x-ratelimit-remaining-requests": "42"})
+            record_quota_from_headers({"x-ratelimit-limit-requests": "500", "x-ratelimit-remaining-requests": "42"})
+        assert fsync.call_count == 1
+        assert read_quota_state()["providers"]["openai"]["remaining"] == 42
+
+    def test_interval_throttle_limits_writes(self, monkeypatch) -> None:
+        monkeypatch.setattr("opencode_go_proxy.quota.WRITE_INTERVAL_SECONDS", 1.0)
+        # 100.0s for the first write's interval check and stamp, 100.5s for
+        # the second record's interval check: 0.5s < 1s, so it is dropped.
+        with mock.patch("opencode_go_proxy.quota.time.monotonic", side_effect=[100.0, 100.0, 100.5]):
+            record_quota_from_headers({"x-ratelimit-remaining-requests": "10"})
+            record_quota_from_headers({"x-ratelimit-remaining-requests": "90"})
+        assert read_quota_state()["providers"]["openai"]["remaining"] == 10
+        # Once the interval has elapsed the newer snapshot persists.
+        with mock.patch("opencode_go_proxy.quota.time.monotonic", return_value=102.5):
+            record_quota_from_headers({"x-ratelimit-remaining-requests": "90"})
+        assert read_quota_state()["providers"]["openai"]["remaining"] == 90
+
+    def test_fresh_state_dir_not_throttled_by_previous_writes(self, monkeypatch, tmp_path) -> None:
+        monkeypatch.setattr("opencode_go_proxy.quota.WRITE_INTERVAL_SECONDS", 1.0)
+        first_dir = tmp_path / "quota-a"
+        second_dir = tmp_path / "quota-b"
+        first_dir.mkdir()
+        second_dir.mkdir()
+        with mock.patch.dict(os.environ, {"OPENCODE_GO_PROXY_STATE_DIR": str(first_dir)}):
+            record_quota_from_headers({"x-ratelimit-remaining-requests": "10"})
+        # A different state dir is a different file: the first write there must
+        # not be throttled even though the previous write was milliseconds ago.
+        with mock.patch.dict(os.environ, {"OPENCODE_GO_PROXY_STATE_DIR": str(second_dir)}):
+            record_quota_from_headers({"x-ratelimit-remaining-requests": "20"})
+        with mock.patch.dict(os.environ, {"OPENCODE_GO_PROXY_STATE_DIR": str(second_dir)}):
+            assert read_quota_state()["providers"]["openai"]["remaining"] == 20
+
+    def test_read_quota_state_memoized_until_file_changes(self) -> None:
+        record_quota_from_headers({"x-ratelimit-remaining-requests": "7"})
+        first = read_quota_state()
+        # Unchanged file: the memo serves the second read with no parse.
+        with mock.patch("opencode_go_proxy.quota.open", side_effect=AssertionError("re-read")):
+            second = read_quota_state()
+        assert first == second == {"providers": {"openai": {
+            "provider": "openai", "remaining": 7, "sampledAt": mock.ANY,
+        }}}
+
+
 def ok_response(headers: dict | None = None) -> mock.Mock:
     raw = json.dumps({"choices": [{"message": {"content": "hi"}}]}).encode("utf-8")
     return mock.Mock(status=200, headers=headers or {}, read=lambda: raw,
@@ -203,7 +263,7 @@ class TestUpstreamHooks:
     def test_call_upstream_chat_verbatim_records_quota(self) -> None:
         with mock.patch.dict(os.environ, {"OPENCODE_GO_API_KEY": "test-key"}), \
              mock.patch("urllib.request.urlopen", return_value=ok_response({"x-ratelimit-remaining": "7"})):
-            status, _body, _retries, _ct = call_upstream_chat_verbatim(chat_payload(), make_config(), "req")
+            status, _body, _retries, _ct, _retry_after = call_upstream_chat_verbatim(chat_payload(), make_config(), "req")
         assert status == 200
         assert read_quota_state()["providers"]["openai"]["remaining"] == 7
 

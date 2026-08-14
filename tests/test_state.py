@@ -6,6 +6,7 @@ import socket
 import threading
 from http.client import HTTPConnection
 from http.server import ThreadingHTTPServer
+from typing import ClassVar
 
 import pytest
 
@@ -18,6 +19,12 @@ from opencode_go_proxy.state import build_state, usage_summary
 UTC = datetime.UTC
 TZ = datetime.timezone(datetime.timedelta(hours=5, minutes=30))
 NOW = datetime.datetime(2026, 8, 11, 10, 0, tzinfo=TZ)
+
+
+@pytest.fixture(autouse=True)
+def no_network_usage_poll(monkeypatch) -> None:
+    """/state must never hit the live usage endpoint or keychain in tests."""
+    monkeypatch.setattr("opencode_go_proxy.state.poll_go_usage", lambda _config=None: None)
 
 
 def record_at(dt_utc: datetime.datetime, **kwargs) -> None:
@@ -83,6 +90,26 @@ class TestUsageSummary:
         assert summary["todayTokens"] == 7
         assert summary["model"] == "m"
 
+    def test_state_usage_consistent_across_fold_and_rescan(self) -> None:
+        # The all-provider summary and the zen rollup both read the same fold;
+        # forcing a rescan must not change the numbers /state reports.
+        import os as _os
+
+        from opencode_go_proxy.meter import usage_events_path
+
+        record_at(datetime.datetime(2026, 8, 11, 3, 30, tzinfo=UTC), model="deepseek-v4-flash",
+                  status=200, duration_ms=100, total_tokens=50, provider="zen")
+        record_at(datetime.datetime(2026, 8, 11, 2, 0, tzinfo=UTC), model="deepseek-v4-flash",
+                  status=200, duration_ms=100, total_tokens=25)
+        folded = build_state(port=8787, upstream="u", now=NOW)
+        _os.utime(usage_events_path())
+        rescanned = build_state(port=8787, upstream="u", now=NOW)
+        assert folded["usage"]["todayTurns"] == rescanned["usage"]["todayTurns"] == 2
+        assert folded["usage"]["todayTokens"] == rescanned["usage"]["todayTokens"] == 75
+        assert folded["usage"]["zen"] == rescanned["usage"]["zen"] == {
+            "todayTurns": 1, "todayTokens": 50, "last7d": [0, 0, 0, 0, 0, 0, 50],
+        }
+
 
 class TestBuildState:
     def test_empty_state_defaults(self) -> None:
@@ -136,6 +163,55 @@ class TestBuildState:
         assert build_state(port=8787, upstream="u", now=NOW)["quota"] is None
 
 
+class TestUsageKey:
+    GO: ClassVar[dict[str, object]] = {
+        "rolling": {"status": "ok", "percent": 26, "resetsAt": "2026-08-14T05:00:00Z"},
+        "weekly": {"status": "ok", "percent": 41, "resetsAt": "2026-08-16T00:00:00Z"},
+        "monthly": {"status": "ok", "percent": 12, "resetsAt": "2026-08-31T00:00:00Z"},
+    }
+
+    def test_go_usage_from_poller(self, monkeypatch) -> None:
+        monkeypatch.setattr("opencode_go_proxy.state.poll_go_usage", lambda _config=None: self.GO)
+        state = build_state(port=8787, upstream="u", now=NOW)
+        assert state["usage"]["go"] == self.GO
+
+    def test_go_usage_null_when_poller_returns_none(self) -> None:
+        state = build_state(port=8787, upstream="u", now=NOW)
+        assert state["usage"]["go"] is None
+
+    def test_go_limits_exact_values(self) -> None:
+        state = build_state(port=8787, upstream="u", now=NOW)
+        assert state["usage"]["goLimits"] == {
+            "monthlyDollars": 60,
+            "weeklyDollars": 30,
+            "rolling5hDollars": 12,
+            "subscriptionMonthlyDollars": 10,
+        }
+
+    def test_zen_rollup_buckets_provider_events(self) -> None:
+        record_at(datetime.datetime(2026, 8, 11, 3, 30, tzinfo=UTC), model="deepseek-v4-flash",
+                  status=200, duration_ms=100, total_tokens=50, provider="zen")
+        record_at(datetime.datetime(2026, 8, 11, 2, 0, tzinfo=UTC), model="deepseek-v4-flash",
+                  status=200, duration_ms=100, total_tokens=100, provider="zen")
+        record_at(datetime.datetime(2026, 8, 10, 12, 0, tzinfo=UTC), model="deepseek-v4-flash",
+                  status=200, duration_ms=100, total_tokens=30, provider="zen")
+        record_at(datetime.datetime(2026, 8, 11, 1, 0, tzinfo=UTC), model="deepseek-v4-flash",
+                  status=200, duration_ms=100, total_tokens=999)
+        state = build_state(port=8787, upstream="u", now=NOW)
+        zen = state["usage"]["zen"]
+        assert zen["todayTurns"] == 2
+        assert zen["todayTokens"] == 150
+        assert zen["last7d"] == [0, 0, 0, 0, 0, 30, 150]
+
+    def test_legacy_usage_keys_still_present(self) -> None:
+        state = build_state(port=8787, upstream="u", now=NOW)
+        usage = state["usage"]
+        assert set(usage) == {"todayTurns", "todayTokens", "last7d", "go", "goLimits", "zen"}
+        assert usage["todayTurns"] == 0
+        assert usage["todayTokens"] == 0
+        assert len(usage["last7d"]) == 7
+
+
 def make_config(port: int = 8787) -> ProxyConfig:
     return ProxyConfig(
         bind="127.0.0.1", port=port, chat_base_url="https://up.test/v1",
@@ -181,7 +257,9 @@ class TestStateEndpoint:
         assert state["upstream"] == "https://up.test/v1"
         assert state["quota"] is None
         assert state["model"] == DEFAULT_MODEL
-        assert set(state["usage"]) == {"todayTurns", "todayTokens", "last7d"}
+        assert set(state["usage"]) == {"todayTurns", "todayTokens", "last7d", "go", "goLimits", "zen"}
+        assert state["usage"]["go"] is None
+        assert state["usage"]["zen"]["last7d"] == [0, 0, 0, 0, 0, 0, 0]
 
     def test_state_alias_path(self, server) -> None:
         status, _state = get(server, "/v1/state")

@@ -22,6 +22,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 
 from . import __version__
+from .compaction import COMPACT_PATHS, handle_compaction, has_compaction_trigger
 from .config import ProxyConfig, resolve_chat_base_url
 from .errors import ProxyError
 from .guards import check_browser_origin, check_content_type, check_host
@@ -52,6 +53,11 @@ from .upstream import (
     usage_tokens,
 )
 from .vision import caption_images_in_messages, is_image_rejection_status
+from .zen_upstream import (
+    call_zen_responses,
+    handle_zen_chat_request,
+    handle_zen_responses_request,
+)
 
 Json = dict[str, Any]
 
@@ -143,6 +149,17 @@ class ResponsesProxyHandler(BaseHTTPRequestHandler):
     def _error_payload(exc: ProxyError) -> Json:
         return {"error": {"type": exc.error_type or "proxy_error", "message": exc.message}}
 
+    def _send_proxy_error(self, exc: ProxyError) -> None:
+        """Write the proxy error envelope, forwarding upstream retry-after.
+
+        Only the upstream's retry-after header is copied (lowercase key); the
+        rest of the upstream response stays out of the envelope.
+        """
+        headers = None
+        if exc.headers and exc.headers.get("retry-after"):
+            headers = {"retry-after": exc.headers["retry-after"]}
+        self._send_json(self._error_payload(exc), status=exc.status, headers=headers)
+
     def _reject_websocket_upgrade(self) -> bool:
         """Reject a realtime WebSocket upgrade with HTTP/1.1 426.
 
@@ -174,7 +191,7 @@ class ResponsesProxyHandler(BaseHTTPRequestHandler):
             self._guard_request()
         except ProxyError as exc:
             trace("request.failed", status=exc.status, message=exc.message)
-            self._send_json(self._error_payload(exc), status=exc.status)
+            self._send_proxy_error(exc)
             return
         if self.path in {"/health", "/v1/health"}:
             self._send_json({"status": "ok"})
@@ -222,20 +239,34 @@ class ResponsesProxyHandler(BaseHTTPRequestHandler):
             check_content_type(self.headers.get("content-type"))
             config = self._config()
             payload = self._read_json(config)
+            model = payload.get("model") or DEFAULT_MODEL
             trace(
                 "request.received",
                 request_id=request_id,
                 path=self.path,
-                model=payload.get("model"),
+                model=model,
                 stream=payload.get("stream", False),
             )
+            # Remote compaction (v1: the dedicated /responses/compact path;
+            # v2: a responses request whose input ends in a compaction trigger
+            # item). Native models fall through to the ChatGPT backend relay,
+            # which handles compaction itself.
+            if path in COMPACT_PATHS or (
+                path in RESPONSES_PATHS and has_compaction_trigger(payload)
+            ) and route_target(model) != "native":
+                handle_compaction(self, payload, config, request_id, path=path)
+                return
             if path in CHAT_COMPLETIONS_PATHS:
                 handle_chat_completions_request(self, payload, config, request_id)
-            elif path in RESPONSES_PATHS and route_target(payload.get("model") or DEFAULT_MODEL) == "native":
+            elif path in RESPONSES_PATHS and route_target(model) == "native":
                 # Native models relay whole to the ChatGPT backend: the body,
                 # the client's own auth, and the stream are forwarded verbatim
                 # and never touch the OpenCode Go key or alias logic.
                 relay_native_request(self, payload, config, request_id)
+            elif path in RESPONSES_PATHS and route_target(model) == "zen":
+                # Zen models translate per wire family inside the zen client;
+                # they must never reach the opencode-go translation path.
+                handle_zen_responses_request(self, payload, config, request_id)
             elif payload.get("stream") is True:
                 # Real streaming: send SSE headers, then stream from upstream in real-time.
                 self.send_response(HTTPStatus.OK)
@@ -257,7 +288,7 @@ class ResponsesProxyHandler(BaseHTTPRequestHandler):
                 self._send_json(response)
         except ProxyError as exc:
             trace("request.failed", request_id=request_id, status=exc.status, message=exc.message)
-            self._send_json(self._error_payload(exc), status=exc.status)
+            self._send_proxy_error(exc)
         except BrokenPipeError:
             trace("client.disconnected", request_id=request_id, message="client closed connection during stream")
         except Exception as exc:  # pragma: no cover - defensive crash trace  # noqa: BLE001
@@ -294,10 +325,12 @@ class ResponsesProxyHandler(BaseHTTPRequestHandler):
             raise ProxyError(HTTPStatus.BAD_REQUEST, "request body must be a JSON object")
         return value
 
-    def _send_json(self, payload: Json, status: HTTPStatus = HTTPStatus.OK) -> None:
+    def _send_json(self, payload: Json, status: HTTPStatus = HTTPStatus.OK, headers: dict[str, str] | None = None) -> None:
         raw = json.dumps(payload, separators=(",",":")).encode("utf-8")
         self.send_response(status)
         self.send_header("content-type", "application/json")
+        for name, value in (headers or {}).items():
+            self.send_header(name, value)
         self.send_header("content-length", str(len(raw)))
         self.end_headers()
         self.wfile.write(raw)
@@ -306,6 +339,10 @@ class ResponsesProxyHandler(BaseHTTPRequestHandler):
 def handle_responses_request(payload: Json, config: ProxyConfig, request_id: str) -> Json:
     started = time.time()
     session_model = payload.get("model") or DEFAULT_MODEL
+    if route_target(session_model) == "zen":
+        # Zen models never enter the opencode-go translation path: the zen
+        # client translates per wire family (and meters provider="zen").
+        return call_zen_responses(payload, config, request_id)
     payload = inject_session_model(payload, session_model)
     chat_payload, request_model, conversion_stats = responses_payload_to_chat_payload(payload)
 
@@ -384,17 +421,24 @@ def handle_chat_completions_request(handler: ResponsesProxyHandler, payload: Jso
     unchanged. A missing key surfaces the same 401 proxy error the responses
     path uses.
     """
+    if route_target(payload.get("model") or DEFAULT_MODEL) == "zen":
+        # Zen models relay to the zen chat-completions surface with the zen
+        # key and base; the opencode-go upstream is never involved.
+        handle_zen_chat_request(handler, payload, config, request_id)
+        return
     if payload.get("stream") is True:
         handle_chat_stream_passthrough(payload, config, request_id, handler)
         return
     started = time.time()
-    status, body, retries, content_type = call_upstream_chat_verbatim(payload, config, request_id)
+    status, body, retries, content_type, retry_after = call_upstream_chat_verbatim(payload, config, request_id)
     record_usage_event(
         model=payload.get("model") or DEFAULT_MODEL, status=status,
         duration_ms=int((time.time() - started) * 1000), retries=retries or None,
     )
     handler.send_response(status)
     handler.send_header("content-type", content_type or "application/json")
+    if retry_after:
+        handler.send_header("retry-after", retry_after)
     handler.send_header("content-length", str(len(body)))
     handler.end_headers()
     handler.wfile.write(body)
@@ -417,15 +461,65 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def _refresh_catalog_in_background() -> None:
-    """Run the TTL-gated runtime catalog refresh; failures are logged, never fatal."""
+CATALOG_REFRESH_INTERVAL_HOURS = 6
+
+
+def _refresh_catalog_once(reason: str) -> None:
+    """Run one TTL-gated runtime catalog refresh; failures are logged, never fatal."""
+    trace("catalog.refresh.start", reason=reason)
     try:
         from opencode_go_proxy import catalog as _catalog
+        from opencode_go_proxy.zen_catalog import capture_zen_models
 
+        # Zen capture is TTL-gated and never raises (network failure falls back
+        # to cache); without it the merged catalog has no zen/ slugs.
+        capture_zen_models()
         _catalog.refresh_runtime_catalog()
         _catalog.render_merged_catalog()
     except Exception as exc:  # noqa: BLE001 - background refresh is best-effort
         trace("catalog.refresh.skipped", error=str(exc))
+
+
+def _refresh_catalog_in_background() -> None:
+    """Run the startup catalog refresh in a daemon thread; failures are logged, never fatal."""
+    _refresh_catalog_once(reason="startup")
+
+
+def _catalog_refresh_enabled() -> bool:
+    from opencode_go_proxy import catalog as _catalog
+
+    return os.environ.get(_catalog.CATALOG_REFRESH_ENV) != "0"
+
+
+def _refresh_catalog_daemon(interval_hours: float = CATALOG_REFRESH_INTERVAL_HOURS) -> None:
+    """Re-run the catalog refresh on an interval until the process exits.
+
+    The refresh is TTL-gated and best-effort, so each tick is cheap: a fresh
+    compact skips discovery entirely, and a stale one issues a conditional GET
+    against models.dev. The thread is daemon=True, so it dies with the
+    process; when catalog refresh is disabled via OPENCODE_GO_CATALOG_REFRESH
+    the loop stays quiet.
+    """
+    while True:
+        time.sleep(interval_hours * 3600)
+        if not _catalog_refresh_enabled():
+            continue
+        trace("catalog.refresh.tick", interval_hours=interval_hours)
+        _refresh_catalog_once(reason="timer")
+
+
+def _start_catalog_refresh() -> None:
+    """Start the startup refresh plus the interval timer, both daemon threads.
+
+    The startup refresh always runs (refresh_catalog itself self-gates on the
+    env); the timer only when catalog refresh is enabled. daemon=True lets both
+    die with the process.
+    """
+    threading.Thread(target=_refresh_catalog_in_background, daemon=True, name="catalog-refresh").start()
+    if _catalog_refresh_enabled():
+        threading.Thread(
+            target=_refresh_catalog_daemon, daemon=True, name="catalog-refresh-timer"
+        ).start()
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -509,8 +603,9 @@ def main(argv: list[str] | None = None) -> None:
     except Exception as exc:  # noqa: BLE001 - startup catalog render is best-effort
         trace("catalog.refresh.skipped", error=str(exc))
     # The full refresh may fetch models.dev (up to a 10s timeout); run it in
-    # the background so startup never blocks on the network.
-    threading.Thread(target=_refresh_catalog_in_background, daemon=True, name="catalog-refresh").start()
+    # the background so startup never blocks on the network, and keep a
+    # low-frequency timer re-running it (both threads daemon=True).
+    _start_catalog_refresh()
     if args.timeout_sec <= 0:
         sys.stderr.write(f"error: --timeout-sec must be positive, got {args.timeout_sec}\n")
         sys.exit(2)

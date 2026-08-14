@@ -11,6 +11,7 @@ from __future__ import annotations
 import http.client
 import json
 import os
+import socket
 import threading
 import time
 import urllib.error
@@ -61,6 +62,47 @@ def keepalive_sec() -> float:
         return max(0.05, float(os.environ.get("OPENCODE_GO_PROXY_KEEPALIVE_SEC", str(DEFAULT_KEEPALIVE_SEC))))
     except ValueError:
         return DEFAULT_KEEPALIVE_SEC
+
+
+def _client_gone(wfile: Any) -> bool:
+    """Peek the client socket to detect a peer that closed its read side.
+
+    On macOS a write to a reset peer does not error, so a cancelling client is
+    invisible to write-failure detection and the turn would meter as a full
+    stream. A non-blocking MSG_PEEK recv observes the peer state directly:
+    EOF (b'') when the client closed, an error when it reset. The peek is
+    best-effort: any unexpected failure degrades to "alive" so a liveness
+    probe can never break a live stream.
+    """
+    try:
+        sock = getattr(wfile, "_sock", None)
+        if sock is None:
+            # A buffered wfile (makefile with default buffering) hides the
+            # socket behind .raw; the real handler uses the unbuffered form.
+            sock = getattr(getattr(wfile, "raw", None), "_sock", None)
+        if sock is None:
+            return False
+        was_blocking = sock.getblocking()
+        sock.setblocking(False)
+        try:
+            try:
+                data = sock.recv(1, socket.MSG_PEEK)
+            except (AttributeError, NotImplementedError):
+                # Platform without MSG_PEEK: a plain recv still observes EOF.
+                data = sock.recv(1)
+            except BlockingIOError:
+                return False  # alive: no pending data, connection open
+            except (ConnectionResetError, ConnectionAbortedError, OSError):
+                return True  # peer reset its connection
+            return data == b""  # EOF: peer closed its read side
+        finally:
+            # Restore blocking mode; a concurrent close makes the restore
+            # itself fail, which the outer guard degrades to "alive".
+            sock.setblocking(was_blocking)
+    except (AttributeError, OSError, ValueError):
+        # No peekable socket (test doubles, already closed, unsupported
+        # flags): fall back to the old write-only detection.
+        return False
 
 
 class _ConnectFailed(Exception):
@@ -136,6 +178,12 @@ def handle_streaming_request(payload: Json, config: ProxyConfig, request_id: str
     write_lock = threading.Lock()
 
     def _write(data: bytes) -> bool:
+        # Liveness peek before every write (keepalive comments and data
+        # frames): on macOS writes to a reset peer do not error, so without
+        # the peek a cancelling client would be invisible until the stream
+        # ends and the turn would meter as a full 200.
+        if _client_gone(wfile):
+            return False
         try:
             with write_lock:
                 wfile.write(data)
@@ -488,7 +536,9 @@ def handle_streaming_request(payload: Json, config: ProxyConfig, request_id: str
                 if isinstance(inp, int) and inp > 0:
                     note_real_input_tokens(model)
                 estimated = estimate_input_tokens(model, len(raw_payload), usage, context_window=context_cap)
-                record_usage_event(model=model, status=200, duration_ms=duration_ms,
+                # The client-visible outcome is response.error empty_completion,
+                # so the meter records 502 (a failed turn), never a success.
+                record_usage_event(model=model, status=502, duration_ms=duration_ms,
                                    input_tokens=inp, output_tokens=outp, total_tokens=total,
                                    estimated_input_tokens=estimated,
                                    empty_completion=True, retries=total_retries + 1 + fallback_attempts)
@@ -619,8 +669,11 @@ def handle_chat_stream_passthrough(payload: Json, config: ProxyConfig, request_i
             # status and error body, not a proxy envelope.
             body = fail.body
             content_type = (exc.headers.get("content-type") if exc.headers else None) or "application/json"
+            retry_after = (exc.headers or {}).get("retry-after")
             handler.send_response(exc.code)
             handler.send_header("content-type", content_type)
+            if retry_after:
+                handler.send_header("retry-after", retry_after)
             handler.send_header("content-length", str(len(body)))
             handler.end_headers()
             handler.wfile.write(body)
@@ -654,6 +707,9 @@ def handle_chat_stream_passthrough(payload: Json, config: ProxyConfig, request_i
         while not keepalive_stop.wait(interval):
             if not client_alive:
                 return
+            if _client_gone(handler.wfile):
+                client_alive = False
+                return
             try:
                 with write_lock:
                     handler.wfile.write(b": keepalive\n\n")
@@ -669,6 +725,14 @@ def handle_chat_stream_passthrough(payload: Json, config: ProxyConfig, request_i
         with response as resp:
             for line in resp:
                 if not client_alive:
+                    break
+                # Liveness peek before each relayed frame: on macOS a write to
+                # a reset peer does not error, so the peek is what makes a
+                # cancelling client visible instead of metering a full 200.
+                if _client_gone(handler.wfile):
+                    client_alive = False
+                    trace("client.disconnected", request_id=request_id,
+                          message="client closed connection during stream")
                     break
                 try:
                     with write_lock:
@@ -690,7 +754,15 @@ def handle_chat_stream_passthrough(payload: Json, config: ProxyConfig, request_i
 
     elapsed_ms = int((time.time() - started) * 1000)
     trace("upstream.done", request_id=request_id, status=response.status, elapsed_ms=elapsed_ms, stream=True)
-    record_usage_event(
-        model=payload.get("model") or DEFAULT_MODEL, status=response.status,
-        duration_ms=elapsed_ms, retries=retries or None,
-    )
+    if not client_alive:
+        # The client cancelled before the relay finished; the upstream's 200 is
+        # not a success the client ever received, so meter the abort.
+        record_usage_event(
+            model=payload.get("model") or DEFAULT_MODEL, status=0,
+            duration_ms=elapsed_ms, stream_aborted=True, retries=retries or None,
+        )
+    else:
+        record_usage_event(
+            model=payload.get("model") or DEFAULT_MODEL, status=response.status,
+            duration_ms=elapsed_ms, retries=retries or None,
+        )
