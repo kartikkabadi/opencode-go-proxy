@@ -141,7 +141,13 @@ def call_upstream_chat(chat_payload: Json, config: ProxyConfig, request_id: str,
                 raise ProxyError(HTTPStatus.SERVICE_UNAVAILABLE, "upstream unavailable", retries=retries) from exc
             if exc.code == 504:
                 raise ProxyError(HTTPStatus.GATEWAY_TIMEOUT, "upstream timeout", retries=retries) from exc
-            raise ProxyError(HTTPStatus.BAD_GATEWAY, f"upstream HTTP {exc.code}", retries=retries, upstream_status=exc.code) from exc
+            raise ProxyError(
+                HTTPStatus.BAD_GATEWAY,
+                f"upstream HTTP {exc.code}",
+                retries=retries,
+                upstream_status=exc.code,
+                body=body,
+            ) from exc
         except urllib.error.URLError as exc:
             trace("upstream.network_error", request_id=request_id, reason=str(getattr(exc, "reason", exc)))
             if retries < max_retries:

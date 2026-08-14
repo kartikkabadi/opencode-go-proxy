@@ -15,6 +15,7 @@ class ProxyError(Exception):
         upstream_status: int | None = None,
         error_type: str | None = None,
         headers: dict[str, str] | None = None,
+        body: bytes | str | None = None,
     ) -> None:
         super().__init__(message)
         self.status = status
@@ -30,3 +31,8 @@ class ProxyError(Exception):
         # Upstream response headers the proxy forwards on its own error
         # response (e.g. retry-after on 429); keys are lowercase.
         self.headers = headers
+        # The upstream's error body (decoded text or raw bytes) when the proxy
+        # surfaces a different status; None when no body was captured. Callers
+        # that must inspect the upstream payload before rendering (e.g. the
+        # go ModelError "not supported" zen fallback) read it here.
+        self.body = body

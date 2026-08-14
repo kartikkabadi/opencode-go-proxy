@@ -42,7 +42,7 @@ from .protocol import (
     responses_payload_to_chat_payload,
 )
 from .quota import read_quota_state
-from .routing import route_target
+from .routing import OPENCODE_GO_PREFIX, route_target
 from .state import build_state
 from .streaming import handle_chat_stream_passthrough, handle_streaming_request
 from .trace import trace
@@ -53,6 +53,7 @@ from .upstream import (
     usage_tokens,
 )
 from .vision import caption_images_in_messages, is_image_rejection_status
+from .zen_catalog import ZEN_PREFIX, zen_model_ids
 from .zen_upstream import (
     call_zen_responses,
     handle_zen_chat_request,
@@ -336,6 +337,47 @@ class ResponsesProxyHandler(BaseHTTPRequestHandler):
         self.wfile.write(raw)
 
 
+def _go_reject_zen_fallback(model: str, status: int | None, body: bytes | str | None) -> bool:
+    """True when the go gateway rejected a bare slug with its ModelError
+    "not supported" shape — the one rejection the proxy answers by re-dispatching
+    the identical request to the zen path.
+
+    Fires only for bare slugs (no provider prefix) the zen catalog owns, only
+    on the gateway's own not-supported rejection (401/403), and only when the
+    body parses to ``{"error": {"type": "ModelError", "message": "... not
+    supported ..."}}`` (the shape seen live; whitespace-tolerant). Any other
+    go error is surfaced as-is: the go-wins contract for bare collisions
+    stands for ids the go gateway actually serves.
+    """
+    if not model or model.startswith((OPENCODE_GO_PREFIX, ZEN_PREFIX)):
+        return False
+    if status not in (401, 403):
+        return False
+    if model not in zen_model_ids():
+        return False
+    if not body:
+        return False
+    if isinstance(body, bytes):
+        text = body.decode("utf-8", errors="replace")
+    else:
+        text = body
+    try:
+        value = json.loads(text)
+    except (ValueError, TypeError):
+        return False
+    if not isinstance(value, dict):
+        return False
+    error = value.get("error")
+    if not isinstance(error, dict):
+        return False
+    if error.get("type") != "ModelError":
+        return False
+    message = error.get("message")
+    if not isinstance(message, str):
+        return False
+    return "not supported" in " ".join(message.split()).lower()
+
+
 def handle_responses_request(payload: Json, config: ProxyConfig, request_id: str) -> Json:
     started = time.time()
     session_model = payload.get("model") or DEFAULT_MODEL
@@ -343,6 +385,9 @@ def handle_responses_request(payload: Json, config: ProxyConfig, request_id: str
         # Zen models never enter the opencode-go translation path: the zen
         # client translates per wire family (and meters provider="zen").
         return call_zen_responses(payload, config, request_id)
+    # The go-reject fallback re-dispatches the ORIGINAL parsed body (pre
+    # session-injection) to zen; keep it before inject_session_model rebinds.
+    original_payload = payload
     payload = inject_session_model(payload, session_model)
     chat_payload, request_model, conversion_stats = responses_payload_to_chat_payload(payload)
 
@@ -384,6 +429,15 @@ def handle_responses_request(payload: Json, config: ProxyConfig, request_id: str
                 )
                 raise
         else:
+            if _go_reject_zen_fallback(session_model, status, exc.body):
+                # The go gateway advertises this bare slug but does not serve
+                # it (ModelError "not supported"); zen owns it. Re-dispatch
+                # the identical original body to the zen path, which
+                # translates per wire family; the zen result/error envelope
+                # becomes the response.
+                trace("fallback.go_reject_zen", request_id=request_id, model=session_model,
+                      status=status, path="responses")
+                return call_zen_responses(original_payload, config, request_id)
             record_usage_event(
                 model=request_model, status=int(exc.status), duration_ms=int((time.time() - started) * 1000),
                 retries=exc.retries or None,
@@ -431,6 +485,18 @@ def handle_chat_completions_request(handler: ResponsesProxyHandler, payload: Jso
         return
     started = time.time()
     status, body, retries, content_type, retry_after = call_upstream_chat_verbatim(payload, config, request_id)
+    model = payload.get("model") or DEFAULT_MODEL
+    if _go_reject_zen_fallback(model, status, body):
+        # The go gateway advertises this bare slug but does not serve it; the
+        # zen chat handler relays with the zen/ prefix (its API contract) and
+        # strips it before sending, so the wire request keeps the identical
+        # messages/tools/stream and the bare id.
+        trace("fallback.go_reject_zen", request_id=request_id, model=model,
+              status=status, path="chat/completions")
+        zen_payload = dict(payload)
+        zen_payload["model"] = f"{ZEN_PREFIX}{model}"
+        handle_zen_chat_request(handler, zen_payload, config, request_id)
+        return
     record_usage_event(
         model=payload.get("model") or DEFAULT_MODEL, status=status,
         duration_ms=int((time.time() - started) * 1000), retries=retries or None,
