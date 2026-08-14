@@ -4,6 +4,7 @@ import tempfile
 import unittest
 from unittest import mock
 
+from opencode_go_proxy import protocol
 from opencode_go_proxy.codex_tools import load_snapshot_tools
 from opencode_go_proxy.protocol import (
     IMAGE_MODEL_DEFAULT,
@@ -419,6 +420,106 @@ class CacheAccountingTests(unittest.TestCase):
             }
         )
         self.assertEqual(response["usage"]["input_tokens_details"], {"cached_tokens": 99})
+
+
+class CatalogCacheCoalescingTests(unittest.TestCase):
+    """The three catalog views share one parse, invalidated by file mtime."""
+
+    @staticmethod
+    def _write_catalog(models: list[dict]) -> str:
+        path = os.path.join(tempfile.mkdtemp(), "catalog.json")
+        with open(path, "w") as handle:
+            json.dump({"models": models}, handle)
+        return path
+
+    @staticmethod
+    def _bump_mtime(path: str) -> None:
+        stamp = os.stat(path).st_mtime_ns + 1_000_000_000
+        os.utime(path, ns=(stamp, stamp))
+
+    @staticmethod
+    def _parse_counter(catalog_path: str):
+        """Count catalog file reads; other file traffic passes through uncounted."""
+        calls = {"count": 0}
+        real_open = open
+
+        class _CountingHandle:
+            def __init__(self, wrapped):
+                self._wrapped = wrapped
+
+            def __enter__(self):
+                return self._wrapped.__enter__()
+
+            def __exit__(self, *exc):
+                return self._wrapped.__exit__(*exc)
+
+            def __iter__(self):
+                return iter(self._wrapped)
+
+            def __getattr__(self, name):
+                return getattr(self._wrapped, name)
+
+        def counting_open(path, *args, **kwargs):
+            mode = args[0] if args else kwargs.get("mode", "r")
+            if path == catalog_path and "w" not in mode and "a" not in mode and "+" not in mode:
+                calls["count"] += 1
+            return _CountingHandle(real_open(path, *args, **kwargs))
+
+        return mock.patch("builtins.open", side_effect=counting_open), calls
+
+    def test_stable_file_parsed_once_for_all_three_views(self) -> None:
+        catalog = self._write_catalog(
+            [
+                {"slug": "alpha", "context_window": 4000, "input_modalities": ["text", "image"]},
+                {"slug": "beta", "input_modalities": ["text"]},
+            ]
+        )
+        open_patch, calls = self._parse_counter(catalog)
+        with mock.patch.dict(os.environ, {"CODEX_MODEL_CATALOG": catalog}), open_patch:
+            self.assertEqual(protocol.known_models(), {"alpha", "beta"})
+            self.assertEqual(protocol.model_context_window("alpha"), 4000)
+            self.assertEqual(protocol.model_context_window("beta"), None)
+            self.assertEqual(protocol.image_capable_models(), {"alpha"})
+            self.assertEqual(protocol.known_models(), {"alpha", "beta"})
+        self.assertEqual(calls["count"], 1)
+
+    def test_mutated_catalog_reparses_once_for_all_three_views(self) -> None:
+        catalog = self._write_catalog(
+            [
+                {"slug": "alpha", "context_window": 4000, "input_modalities": ["text", "image"]},
+                {"slug": "beta", "input_modalities": ["text"]},
+            ]
+        )
+        open_patch, calls = self._parse_counter(catalog)
+        with mock.patch.dict(os.environ, {"CODEX_MODEL_CATALOG": catalog}), open_patch:
+            self.assertEqual(protocol.image_capable_models(), {"alpha"})
+            self.assertEqual(protocol.model_context_window("alpha"), 4000)
+            self.assertEqual(calls["count"], 1)
+
+            with open(catalog, "w") as handle:
+                json.dump(
+                    {
+                        "models": [
+                            {"slug": "gamma", "context_window": 8000, "input_modalities": ["text", "image"]}
+                        ]
+                    },
+                    handle,
+                )
+            self._bump_mtime(catalog)
+
+            self.assertEqual(protocol.known_models(), {"gamma"})
+            self.assertEqual(protocol.model_context_window("gamma"), 8000)
+            self.assertEqual(protocol.image_capable_models(), {"gamma"})
+        self.assertEqual(calls["count"], 2)
+
+    def test_reload_known_models_bypasses_mtime_cache(self) -> None:
+        catalog = self._write_catalog([{"slug": "alpha", "input_modalities": ["text"]}])
+        open_patch, calls = self._parse_counter(catalog)
+        with mock.patch.dict(os.environ, {"CODEX_MODEL_CATALOG": catalog}), open_patch:
+            self.assertEqual(protocol.known_models(), {"alpha"})
+            # Same path and mtime: the cache must not serve the forced re-read.
+            self.assertEqual(protocol.reload_known_models(), {"alpha"})
+        self.assertEqual(calls["count"], 2)
 
 
 class ImageRoutingTests(unittest.TestCase):

@@ -323,6 +323,82 @@ class TestCatalogAutoPick:
             assert vision.auto_pick_caption_model() == IMAGE_MODEL_DEFAULT
 
 
+class TestCatalogModelsCache:
+    """catalog_image_models is mtime-memoized: one parse per file change."""
+
+    @staticmethod
+    def _write_catalog(tmp_path, models) -> str:
+        path = tmp_path / "cat.json"
+        path.write_text(json.dumps({"models": models}))
+        return str(path)
+
+    @staticmethod
+    def _bump_mtime(path: str) -> None:
+        stamp = os.stat(path).st_mtime_ns + 1_000_000_000
+        os.utime(path, ns=(stamp, stamp))
+
+    def test_stable_file_read_once_across_calls(self, tmp_path) -> None:
+        cat = self._write_catalog(
+            tmp_path,
+            [
+                {"slug": "mimo-v2.5", "input_modalities": ["text", "image"]},
+                {"slug": "text-only", "input_modalities": ["text"]},
+            ],
+        )
+        real_load = vision.json.load
+        parses = {"count": 0}
+
+        def counting_load(*args, **kwargs):
+            parses["count"] += 1
+            return real_load(*args, **kwargs)
+
+        with mock.patch.dict(os.environ, {"CODEX_MODEL_CATALOG": cat}), mock.patch(
+            "opencode_go_proxy.vision.json.load", side_effect=counting_load
+        ):
+            assert [m["slug"] for m in vision.catalog_image_models()] == ["mimo-v2.5"]
+            assert [m["slug"] for m in vision.catalog_image_models()] == ["mimo-v2.5"]
+            assert [m["slug"] for m in vision.catalog_image_models()] == ["mimo-v2.5"]
+        assert parses["count"] == 1
+
+    def test_new_mtime_reparses(self, tmp_path) -> None:
+        cat = self._write_catalog(tmp_path, [{"slug": "old-vision", "input_modalities": ["text", "image"]}])
+        real_load = vision.json.load
+        parses = {"count": 0}
+
+        def counting_load(*args, **kwargs):
+            parses["count"] += 1
+            return real_load(*args, **kwargs)
+
+        with mock.patch.dict(os.environ, {"CODEX_MODEL_CATALOG": cat}), mock.patch(
+            "opencode_go_proxy.vision.json.load", side_effect=counting_load
+        ):
+            assert [m["slug"] for m in vision.catalog_image_models()] == ["old-vision"]
+            cat_path = tmp_path / "cat.json"
+            cat_path.write_text(
+                json.dumps({"models": [{"slug": "new-vision", "input_modalities": ["text", "image"]}]})
+            )
+            self._bump_mtime(cat)
+            assert [m["slug"] for m in vision.catalog_image_models()] == ["new-vision"]
+            assert [m["slug"] for m in vision.catalog_image_models()] == ["new-vision"]
+        assert parses["count"] == 2
+
+    def test_missing_catalog_cached_as_empty(self, tmp_path) -> None:
+        real_load = vision.json.load
+        parses = {"count": 0}
+
+        def counting_load(*args, **kwargs):
+            parses["count"] += 1
+            return real_load(*args, **kwargs)
+
+        missing = str(tmp_path / "missing.json")
+        with mock.patch.dict(os.environ, {"CODEX_MODEL_CATALOG": missing}), mock.patch(
+            "opencode_go_proxy.vision.json.load", side_effect=counting_load
+        ):
+            assert vision.catalog_image_models() == []
+            assert vision.catalog_image_models() == []
+        assert parses["count"] == 0
+
+
 class TestEngineResolution:
     def test_auto_orders_local_before_remote_when_enabled(self) -> None:
         with mock.patch.object(vision, "local_runtime_enabled", return_value=True):
@@ -383,6 +459,53 @@ class TestLocalProbe:
     def test_disabled_when_payload_malformed(self) -> None:
         with mock.patch("urllib.request.urlopen", side_effect=json.JSONDecodeError("x", "y", 0)):
             assert vision.local_runtime_enabled() is False
+
+
+class TestLocalProbeCache:
+    """The probe cache stays bounded: expired entries swept, oldest evicted."""
+
+    def test_single_slot_keeps_only_most_recent(self) -> None:
+        base = 1_000_000.0
+        with mock.patch.object(vision, "_LOCAL_PROBE_MAX_ENTRIES", 1), mock.patch(
+            "opencode_go_proxy.vision.time.time", return_value=base
+        ), mock.patch(
+            "urllib.request.urlopen",
+            return_value=_FakeResponse(200, {"data": [{"id": "qwen2.5vl:3b"}]}),
+        ):
+            for index in range(5):
+                assert vision.local_runtime_enabled(base_url=f"http://127.0.0.1:{10000 + index}/v1") is True
+                assert len(vision._LOCAL_PROBE_CACHE) <= 1
+
+    def test_cap_evicts_oldest_beyond_max(self) -> None:
+        base = 2_000_000.0
+        with mock.patch.object(vision, "_LOCAL_PROBE_MAX_ENTRIES", 2), mock.patch(
+            "opencode_go_proxy.vision.time.time", return_value=base
+        ), mock.patch(
+            "urllib.request.urlopen",
+            return_value=_FakeResponse(200, {"data": [{"id": "qwen2.5vl:3b"}]}),
+        ):
+            assert vision.local_runtime_enabled(base_url="http://127.0.0.1:10001/v1") is True
+            assert vision.local_runtime_enabled(base_url="http://127.0.0.1:10002/v1") is True
+            assert vision.local_runtime_enabled(base_url="http://127.0.0.1:10003/v1") is True
+            assert len(vision._LOCAL_PROBE_CACHE) == 2
+
+    def test_expired_entries_swept_on_access(self) -> None:
+        with mock.patch.object(vision, "_LOCAL_PROBE_MAX_ENTRIES", 8), mock.patch(
+            "opencode_go_proxy.vision.time.time", return_value=100.0
+        ), mock.patch(
+            "urllib.request.urlopen",
+            return_value=_FakeResponse(200, {"data": [{"id": "qwen2.5vl:3b"}]}),
+        ):
+            vision._LOCAL_PROBE_CACHE[("http://127.0.0.1:10001/v1", "qwen2.5vl:3b")] = (1.0, True)
+            vision._LOCAL_PROBE_CACHE[("http://127.0.0.1:10002/v1", "qwen2.5vl:3b")] = (2.0, False)
+        assert len(vision._LOCAL_PROBE_CACHE) == 2
+        with mock.patch("opencode_go_proxy.vision.time.time", return_value=100.0), mock.patch(
+            "urllib.request.urlopen",
+            return_value=_FakeResponse(200, {"data": [{"id": "qwen2.5vl:3b"}]}),
+        ):
+            vision.local_runtime_enabled(base_url="http://127.0.0.1:10003/v1")
+        assert len(vision._LOCAL_PROBE_CACHE) == 1
+        assert ("http://127.0.0.1:10003/v1", "qwen2.5vl:3b") in vision._LOCAL_PROBE_CACHE
 
 
 class TestRemoteAdapter:

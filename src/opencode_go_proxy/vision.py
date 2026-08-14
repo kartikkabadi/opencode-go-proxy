@@ -30,7 +30,7 @@ from typing import Any
 
 from .errors import ProxyError
 from .meter import record_usage_event
-from .protocol import IMAGE_MODEL_DEFAULT
+from .protocol import IMAGE_MODEL_DEFAULT, _catalog_mtime
 
 # Caption cache: the same screenshot bytes are re-sent on every tool call of a
 # turn, and each re-caption costs a full upstream round trip. Key by the raw
@@ -285,24 +285,37 @@ def supports_image_input(model: dict[str, Any]) -> bool:
     return "image" in (model.get("input_modalities") or [])
 
 
+# Single-slot mtime cache for the catalog read below; the catalog is parsed
+# once per change instead of on every caption turn.
+_CATALOG_MODELS_CACHE: tuple[str, int | None, list[dict[str, Any]]] | None = None
+
+
 def catalog_image_models() -> list[dict[str, Any]]:
     """Image-capable, listed models from the full-shape state catalog."""
-    from . import catalog as _catalog
+    global _CATALOG_MODELS_CACHE
 
-    path = _catalog.default_catalog_path()
+    path, mtime = _catalog_mtime()
+    if (
+        _CATALOG_MODELS_CACHE is not None
+        and _CATALOG_MODELS_CACHE[0] == path
+        and _CATALOG_MODELS_CACHE[1] == mtime
+    ):
+        return _CATALOG_MODELS_CACHE[2]
     try:
         with open(path, encoding="utf-8") as handle:
             data = json.load(handle)
     except (OSError, json.JSONDecodeError):
-        return []
+        data = None
     models = data.get("models") if isinstance(data, dict) else None
     if not isinstance(models, list):
-        return []
-    return [
+        models = []
+    image_models = [
         m
         for m in models
         if isinstance(m, dict) and supports_image_input(m) and m.get("visibility", "list") == "list"
     ]
+    _CATALOG_MODELS_CACHE = (path, mtime, image_models)
+    return image_models
 
 
 # The catalog carries no per-token prices, so name-tier hints rank engines by
@@ -347,7 +360,11 @@ DEFAULT_LOCAL_VISION_BASE_URL = "http://127.0.0.1:11434/v1"
 DEFAULT_LOCAL_VISION_MODEL = "qwen2.5vl:3b"
 LOCAL_PROBE_TIMEOUT_SEC = 1.5
 _LOCAL_PROBE_TTL_SEC = 30.0
+_LOCAL_PROBE_MAX_ENTRIES = 64
 
+# (base_url, model) -> (probed_at, enabled). Bounded: expired entries are
+# swept on every access and the oldest entry is evicted past the cap, so a
+# turn that probes many runtimes can never grow this without limit.
 _LOCAL_PROBE_CACHE: dict[tuple[str, str], tuple[float, bool]] = {}
 
 
@@ -393,11 +410,17 @@ def local_runtime_enabled(*, base_url: str | None = None, model: str | None = No
     model = model or local_vision_model()
     key = (base_url, model)
     now = time.time()
+    stale = [k for k, (probed_at, _enabled) in _LOCAL_PROBE_CACHE.items() if now - probed_at >= _LOCAL_PROBE_TTL_SEC]
+    for stale_key in stale:
+        del _LOCAL_PROBE_CACHE[stale_key]
     cached = _LOCAL_PROBE_CACHE.get(key)
-    if cached is not None and now - cached[0] < _LOCAL_PROBE_TTL_SEC:
+    if cached is not None:
         return cached[1]
     enabled = _probe_local(base_url, model)
     _LOCAL_PROBE_CACHE[key] = (now, enabled)
+    if len(_LOCAL_PROBE_CACHE) > _LOCAL_PROBE_MAX_ENTRIES:
+        oldest_key = min(_LOCAL_PROBE_CACHE, key=lambda k: _LOCAL_PROBE_CACHE[k][0])
+        del _LOCAL_PROBE_CACHE[oldest_key]
     return enabled
 
 

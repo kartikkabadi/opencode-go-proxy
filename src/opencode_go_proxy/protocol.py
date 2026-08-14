@@ -146,7 +146,45 @@ def _catalog_mtime() -> tuple[str, int | None]:
         return path, None
 
 
-_KNOWN_MODELS_CACHE: tuple[str, int | None, set[str]] | None = None
+# One mtime-keyed parse serves all three catalog views below: known slugs,
+# context windows, and image-capable slugs. The full-shape catalog file is
+# only read once per change instead of once per view.
+_CATALOG_CACHE: tuple[str, int | None, set[str], dict[str, int], set[str]] | None = None
+
+
+def _catalog_views() -> tuple[str, int | None, set[str], dict[str, int], set[str]]:
+    """Parse the catalog once, cached by file mtime; (path, mtime, slugs, windows, image_slugs)."""
+    global _CATALOG_CACHE
+
+    path, mtime = _catalog_mtime()
+    if (
+        _CATALOG_CACHE is not None
+        and _CATALOG_CACHE[0] == path
+        and _CATALOG_CACHE[1] == mtime
+    ):
+        return _CATALOG_CACHE
+    slugs: set[str] = set()
+    windows: dict[str, int] = {}
+    image_slugs: set[str] = set()
+    try:
+        with open(path) as handle:
+            catalog = json.load(handle)
+        for entry in catalog.get("models", []):
+            if not isinstance(entry, dict):
+                continue
+            slug = entry.get("slug")
+            if isinstance(slug, str) and slug:
+                slugs.add(slug)
+                context = entry.get("context_window")
+                if isinstance(context, int) and context > 0:
+                    windows[slug] = context
+                modalities = entry.get("input_modalities")
+                if isinstance(modalities, list) and "image" in modalities:
+                    image_slugs.add(slug)
+    except (OSError, json.JSONDecodeError):
+        pass
+    _CATALOG_CACHE = (path, mtime, slugs, windows, image_slugs)
+    return _CATALOG_CACHE
 
 
 def known_models() -> set[str]:
@@ -156,31 +194,14 @@ def known_models() -> set[str]:
     makes the next call re-read without a restart. reload_known_models()
     bypasses the cache explicitly.
     """
-    global _KNOWN_MODELS_CACHE
-    from opencode_go_proxy import catalog as _catalog
-
-    path, mtime = _catalog_mtime()
-    if (
-        _KNOWN_MODELS_CACHE is not None
-        and _KNOWN_MODELS_CACHE[0] == path
-        and _KNOWN_MODELS_CACHE[1] == mtime
-    ):
-        return _KNOWN_MODELS_CACHE[2]
-    slugs = _catalog.load_known_slugs(catalog_path=path)
-    _KNOWN_MODELS_CACHE = (path, mtime, slugs)
-    return slugs
+    return _catalog_views()[2]
 
 
 def reload_known_models() -> set[str]:
-    """Drop the mtime caches and re-read known slugs from the catalog."""
-    global _KNOWN_MODELS_CACHE, _IMAGE_CAPABLE_CACHE, _CONTEXT_WINDOW_CACHE
-    _KNOWN_MODELS_CACHE = None
-    _IMAGE_CAPABLE_CACHE = None
-    _CONTEXT_WINDOW_CACHE = None
+    """Drop the mtime cache and re-read known slugs from the catalog."""
+    global _CATALOG_CACHE
+    _CATALOG_CACHE = None
     return known_models()
-
-
-_CONTEXT_WINDOW_CACHE: tuple[str, int | None, dict[str, int]] | None = None
 
 
 def model_context_window(model: str) -> int | None:
@@ -190,34 +211,7 @@ def model_context_window(model: str) -> int | None:
     file mtime. Used to cap zero-input-token estimates at the model's real
     window instead of a proxy-wide default.
     """
-    global _CONTEXT_WINDOW_CACHE
-
-    path, mtime = _catalog_mtime()
-    if (
-        _CONTEXT_WINDOW_CACHE is not None
-        and _CONTEXT_WINDOW_CACHE[0] == path
-        and _CONTEXT_WINDOW_CACHE[1] == mtime
-    ):
-        windows = _CONTEXT_WINDOW_CACHE[2]
-    else:
-        windows = {}
-        try:
-            with open(path) as f:
-                catalog = json.load(f)
-            for entry in catalog.get("models", []):
-                if not isinstance(entry, dict):
-                    continue
-                slug = entry.get("slug")
-                context = entry.get("context_window")
-                if isinstance(slug, str) and slug and isinstance(context, int) and context > 0:
-                    windows[slug] = context
-        except (OSError, json.JSONDecodeError):
-            pass
-        _CONTEXT_WINDOW_CACHE = (path, mtime, windows)
-    return windows.get(model)
-
-
-_IMAGE_CAPABLE_CACHE: tuple[str, int | None, set[str]] | None = None
+    return _catalog_views()[3].get(model)
 
 
 def image_capable_models() -> set[str]:
@@ -227,35 +221,7 @@ def image_capable_models() -> set[str]:
     re-read. Used to keep image turns on the requested model when it can
     actually accept images, instead of always forcing the image default.
     """
-    global _IMAGE_CAPABLE_CACHE
-
-    path, mtime = _catalog_mtime()
-    if (
-        _IMAGE_CAPABLE_CACHE is not None
-        and _IMAGE_CAPABLE_CACHE[0] == path
-        and _IMAGE_CAPABLE_CACHE[1] == mtime
-    ):
-        return _IMAGE_CAPABLE_CACHE[2]
-    slugs: set[str] = set()
-    try:
-        with open(path) as f:
-            catalog = json.load(f)
-        for entry in catalog.get("models", []):
-            if not isinstance(entry, dict):
-                continue
-            slug = entry.get("slug")
-            modalities = entry.get("input_modalities")
-            if (
-                isinstance(slug, str)
-                and slug
-                and isinstance(modalities, list)
-                and "image" in modalities
-            ):
-                slugs.add(slug)
-    except (OSError, json.JSONDecodeError):
-        pass
-    _IMAGE_CAPABLE_CACHE = (path, mtime, slugs)
-    return slugs
+    return _catalog_views()[4]
 
 
 def new_response_id() -> str:
