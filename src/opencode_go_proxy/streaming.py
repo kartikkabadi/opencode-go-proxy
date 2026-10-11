@@ -32,6 +32,7 @@ from .protocol import (
     DEFAULT_MODEL,
     cache_stats_from_usage,
     chat_message_to_response_output,
+    custom_tool_names,
     inject_session_model,
     model_context_window,
     new_response_id,
@@ -171,6 +172,10 @@ def handle_streaming_request(payload: Json, config: ProxyConfig, request_id: str
     original_payload = dict(payload)
     payload = inject_session_model(payload, session_model)
     chat_payload, request_model, conversion_stats = responses_payload_to_chat_payload(payload)
+    # Names of Responses custom/freeform tools in the request; the upstream
+    # returns them as chat function calls, and the reverse translation must
+    # emit custom_tool_call items for them (not function_call).
+    custom_names = custom_tool_names(payload.get("tools"))
 
     client_alive = True
     interval = keepalive_sec()
@@ -366,17 +371,29 @@ def handle_streaming_request(payload: Json, config: ProxyConfig, request_id: str
                 if idx in tool_call_open:
                     return
                 flat_name = tool_calls[idx]["function"]["name"]
-                ns, _, n = flat_name.rpartition("__")
-                if not ns or not n:
-                    ns, n = None, flat_name
-                fc_id = f"fc_{uuid.uuid4().hex}"
                 call_id = tool_calls[idx]["id"] or f"call_{uuid.uuid4().hex}"
-                tc_item: Json = {
-                    "type": "function_call", "id": fc_id, "call_id": call_id,
-                    "name": n, "arguments": "", "status": "in_progress",
-                }
-                if ns:
-                    tc_item["namespace"] = ns
+                tc_item: Json
+                if custom_names and flat_name in custom_names:
+                    # Freeform/custom tool: a custom_tool_call item carries the
+                    # raw input string. The JSON {"input": ...} arguments are
+                    # still streaming, so the input is delivered via
+                    # custom_tool_call_input.delta + output_item.done at finalize.
+                    tc_item = {
+                        "type": "custom_tool_call", "id": f"ctc_{uuid.uuid4().hex}",
+                        "call_id": call_id, "name": flat_name, "input": "",
+                        "status": "in_progress",
+                    }
+                else:
+                    ns, _, n = flat_name.rpartition("__")
+                    if not ns or not n:
+                        ns, n = None, flat_name
+                    tc_item = {
+                        "type": "function_call", "id": f"fc_{uuid.uuid4().hex}",
+                        "call_id": call_id, "name": n, "arguments": "",
+                        "status": "in_progress",
+                    }
+                    if ns:
+                        tc_item["namespace"] = ns
                 tool_call_items[idx] = tc_item
                 tool_indices[idx] = allocate_index()
                 send_event({"type": "response.output_item.added",
@@ -609,7 +626,7 @@ def handle_streaming_request(payload: Json, config: ProxyConfig, request_id: str
             fake_msg["tool_calls"] = tool_calls
         if text:
             fake_msg["content"] = text
-        output = chat_message_to_response_output(fake_msg)
+        output = chat_message_to_response_output(fake_msg, custom_tool_names=custom_names)
 
         # Close reasoning item if opened.
         if reasoning_open:
@@ -619,10 +636,13 @@ def handle_streaming_request(payload: Json, config: ProxyConfig, request_id: str
 
         # Emit output_item.done for tool calls that were opened during streaming,
         # and added+done for any that weren't (e.g. name only completed at stream
-        # end) — always with the complete name.
+        # end) — always with the complete name. Custom/freeform tools emit a
+        # custom_tool_call item plus a custom_tool_call_input.delta carrying the
+        # raw input, so Codex completes the freeform call instead of stalling.
         tc_count = 0
         for item in output:
-            if item.get("type") != "function_call":
+            item_type = item.get("type")
+            if item_type not in ("function_call", "custom_tool_call"):
                 continue
             idx = tool_indices.get(tc_count)
             if idx is None:
@@ -634,11 +654,17 @@ def handle_streaming_request(payload: Json, config: ProxyConfig, request_id: str
                 tool_indices[tc_count] = idx
             if tc_count in tool_call_open:
                 # Already emitted added during streaming; close with the final
-                # name/arguments and keep the streamed item id.
+                # name/arguments (or raw input) and keep the streamed item id.
                 done_item = dict(tool_call_items[tc_count])
                 done_item["name"] = item["name"]
-                done_item["arguments"] = item.get("arguments", "{}")
                 done_item["status"] = "completed"
+                if item_type == "custom_tool_call":
+                    done_item["input"] = item.get("input", "")
+                    send_event({"type": "response.custom_tool_call_input.delta",
+                                "item_id": done_item["id"], "output_index": idx,
+                                "delta": item.get("input", "")})
+                else:
+                    done_item["arguments"] = item.get("arguments", "{}")
                 send_event({"type": "response.output_item.done", "output_index": idx, "item": done_item})
                 # Completed must reuse the streamed ids so Codex reconciles items
                 # by id instead of creating ghost duplicates.
@@ -649,6 +675,10 @@ def handle_streaming_request(payload: Json, config: ProxyConfig, request_id: str
                 # with the complete name.
                 tool_call_items[tc_count] = item
                 send_event({"type": "response.output_item.added", "output_index": idx, "item": item})
+                if item_type == "custom_tool_call":
+                    send_event({"type": "response.custom_tool_call_input.delta",
+                                "item_id": item["id"], "output_index": idx,
+                                "delta": item.get("input", "")})
                 send_event({"type": "response.output_item.done", "output_index": idx, "item": item})
             tc_count += 1
 

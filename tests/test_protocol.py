@@ -606,5 +606,130 @@ class ImageRoutingTests(unittest.TestCase):
         self.assertEqual(stats["upstream_model"], "text-only-model")
 
 
+class CustomToolCallTests(unittest.TestCase):
+    """Responses custom/freeform tools round-trip as custom_tool_call.
+
+    Chat Completions has no custom tool type, so the proxy lowers ``type:
+    custom`` to a function with an ``input`` string parameter. Codex rejects a
+    freeform tool (apply_patch) returned as a function_call, so the reverse
+    translation must emit a custom_tool_call carrying the raw input string, and
+    continuation turns must replay custom_tool_call/custom_tool_call_output.
+    """
+
+    TOOLS = [
+        {"type": "custom", "name": "apply_patch", "description": "Edit files."},
+        {
+            "type": "function",
+            "name": "read_file",
+            "description": "Read a file",
+            "parameters": {"type": "object", "properties": {"path": {"type": "string"}}},
+        },
+    ]
+
+    def _chat(self, name: str, arguments: str, call_id: str = "call_1") -> dict:
+        return {
+            "choices": [
+                {
+                    "message": {
+                        "tool_calls": [
+                            {
+                                "id": call_id,
+                                "type": "function",
+                                "function": {"name": name, "arguments": arguments},
+                            }
+                        ]
+                    }
+                }
+            ]
+        }
+
+    def test_custom_tool_names_extracts_only_custom_tools(self) -> None:
+        self.assertEqual(protocol.custom_tool_names(self.TOOLS), {"apply_patch"})
+        self.assertEqual(protocol.custom_tool_names(None), set())
+        self.assertEqual(protocol.custom_tool_names([{"type": "function", "name": "x"}]), set())
+
+    def test_custom_call_emits_custom_tool_call_with_raw_input(self) -> None:
+        chat = self._chat(
+            "apply_patch",
+            json.dumps({"input": "*** Begin Patch\n*** End Patch"}),
+            call_id="call_patch",
+        )
+        response = chat_completion_to_response(chat, custom_tool_names={"apply_patch"})
+        item = response["output"][0]
+        self.assertEqual(item["type"], "custom_tool_call")
+        self.assertEqual(item["call_id"], "call_patch")
+        self.assertEqual(item["name"], "apply_patch")
+        self.assertEqual(item["input"], "*** Begin Patch\n*** End Patch")
+        self.assertNotIn("arguments", item)
+        self.assertEqual(response["output_text"], "")
+
+    def test_normal_function_stays_function_call(self) -> None:
+        chat = self._chat("read_file", '{"path":"README.md"}')
+        response = chat_completion_to_response(chat, custom_tool_names={"apply_patch"})
+        item = response["output"][0]
+        self.assertEqual(item["type"], "function_call")
+        self.assertEqual(item["name"], "read_file")
+        self.assertEqual(item["arguments"], '{"path":"README.md"}')
+
+    def test_custom_name_absent_from_request_stays_function_call(self) -> None:
+        # Without the request's custom-tool names apply_patch cannot be
+        # distinguished from an ordinary function: it stays a function_call.
+        chat = self._chat("apply_patch", json.dumps({"input": "patch"}))
+        response = chat_completion_to_response(chat)
+        self.assertEqual(response["output"][0]["type"], "function_call")
+
+    def test_bare_string_arguments_become_raw_input(self) -> None:
+        chat = self._chat("apply_patch", json.dumps("*** Begin Patch"))
+        response = chat_completion_to_response(chat, custom_tool_names={"apply_patch"})
+        self.assertEqual(response["output"][0]["input"], "*** Begin Patch")
+
+    def test_non_json_arguments_are_preserved_verbatim(self) -> None:
+        chat = self._chat("apply_patch", "*** Begin Patch\n*** End Patch")
+        response = chat_completion_to_response(chat, custom_tool_names={"apply_patch"})
+        self.assertEqual(response["output"][0]["input"], "*** Begin Patch\n*** End Patch")
+
+    def test_continuation_replays_custom_tool_call_and_output(self) -> None:
+        messages, stats = protocol.responses_input_to_chat_messages(
+            {
+                "model": "deepseek-v4-flash",
+                "input": [
+                    {
+                        "type": "custom_tool_call",
+                        "call_id": "call_patch",
+                        "name": "apply_patch",
+                        "input": "*** Begin Patch\n*** End Patch",
+                    },
+                    {"type": "custom_tool_call_output", "call_id": "call_patch", "output": "Done!"},
+                ],
+            }
+        )
+        assistant = messages[0]
+        self.assertEqual(assistant["role"], "assistant")
+        call = assistant["tool_calls"][0]
+        self.assertEqual(call["id"], "call_patch")
+        self.assertEqual(call["function"]["name"], "apply_patch")
+        self.assertEqual(
+            json.loads(call["function"]["arguments"]),
+            {"input": "*** Begin Patch\n*** End Patch"},
+        )
+        tool = messages[1]
+        self.assertEqual(tool["role"], "tool")
+        self.assertEqual(tool["tool_call_id"], "call_patch")
+        self.assertEqual(tool["content"], "Done!")
+        self.assertEqual(stats["custom_tool_calls_replayed"], 1)
+        self.assertEqual(stats["custom_tool_outputs"], 1)
+
+    def test_lowered_custom_tool_stays_function_shaped_for_upstream(self) -> None:
+        chat, _model, stats = responses_payload_to_chat_payload(
+            {"model": "deepseek-v4-flash", "input": "patch", "tools": self.TOOLS}
+        )
+        names = [t["function"]["name"] for t in chat["tools"]]
+        self.assertIn("apply_patch", names)
+        apply_tool = next(t for t in chat["tools"] if t["function"]["name"] == "apply_patch")
+        self.assertEqual(apply_tool["type"], "function")
+        self.assertEqual(apply_tool["function"]["parameters"]["required"], ["input"])
+        self.assertEqual(stats["tools"]["dropped_tools"], 0)
+
+
 if __name__ == "__main__":
     unittest.main()

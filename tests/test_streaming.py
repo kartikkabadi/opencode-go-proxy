@@ -37,7 +37,8 @@ class _UpstreamStream:
         return False
 
 
-def _stream(lines: list[bytes], *, env: dict[str, str] | None = None, state_dir: str | None = None):
+def _stream(lines: list[bytes], *, env: dict[str, str] | None = None, state_dir: str | None = None,
+            payload: dict | None = None):
     """Drive handle_streaming_request; returns (events, wfile, meter_events)."""
     clear_api_key_cache()
     merged = {"OPENCODE_GO_API_KEY": "test-key"}
@@ -46,7 +47,8 @@ def _stream(lines: list[bytes], *, env: dict[str, str] | None = None, state_dir:
     if env:
         merged.update(env)
     cfg = make_config()
-    payload = {"model": "deepseek-v4-flash", "input": "hi", "stream": True}
+    if payload is None:
+        payload = {"model": "deepseek-v4-flash", "input": "hi", "stream": True}
     wfile = io.BytesIO()
     meter: list[dict] = []
     with mock.patch.dict(os.environ, merged):
@@ -190,6 +192,66 @@ class TestFinalOnlyToolIndex:
         assert len(added) >= 2
         indices = [e["output_index"] for e in added]
         assert len(set(indices)) == len(indices), f"collision: {indices}"
+
+
+class TestCustomToolCallStreaming:
+    """Custom/freeform tool calls stream as custom_tool_call, not function_call."""
+
+    CUSTOM_TOOLS = [{"type": "custom", "name": "apply_patch", "description": "Edit files."}]
+
+    def test_custom_tool_streams_custom_tool_call_with_raw_input(self) -> None:
+        payload = {"model": "deepseek-v4-flash", "input": "patch it", "stream": True,
+                   "tools": self.CUSTOM_TOOLS}
+        lines = [
+            b'data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_patch","function":{"name":"apply_patch","arguments":""}}]}}]}\n',
+            b'data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\\"input\\":\\"*** Begin Patch\\\\n*** End Patch\\"}"}}]}}]}\n',
+            b'data: {"id":"1","choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}\n',
+            b"data: [DONE]\n",
+        ]
+        with mock.patch("urllib.request.urlopen", return_value=_UpstreamStream(lines)):
+            events, _wfile, _meter = _stream(lines, payload=payload)
+
+        added = [e for e in events if e["type"] == "response.output_item.added"]
+        assert added and added[0]["item"]["type"] == "custom_tool_call"
+        assert added[0]["item"]["name"] == "apply_patch"
+        assert added[0]["item"]["input"] == ""
+
+        done = [e for e in events if e["type"] == "response.output_item.done"]
+        custom_done = [e for e in done if e["item"]["type"] == "custom_tool_call"]
+        assert custom_done
+        assert custom_done[0]["item"]["call_id"] == "call_patch"
+        assert custom_done[0]["item"]["input"] == "*** Begin Patch\n*** End Patch"
+
+        deltas = [e for e in events if e["type"] == "response.custom_tool_call_input.delta"]
+        assert deltas, "custom tool call must stream a raw input delta"
+        assert deltas[0]["delta"] == "*** Begin Patch\n*** End Patch"
+        assert deltas[0]["item_id"] == custom_done[0]["item"]["id"]
+
+        completed = [e for e in events if e["type"] == "response.completed"][0]["response"]
+        assert completed["output"][0]["type"] == "custom_tool_call"
+        assert completed["output"][0]["input"] == "*** Begin Patch\n*** End Patch"
+
+    def test_normal_function_tool_still_streams_function_call(self) -> None:
+        payload = {"model": "deepseek-v4-flash", "input": "read", "stream": True,
+                   "tools": [
+                       {"type": "function", "name": "read_file", "description": "Read a file",
+                        "parameters": {"type": "object", "properties": {"path": {"type": "string"}}}}
+                   ]}
+        lines = [
+            b'data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_r","function":{"name":"read_file","arguments":""}}]}}]}\n',
+            b'data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\\"path\\":\\"README.md\\"}"}}]}}]}\n',
+            b'data: {"id":"1","choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}\n',
+            b"data: [DONE]\n",
+        ]
+        with mock.patch("urllib.request.urlopen", return_value=_UpstreamStream(lines)):
+            events, _wfile, _meter = _stream(lines, payload=payload)
+
+        added = [e for e in events if e["type"] == "response.output_item.added"]
+        assert added and added[0]["item"]["type"] == "function_call"
+        done = [e for e in events if e["type"] == "response.output_item.done"]
+        assert done[0]["item"]["type"] == "function_call"
+        assert done[0]["item"]["arguments"] == '{"path":"README.md"}'
+        assert not [e for e in events if e["type"] == "response.custom_tool_call_input.delta"]
 
 
 class TestClientGone:

@@ -356,6 +356,55 @@ def reasoning_content_from_item(item: Json) -> str:
     return flatten_content(item.get("summary", ""))
 
 
+def custom_tool_names(tools: Any) -> set[str]:
+    """Names of Responses ``type: custom`` (freeform) tools in a request tool list.
+
+    Chat Completions has no custom/freeform tool type, so the proxy lowers each
+    custom tool to a function with an ``input`` string parameter. The names are
+    kept so the reverse translation can emit a proper ``custom_tool_call`` (with
+    a raw ``input`` string) instead of a ``function_call`` (with JSON
+    ``arguments``), which Codex rejects for freeform tools such as apply_patch.
+    """
+    names: set[str] = set()
+    if isinstance(tools, list):
+        for tool in tools:
+            if not isinstance(tool, dict) or tool.get("type") != "custom":
+                continue
+            name = tool.get("name")
+            if isinstance(name, str) and name:
+                names.add(name)
+    return names
+
+
+def _custom_tool_input(arguments: Any) -> str:
+    """Recover the raw freeform input string from a chat tool-call arguments blob.
+
+    The model was asked for ``{"input": "<raw text>"}``; tolerant of a bare JSON
+    string, a non-JSON raw body the model emitted directly, or a missing key.
+    """
+    if not isinstance(arguments, str):
+        return ""
+    stripped = arguments.strip()
+    if not stripped:
+        return ""
+    try:
+        parsed = json.loads(stripped)
+    except (ValueError, TypeError):
+        return arguments
+    if isinstance(parsed, str):
+        return parsed
+    if isinstance(parsed, dict):
+        if "input" in parsed:
+            value = parsed["input"]
+            if isinstance(value, str):
+                return value
+            return json.dumps(value, separators=(",", ":"))
+        # The model answered with arbitrary JSON instead of {"input": ...};
+        # preserve its raw text rather than dropping the call.
+        return arguments
+    return arguments
+
+
 def responses_input_to_chat_messages(payload: Json) -> tuple[list[Json], Json]:
     messages: list[Json] = []
     stats: Json = {
@@ -364,6 +413,8 @@ def responses_input_to_chat_messages(payload: Json) -> tuple[list[Json], Json]:
         "reasoning_items_replayed": 0,
         "function_outputs": 0,
         "function_calls_replayed": 0,
+        "custom_tool_calls_replayed": 0,
+        "custom_tool_outputs": 0,
     }
 
     instructions = payload.get("instructions")
@@ -423,24 +474,34 @@ def responses_input_to_chat_messages(payload: Json) -> tuple[list[Json], Json]:
                 stats["reasoning_items_dropped"] += 1
             continue
 
-        if item_type == "function_call":
+        if item_type in ("function_call", "custom_tool_call"):
             ns = item.get("namespace")
             name = item.get("name", "")
             flat_name = f"{ns}__{name}" if ns else name
+            if item_type == "custom_tool_call":
+                # A custom/freeform call the proxy replayed as a chat tool call:
+                # rebuild the {"input": ...} arguments blob from the raw input.
+                raw_input = item.get("input")
+                if not isinstance(raw_input, str):
+                    raw_input = "" if raw_input is None else json.dumps(raw_input, separators=(",", ":"))
+                arguments = json.dumps({"input": raw_input}, separators=(",", ":"))
+                stats["custom_tool_calls_replayed"] += 1
+            else:
+                arguments = item.get("arguments", "{}")
+                stats["function_calls_replayed"] += 1
             pending_assistant_tool_calls.append(
                 {
                     "id": item.get("call_id") or item.get("id") or f"call_{uuid.uuid4().hex}",
                     "type": "function",
                     "function": {
                         "name": flat_name,
-                        "arguments": item.get("arguments", "{}"),
+                        "arguments": arguments,
                     },
                 }
             )
-            stats["function_calls_replayed"] += 1
             continue
 
-        if item_type == "function_call_output":
+        if item_type in ("function_call_output", "custom_tool_call_output"):
             if pending_assistant_tool_calls:
                 messages.append(pending_assistant_message())
                 pending_assistant_tool_calls = []
@@ -451,7 +512,10 @@ def responses_input_to_chat_messages(payload: Json) -> tuple[list[Json], Json]:
                     "content": _content_to_chat_parts(item.get("output", "")),
                 }
             )
-            stats["function_outputs"] += 1
+            if item_type == "custom_tool_call_output":
+                stats["custom_tool_outputs"] += 1
+            else:
+                stats["function_outputs"] += 1
             continue
 
         role = item.get("role", "user")
@@ -724,13 +788,17 @@ def responses_payload_to_chat_payload(payload: Json) -> tuple[Json, str, Json]:
 
 
 def chat_completion_to_response(
-    chat: Json, request_model: str | None = None, *, estimated_input_tokens: int | None = None
+    chat: Json,
+    request_model: str | None = None,
+    *,
+    estimated_input_tokens: int | None = None,
+    custom_tool_names: set[str] | None = None,
 ) -> Json:
     response_id = new_response_id()
     model = request_model or DEFAULT_MODEL
     choice = _first_choice(chat)
     message = choice.get("message", {}) if isinstance(choice, dict) else {}
-    output = chat_message_to_response_output(message)
+    output = chat_message_to_response_output(message, custom_tool_names=custom_tool_names)
     return {
         "id": response_id,
         "object": "response",
@@ -743,7 +811,9 @@ def chat_completion_to_response(
     }
 
 
-def chat_message_to_response_output(message: Json) -> list[Json]:
+def chat_message_to_response_output(
+    message: Json, *, custom_tool_names: set[str] | None = None
+) -> list[Json]:
     output: list[Json] = []
     reasoning = message.get("reasoning_content")
     if isinstance(reasoning, str) and reasoning:
@@ -761,6 +831,22 @@ def chat_message_to_response_output(message: Json) -> list[Json]:
             continue
         function = tool_call.get("function") or {}
         flat_name = function.get("name", "")
+        call_id = tool_call.get("id") or f"call_{uuid.uuid4().hex}"
+        # Custom/freeform tools (apply_patch) must round-trip as custom_tool_call
+        # with a raw input string; Codex rejects them as a JSON-argument
+        # function_call. Ordinary function tools keep their function_call shape.
+        if custom_tool_names and flat_name in custom_tool_names:
+            output.append(
+                {
+                    "type": "custom_tool_call",
+                    "id": f"ctc_{uuid.uuid4().hex}",
+                    "call_id": call_id,
+                    "name": flat_name,
+                    "input": _custom_tool_input(function.get("arguments", "")),
+                    "status": "completed",
+                }
+            )
+            continue
         # Split flat name back into namespace + name for Codex.
         # Codex's ResponseItem::FunctionCall has separate namespace and name fields.
         # Namespaced tools are flattened as {namespace}__{name}; split on last "__".
@@ -772,7 +858,7 @@ def chat_message_to_response_output(message: Json) -> list[Json]:
         item: Json = {
             "type": "function_call",
             "id": f"fc_{uuid.uuid4().hex}",
-            "call_id": tool_call.get("id") or f"call_{uuid.uuid4().hex}",
+            "call_id": call_id,
             "name": name,
             "arguments": function.get("arguments", "{}"),
             "status": "completed",

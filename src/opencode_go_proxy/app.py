@@ -49,6 +49,7 @@ from .protocol import (
     DEFAULT_MODEL,
     cache_stats_from_usage,
     chat_completion_to_response,
+    custom_tool_names,
     inject_session_model,
     known_models,
     model_context_window,
@@ -533,7 +534,12 @@ def handle_responses_request(payload: Json, config: ProxyConfig, request_id: str
     context_cap = model_context_window(request_model) or DEFAULT_ESTIMATE_CONTEXT_WINDOW
     prompt_bytes = len(json.dumps(chat_payload, separators=(",", ":")).encode("utf-8"))
     estimated = estimate_input_tokens(request_model, prompt_bytes, chat.get("usage"), context_window=context_cap)
-    response = chat_completion_to_response(chat, request_model=request_model, estimated_input_tokens=estimated)
+    response = chat_completion_to_response(
+        chat,
+        request_model=request_model,
+        estimated_input_tokens=estimated,
+        custom_tool_names=custom_tool_names(payload.get("tools")),
+    )
     trace(
         "response.converted",
         request_id=request_id,

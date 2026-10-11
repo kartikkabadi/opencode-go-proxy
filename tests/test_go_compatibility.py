@@ -71,10 +71,10 @@ def response(value: dict) -> mock.Mock:
     )
 
 
-def test_documented_catalog_has_all_28_models_in_their_official_families() -> None:
-    assert len(DOCUMENTED_GO_MODELS) == 28
+def test_documented_catalog_has_all_30_models_in_their_official_families() -> None:
+    assert len(DOCUMENTED_GO_MODELS) == 30
     assert len(DOCUMENTED_RESPONSES_MODELS) == 4
-    assert len(DOCUMENTED_CHAT_MODELS) == 16
+    assert len(DOCUMENTED_CHAT_MODELS) == 18
     assert len(DOCUMENTED_MESSAGES_MODELS) == 8
     assert {go_family_for(model) for model in DOCUMENTED_RESPONSES_MODELS} == {
         OPENAI_RESPONSES
@@ -87,9 +87,12 @@ def test_documented_catalog_has_all_28_models_in_their_official_families() -> No
     }
     seed = catalog.load_seed_compact()
     assert seed is not None
-    assert DOCUMENTED_GO_MODELS <= {
-        str(model["slug"]) for model in seed["models"]
-    }
+    newly_certified = {"longcat-2.5-preview-free", "mimo-v2.6-flash"}
+    assert newly_certified <= DOCUMENTED_CHAT_MODELS
+    assert go_family_for("longcat-2.5-preview-free") == OPENAI_CHAT
+    assert go_family_for("mimo-v2.6-flash") == OPENAI_CHAT
+    pre_existing = DOCUMENTED_GO_MODELS - newly_certified
+    assert pre_existing <= {str(model["slug"]) for model in seed["models"]}
 
 
 def test_explicit_and_safe_bare_selection_reject_unknown_ids() -> None:

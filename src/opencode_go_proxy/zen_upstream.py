@@ -46,6 +46,7 @@ from .protocol import (
     _normalize_image_url,
     chat_completion_to_response,
     chat_message_to_response_output,
+    custom_tool_names,
     flatten_content,
     inject_session_model,
     model_context_window,
@@ -807,10 +808,10 @@ def _gemini_tool_config(choice: Any, declarations: list[Json]) -> Json | None:
     return {"functionCallingConfig": config}
 
 
-def _anthropic_to_response(value: Json, model: str) -> Json:
+def _anthropic_to_response(value: Json, model: str, custom_names: set[str] | None = None) -> Json:
     """Anthropic messages response to the Responses object shape."""
     fake, text_parts = _anthropic_content_to_fake(value.get("content"))
-    output = chat_message_to_response_output(fake)
+    output = chat_message_to_response_output(fake, custom_tool_names=custom_names)
     usage = value.get("usage")
     normalized_usage = None
     if isinstance(usage, dict):
@@ -868,10 +869,10 @@ def _anthropic_content_to_fake(content: Any) -> tuple[Json, list[str]]:
     return fake, text_parts
 
 
-def _gemini_to_response(value: Json, model: str) -> Json:
+def _gemini_to_response(value: Json, model: str, custom_names: set[str] | None = None) -> Json:
     """Gemini generateContent response to the Responses object shape."""
     fake, text_parts = _gemini_content_to_fake(value)
-    output = chat_message_to_response_output(fake)
+    output = chat_message_to_response_output(fake, custom_tool_names=custom_names)
     metadata = value.get("usageMetadata")
     normalized_usage = None
     if isinstance(metadata, dict):
@@ -930,15 +931,17 @@ def _gemini_content_to_fake(value: Json) -> tuple[Json, list[str]]:
     return fake, text_parts
 
 
-def _translate_response(value: Json, family: str, model: str) -> Json:
+def _translate_response(
+    value: Json, family: str, model: str, custom_names: set[str] | None = None
+) -> Json:
     """Family-shaped non-stream response to the Responses object shape."""
     if family == "openai_responses":
         return value
     if family == "openai_chat":
-        return chat_completion_to_response(value, request_model=model)
+        return chat_completion_to_response(value, request_model=model, custom_tool_names=custom_names)
     if family == "anthropic_messages":
-        return _anthropic_to_response(value, model)
-    return _gemini_to_response(value, model)
+        return _anthropic_to_response(value, model, custom_names)
+    return _gemini_to_response(value, model, custom_names)
 
 
 def _meter_provider(
@@ -1095,7 +1098,9 @@ def call_family_responses(
         input_tokens=inp, output_tokens=outp, total_tokens=total,
         retries=retries or None,
     )
-    response = _translate_response(value, family, model)
+    response = _translate_response(
+        value, family, model, custom_tool_names(payload.get("tools"))
+    )
     if restore_namespaces:
         response = restore_namespaced_function_calls(response)
     trace(
@@ -1178,6 +1183,9 @@ class _ZenStreamEngine:
         self.reasoning_index = 0
         self.next_output_index = 0
         self._active_tool_index: int | None = None
+        # Names of Responses custom/freeform tools; their calls must round-trip
+        # as custom_tool_call (raw input) rather than function_call.
+        self.custom_names = custom_tool_names(payload.get("tools"))
 
     # -- SSE write plumbing -------------------------------------------------
 
@@ -1554,7 +1562,7 @@ class _ZenStreamEngine:
             fake["tool_calls"] = self.tool_calls
         if self.text:
             fake["content"] = self.text
-        output = chat_message_to_response_output(fake)
+        output = chat_message_to_response_output(fake, custom_tool_names=self.custom_names)
 
         if self.reasoning_open:
             reasoning_done: Json = {
@@ -1572,10 +1580,17 @@ class _ZenStreamEngine:
 
         tool_index = 0
         for item in output:
-            if item.get("type") != "function_call":
+            item_type = item.get("type")
+            if item_type not in ("function_call", "custom_tool_call"):
                 continue
             index = self.allocate_index()
             self.send_event({"type": "response.output_item.added", "output_index": index, "item": item})
+            if item_type == "custom_tool_call":
+                # Codex completes a freeform call from the raw input delta; a
+                # bare added item with empty input would stall the stream.
+                self.send_event({"type": "response.custom_tool_call_input.delta",
+                                 "item_id": item["id"], "output_index": index,
+                                 "delta": item.get("input", "")})
             self.send_event({"type": "response.output_item.done", "output_index": index, "item": item})
             tool_index += 1
 
